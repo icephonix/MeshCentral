@@ -17,6 +17,7 @@ function QV(x, y) { try { QS(x).display = (y ? '' : 'none'); } catch (x) { } }  
 function QA(x, y) { Q(x).innerHTML += y; }                                      // "Q" append
 function QH(x, y) { Q(x).innerHTML = y; }                                       // "Q" html
 function QC(x) { try { return Q(x).classList; } catch (x) { } }                 // "Q" class
+function QVH(x, y) { try { y ? Q(x).classList.remove('visually-hidden') : Q(x).classList.add('visually-hidden'); } catch (x) { } } // "Q" visibility
 
 // Move cursor to end of input box
 function inputBoxFocus(x) { Q(x).focus(); var v = Q(x).value; Q(x).value = ''; Q(x).value = v; }
@@ -125,7 +126,7 @@ function parseUriArgs(decodeUrl) {
         name = arg.substring(0, i);
         r[name] = arg.substring(i + 1);
         if (decodeUrl) { r[name] = decodeURIComponent(arg.substring(i + 1)); }
-        if (!isSafeString(r[name])) { delete r[name]; } else { var x = parseInt(r[name]); if (x == r[name]) { r[name] = x; } }
+        if (!isSafeString2(r[name])) { delete r[name]; } else { var x = parseInt(r[name]); if (x == r[name]) { r[name] = x; } }
     }
     return r;
 }
@@ -151,3 +152,29 @@ function check_webp_feature(feature, callback) {
     };
     img.src = 'data:image/webp;base64,' + kTestImages[feature];
 }
+
+// camelCase converter for JSON
+function jsonToCamel(o) {
+    var newO, origKey, newKey, value
+    if (o instanceof Array) {
+      return o.map(function(value) {
+          if (typeof value === "object") {
+            value = jsonToCamel(value)
+          }
+          return value
+      })
+    } else {
+      newO = {}
+      for (origKey in o) {
+        if (o.hasOwnProperty(origKey)) {
+          newKey = (origKey.charAt(0).toLowerCase() + origKey.slice(1) || origKey).toString()
+          value = o[origKey]
+          if (value instanceof Array || (value !== null && value.constructor === Object)) {
+            value = jsonToCamel(value)
+          }
+          newO[newKey] = value
+        }
+      }
+    }
+    return newO
+  }

@@ -16,7 +16,7 @@ var settings = {};
 const crypto = require('crypto');
 const args = require('minimist')(process.argv.slice(2));
 const path = require('path');
-const possibleCommands = ['edituser', 'listusers', 'listusersessions', 'listdevicegroups', 'listdevices', 'listusersofdevicegroup', 'listevents', 'logintokens', 'serverinfo', 'userinfo', 'adduser', 'removeuser', 'adddevicegroup', 'removedevicegroup', 'editdevicegroup', 'broadcast', 'showevents', 'addusertodevicegroup', 'removeuserfromdevicegroup', 'addusertodevice', 'removeuserfromdevice', 'sendinviteemail', 'generateinvitelink', 'config', 'movetodevicegroup', 'deviceinfo', 'editdevice', 'addusergroup', 'listusergroups', 'removeusergroup', 'runcommand', 'shell', 'upload', 'download', 'deviceopenurl', 'devicemessage', 'devicetoast', 'addtousergroup', 'removefromusergroup', 'removeallusersfromusergroup', 'devicesharing', 'devicepower', 'indexagenterrorlog', 'agentdownload'];
+const possibleCommands = ['edituser', 'listusers', 'listusersessions', 'listdevicegroups', 'listdevices', 'listusersofdevicegroup', 'listevents', 'logintokens', 'serverinfo', 'userinfo', 'adduser', 'removeuser', 'adddevicegroup', 'removedevicegroup', 'editdevicegroup', 'broadcast', 'showevents', 'addusertodevicegroup', 'removeuserfromdevicegroup', 'addusertodevice', 'removeuserfromdevice', 'sendinviteemail', 'generateinvitelink', 'config', 'movetodevicegroup', 'deviceinfo', 'removedevice', 'editdevice', 'addlocaldevice', 'addamtdevice', 'addusergroup', 'listusergroups', 'removeusergroup', 'runcommand', 'shell', 'upload', 'download', 'deviceopenurl', 'devicemessage', 'devicetoast', 'addtousergroup', 'removefromusergroup', 'removeallusersfromusergroup', 'devicesharing', 'devicepower', 'indexagenterrorlog', 'agentdownload', 'report', 'grouptoast', 'groupmessage', 'webrelay'];
 if (args.proxy != null) { try { require('https-proxy-agent'); } catch (ex) { console.log('Missing module "https-proxy-agent", type "npm install https-proxy-agent" to install it.'); return; } }
 
 if (args['_'].length == 0) {
@@ -36,7 +36,10 @@ if (args['_'].length == 0) {
     console.log("  ListEvents                  - List server events.");
     console.log("  LoginTokens                 - List, create and remove login tokens.");
     console.log("  DeviceInfo                  - Show information about a device.");
+    console.log("  AddLocalDevice              - Add a local device.");
+    console.log("  AddAmtDevice                - Add a AMT device.");
     console.log("  EditDevice                  - Make changes to a device.");
+    console.log("  RemoveDevice                - Delete a device.");
     console.log("  Config                      - Perform operation on config.json file.");
     console.log("  AddUser                     - Create a new user account.");
     console.log("  EditUser                    - Change a user account.");
@@ -62,17 +65,21 @@ if (args['_'].length == 0) {
     console.log("  Shell                       - Access command shell of a remote device.");
     console.log("  Upload                      - Upload a file to a remote device.");
     console.log("  Download                    - Download a file from a remote device.");
+    console.log("  WebRelay                    - Creates a HTTP/HTTPS webrelay link for a remote device.");
     console.log("  DeviceOpenUrl               - Open a URL on a remote device.");
     console.log("  DeviceMessage               - Open a message box on a remote device.");
     console.log("  DeviceToast                 - Display a toast notification on a remote device.");
+    console.log("  GroupMessage                - Open a message box on remote devices in a specific device group.");
+    console.log("  GroupToast                  - Display a toast notification on remote devices in a specific device group.");
     console.log("  DevicePower                 - Perform wake/sleep/reset/off operations on remote devices.");
     console.log("  DeviceSharing               - View, add and remove sharing links for a given device.");
     console.log("  AgentDownload               - Download an agent of a specific type for a device group.");
+    console.log("  Report                      - Create and show a CSV report.");
     console.log("\r\nSupported login arguments:");
     console.log("  --url [wss://server]        - Server url, wss://localhost:443 is default.");
     console.log("                              - Use wss://localhost:443?key=xxx if login key is required.");
     console.log("  --loginuser [username]      - Login username, admin is default.");
-    console.log("  --loginpass [password]      - Login password.");
+    console.log("  --loginpass [password]      - Login password OR Leave blank to enter password at prompt");
     console.log("  --token [number]            - 2nd factor authentication token.");
     console.log("  --loginkey [hex]            - Server login key in hex.");
     console.log("  --loginkeyfile [file]       - File containing server login key in hex.");
@@ -97,18 +104,27 @@ if (args['_'].length == 0) {
         case 'listdevices': { ok = true; break; }
         case 'listevents': { ok = true; break; }
         case 'logintokens': { ok = true; break; }
-        case 'listusersofdevicegroup': {
-            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing group id, use --id '[groupid]'")); }
-            else { ok = true; }
-            break;
-        }
-        case 'deviceinfo': {
-            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
-            else { ok = true; }
-            break;
-        }
+        case 'listusersofdevicegroup':
+        case 'deviceinfo':
+        case 'removedevice':
         case 'editdevice': {
             if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
+            else { ok = true; }
+            break;
+        }
+        case 'addlocaldevice': {
+            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
+            else if (args.devicename == null) { console.log(winRemoveSingleQuotes("Missing devicename, use --devicename [devicename]")); }
+            else if (args.hostname == null) { console.log(winRemoveSingleQuotes("Missing hostname, use --hostname [hostname]")); }
+            else { ok = true; }
+            break;
+        }
+        case 'addamtdevice': {
+            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
+            else if (args.devicename == null) { console.log(winRemoveSingleQuotes("Missing devicename, use --devicename [devicename]")); }
+            else if (args.hostname == null) { console.log(winRemoveSingleQuotes("Missing hostname, use --hostname [hostname]")); }
+            else if (args.user == null) { console.log(winRemoveSingleQuotes("Missing user, use --user [user]")); }
+            else if (args.pass == null) { console.log(winRemoveSingleQuotes("Missing pass, use --pass [pass]")); }
             else { ok = true; }
             break;
         }
@@ -208,7 +224,7 @@ if (args['_'].length == 0) {
         case 'sendinviteemail': {
             if ((args.id == null) && (args.group == null)) { console.log("Device group identifier missing, use --id '[groupid]' or --group [groupname]"); }
             else if (args.email == null) { console.log("Device email is missing, use --email [email]"); }
-			else { ok = true; }
+            else { ok = true; }
             break;
         }
         case 'generateinvitelink': {
@@ -241,10 +257,9 @@ if (args['_'].length == 0) {
         }
         case 'agentdownload': {
             if (args.type == null) { console.log(winRemoveSingleQuotes("Missing device type, use --type [agenttype]")); }
-            var at = parseInt(args.type);
-            if ((at == null) || isNaN(at) || (at < 1) || (at > 11000)) { console.log(winRemoveSingleQuotes("Invalid agent type, must be a number.")); }
-            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[meshid]'")); }
-            if ((typeof args.id != 'string') || (args.id.length != 64)) { console.log(winRemoveSingleQuotes("Invalid meshid.")); }
+            else if ((parseInt(args.type) == null) || isNaN(parseInt(args.type)) || (parseInt(args.type) < 1) || (parseInt(args.type) > 11000)) { console.log(winRemoveSingleQuotes("Invalid agent type, must be a number.")); }
+            else if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[meshid]'")); }
+            else if ((typeof args.id != 'string') || (args.id.length != 64)) { console.log(winRemoveSingleQuotes("Invalid meshid.")); }
             else { ok = true; }
             break;
         }
@@ -263,6 +278,12 @@ if (args['_'].length == 0) {
             else { ok = true; }
             break;
         }
+        case 'webrelay': {
+            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
+            else if (args.type == null) { console.log(winRemoveSingleQuotes("Missing protocol type, use --type [http,https]")); }
+            else { ok = true; }
+            break;
+        }
         case 'deviceopenurl': {
             if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
             else if (args.openurl == null) { console.log("Remote URL, use --openurl [url] specify the link to open."); }
@@ -278,6 +299,23 @@ if (args['_'].length == 0) {
         case 'devicetoast': {
             if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device id, use --id '[deviceid]'")); }
             else if (args.msg == null) { console.log("Remote message, use --msg \"[message]\" specify a remote message."); }
+            else { ok = true; }
+            break;
+        }
+        case 'groupmessage': {
+            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device group id, use --id '[devicegroupid]'")); }
+            else if (args.msg == null) { console.log("Remote message, use --msg \"[message]\" specify a remote message."); }
+            else { ok = true; }
+            break;
+        }
+        case 'grouptoast': {
+            if (args.id == null) { console.log(winRemoveSingleQuotes("Missing device group id, use --id '[devicegroupid]'")); }
+            else if (args.msg == null) { console.log("Remote message, use --msg \"[message]\" specify a remote message."); }
+            else { ok = true; }
+            break;
+        }
+        case 'report': {
+            if (args.type == null) { console.log(winRemoveSingleQuotes("Missing report type, use --type '[reporttype]'")); }
             else { ok = true; }
             break;
         }
@@ -304,7 +342,7 @@ if (args['_'].length == 0) {
                         console.log("  --email [email]        - Email address.");
                         console.log("\r\nOptional arguments:\r\n");
                         console.log("  --name (name)          - Name of recipient to be included in the email.");
-						console.log("  --message (msg)        - Message to be included in the email.");
+                        console.log("  --message (msg)        - Message to be included in the email.");
                         break;
                     }
                     case 'generateinvitelink': {
@@ -318,7 +356,7 @@ if (args['_'].length == 0) {
                             console.log("  --id '[groupid]'       - Device group identifier (or --group).");
                         }
                         console.log("  --group [groupname]    - Device group name (or --id).");
-                        console.log("  --hours [hours]        - Validity period in hours or 0 for infinit.");
+                        console.log("  --hours [hours]        - Validity period in hours or 0 for infinite.");
                         console.log("\r\nOptional arguments:\r\n");
                         console.log("  --flags [mode]         - Mode flag for link type (0 = both, 1 = interactive only, 2 = background only)");
                         break;
@@ -398,7 +436,7 @@ if (args['_'].length == 0) {
                         console.log("  --group [groupname]    - Filter by group name (or --id).");
                         console.log("  --count                - Only return the device count.");
                         console.log("  --json                 - Show result as JSON.");
-                        console.log("  --csv                  - Show result as comma seperated values.");
+                        console.log("  --csv                  - Show result as comma separated values.");
                         console.log("  --filter \"[filter]\"  - Filter devices using a filter string.");
                         console.log("     \"x\"                  - Devices with \"x\" in the name.");
                         console.log("     \"user:x or u:x\"      - Devices with \"x\" in the name of currently logged in user.");
@@ -469,8 +507,8 @@ if (args['_'].length == 0) {
                         console.log("  --resetpass                 - Request password reset on next login.");
                         console.log("  --realname [name]           - Set the real name for this account.");
                         console.log("  --phone [number]            - Set the account phone number.");
-                        console.log("  --rights [none|full|a,b,c]  - Comma seperated list of server permissions. Possible values:");
-                        console.log("     manageusers,backup,restore,update,fileaccess,locked,nonewgroups,notools,usergroups,recordings,locksettings,allevents");
+                        console.log("  --rights [none|full|a,b,c]  - Comma separated list of server permissions. Possible values:");
+                        console.log("     manageusers,serverbackup,serverrestore,serverupdate,fileaccess,locked,nonewgroups,notools,usergroups,recordings,locksettings,allevents,nonewdevices");
                         break;
                     }
                     case 'edituser': {
@@ -486,8 +524,8 @@ if (args['_'].length == 0) {
                         console.log("  --resetpass                 - Request password reset on next login.");
                         console.log("  --realname [name]           - Set the real name for this account.");
                         console.log("  --phone [number]            - Set the account phone number.");
-                        console.log("  --rights [none|full|a,b,c]  - Comma seperated list of server permissions. Possible values:");
-                        console.log("     manageusers,backup,restore,update,fileaccess,locked,nonewgroups,notools,usergroups,recordings,locksettings,allevents");
+                        console.log("  --rights [none|full|a,b,c]  - Comma separated list of server permissions. Possible values:");
+                        console.log("     manageusers,serverbackup,serverrestore,serverupdate,fileaccess,locked,nonewgroups,notools,usergroups,recordings,locksettings,allevents,nonewdevices");
                         break;
                     }
                     case 'removeuser': {
@@ -579,6 +617,7 @@ if (args['_'].length == 0) {
                         console.log("\r\nOptional arguments:\r\n");
                         console.log("  --desc [description]   - New group description.");
                         console.log("  --amtonly              - New group is agent-less, Intel AMT only.");
+                        console.log("  --agentless            - New group is agent-less only.");
                         console.log("  --features [number]    - Set device group features, sum of numbers below.");
                         console.log("     1 = Auto-Remove                 2 = Hostname Sync");
                         console.log("     4 = Record Sessions");
@@ -627,7 +666,7 @@ if (args['_'].length == 0) {
                         console.log("    16 = Terminal prompt for user consent.");
                         console.log("    32 = Files prompt for user consent.");
                         console.log("    64 = Desktop show connection toolbar.");
-                        console.log("  --invitecodes [aa,bb]  - Comma seperated list of invite codes, blank to clear.");
+                        console.log("  --invitecodes [aa,bb]  - Comma separated list of invite codes, blank to clear.");
                         console.log("    --backgroundonly     - When used with invitecodes, set agent to only install in background.");
                         console.log("    --interactiveonly    - When used with invitecodes, set agent to only run on demand.");
                         break;
@@ -745,7 +784,7 @@ if (args['_'].length == 0) {
                         console.log("\r\nRequired arguments:\r\n");
                         console.log("  --msg [message]        - Message to display.");
                         console.log("\r\nOptional arguments:\r\n");
-                        console.log("  --user [userid]        - Send the message to the speficied user.");
+                        console.log("  --user [userid]        - Send the message to the specified user.");
                         break;
                     }
                     case 'deviceinfo': {
@@ -761,6 +800,66 @@ if (args['_'].length == 0) {
                         console.log("\r\nOptional arguments:\r\n");
                         console.log("  --raw                  - Output raw data in JSON format.");
                         console.log("  --json                 - Give results in JSON format.");
+                        break;
+                    }
+                    case 'removedevice': {
+                        console.log("Delete a device, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl RemoveDevice --id 'deviceid'"));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [deviceid]        - The device identifier.");
+                        } else {
+                            console.log("  --id '[deviceid]'      - The device identifier.");
+                        }
+                        break;
+                    }
+                    case 'addlocaldevice': {
+                        console.log("Add a Local Device, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl AddLocalDevice --id 'meshid' --devicename 'devicename' --hostname 'hostname'"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl AddLocalDevice --id 'meshid' --devicename 'devicename' --hostname 'hostname' --type 6"));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [meshid]                - The mesh identifier.");
+                            console.log("  --devicename [devicename]    - The device name.");
+                            console.log("  --hostname [hostname]        - The devices hostname or ip address.");
+                        } else {
+                            console.log("  --id '[meshid]'              - The mesh identifier.");
+                            console.log("  --devicename '[devicename]'  - The device name.");
+                            console.log("  --hostname '[hostname]'      - The devices hostname or ip address.");
+                        }
+
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --type [TypeNumber] - With the following choices:");
+                        console.log("    type 4            - Default, Windows (RDP)");
+                        console.log("    type 6            - Linux (SSH/SCP/VNC)");
+                        console.log("    type 29           - macOS (SSH/SCP/VNC)");
+                        break;
+                    }
+                    case 'addamtdevice': {
+                        console.log("Add an Intel AMT Device, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl AddAmtDevice --id 'meshid' --devicename 'devicename' --hostname 'hostname --user 'admin' --pass 'admin'"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl AddAmtDevice --id 'meshid' --devicename 'devicename' --hostname 'hostname --user 'admin' --pass 'admin' --notls"));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [meshid]                - The mesh identifier.");
+                            console.log("  --devicename [devicename]    - The device name.");
+                            console.log("  --hostname [hostname]        - The devices hostname or ip address.");
+                            console.log("  --user [user]                - The devices AMT username.");
+                            console.log("  --pass [pass]                - The devices AMT password.");
+                            console.log("")
+                        } else {
+                            console.log("  --id '[meshid]'              - The mesh identifier.");
+                            console.log("  --devicename '[devicename]'  - The device name.");
+                            console.log("  --hostname '[hostname]'      - The devices hostname or ip address.");
+                            console.log("  --user '[user]'              - The devices AMT username.");
+                            console.log("  --pass '[pass]'              - The devices AMT password.");
+                        }
+                        console.log("\r\nOptional arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --notls                      - Use No TLS Security.");
+                        } else {
+                            console.log("  --notls                      - Use No TLS Security.");
+                        }
                         break;
                     }
                     case 'editdevice': {
@@ -794,6 +893,7 @@ if (args['_'].length == 0) {
                         console.log("Run a shell command on a remote device, Example usages:\r\n");
                         console.log(winRemoveSingleQuotes("  MeshCtrl RunCommand --id 'deviceid' --run \"command\""));
                         console.log(winRemoveSingleQuotes("  MeshCtrl RunCommand --id 'deviceid' --run \"command\" --powershell"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl RunCommand --id 'deviceid' --run \"command\" --reply"));
                         console.log("\r\nRequired arguments:\r\n");
                         if (process.platform == 'win32') {
                             console.log("  --id [deviceid]        - The device identifier.");
@@ -805,6 +905,7 @@ if (args['_'].length == 0) {
                         console.log("  --powershell           - Run in Windows PowerShell.");
                         console.log("  --runasuser            - Attempt to run the command as logged in user.");
                         console.log("  --runasuseronly        - Only run the command as the logged in user.");
+                        console.log("  --reply                - Return with the output from running the command.");
                         break;
                     }
                     case 'shell': {
@@ -839,6 +940,9 @@ if (args['_'].length == 0) {
                         console.log("  --reset                       - Attempt to remote the remote device.");
                         console.log("  --sleep                       - Attempt to place the remote device in low power mode.");
                         console.log("  --off                         - Attempt to power off the remote device.");
+                        console.log("  --amtoff                      - Attempt to power off the remote device using Intel AMT.");
+                        console.log("  --amton                       - Attempt to power on the remote device using Intel AMT.");
+                        console.log("  --amtreset                    - Attempt to reset the remote device using Intel AMT.");
                         break;
                     }
                     case 'devicesharing': {
@@ -850,6 +954,7 @@ if (args['_'].length == 0) {
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceSharing --id 'deviceid' --add Guest --start " + localISOTime + " --duration 30"));
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceSharing --id 'deviceid' --add Guest --start " + localISOTime + " --duration 30 --daily"));
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceSharing --id 'deviceid' --add Guest --type desktop,terminal --consent prompt"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl DeviceSharing --id 'deviceid' --add Guest --type http --port 80"));
                         console.log("\r\nRequired arguments:\r\n");
                         if (process.platform == 'win32') {
                             console.log("  --id [deviceid]                - The device identifier.");
@@ -857,21 +962,23 @@ if (args['_'].length == 0) {
                             console.log("  --id '[deviceid]'              - The device identifier.");
                         }
                         console.log("\r\nOptional arguments:\r\n");
-                        console.log("  --remove [shareid]              - Remove a device sharing link.");
-                        console.log("  --add [guestname]               - Add a device sharing link.");
-                        console.log("  --type [desktop,terminal,files] - Type of sharing to add, can be combined. default is desktop.");
-                        console.log("  --viewonly                      - Make desktop sharing view only.");
-                        console.log("  --consent [notify,prompt]       - Consent flags, default is notify.");
-                        console.log("  --start [yyyy-mm-ddThh:mm:ss]   - Start time, default is now.");
-                        console.log("  --end [yyyy-mm-ddThh:mm:ss]     - End time.");
-                        console.log("  --duration [minutes]            - Duration of the share, default is 60 minutes.");
-                        console.log("  --daily                         - Add recurring daily device share.");
-                        console.log("  --weekly                        - Add recurring weekly device share.");
+                        console.log("  --remove [shareid]                         - Remove a device sharing link.");
+                        console.log("  --add [guestname]                          - Add a device sharing link.");
+                        console.log("  --type [desktop,terminal,files,http,https] - Type of sharing to add, can be combined. default is desktop.");
+                        console.log("  --viewonly                                 - Make desktop sharing view only.");
+                        console.log("  --consent [notify,prompt,none]             - Consent flags, default is notify.");
+                        console.log("  --start [yyyy-mm-ddThh:mm:ss]              - Start time, default is now.");
+                        console.log("  --end [yyyy-mm-ddThh:mm:ss]                - End time.");
+                        console.log("  --duration [minutes]                       - Duration of the share, default is 60 minutes.");
+                        console.log("  --daily                                    - Add recurring daily device share.");
+                        console.log("  --weekly                                   - Add recurring weekly device share.");
+                        console.log("  --port [portnumber]                        - Set alternative port for http or https, default is 80 for http and 443 for https.");
                         break;
                     }
                     case 'agentdownload': {
                         console.log("Download an agent of a specific type for a given device group, Example usages:\r\n");
                         console.log(winRemoveSingleQuotes("  MeshCtrl AgentDownload --id 'groupid' --type 3"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl AgentDownload --id 'groupid' --type 3 --installflags 1"));
                         console.log("\r\nRequired arguments:\r\n");
                         console.log("  --type [ArchitectureNumber]   - Agent architecture number.");
                         if (process.platform == 'win32') {
@@ -879,6 +986,11 @@ if (args['_'].length == 0) {
                         } else {
                             console.log("  --id '[groupid]'              - The device group identifier.");
                         }
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --installflags [InstallFlagsNumber] - With the following choices:");
+                        console.log("    installflags 0                    - Default, Interactive & Background, offers connect button & install/uninstall");
+                        console.log("    installflags 1                    - Interactive only, offers only connect button, not install/uninstall");
+                        console.log("    installflags 2                    - Background only, offers only install/uninstall, not connect");
                         break;
                     }
                     case 'upload': {
@@ -910,6 +1022,21 @@ if (args['_'].length == 0) {
                         console.log("  --target [localpath]   - The local path to download the file to.");
                         break;
                     }
+                    case 'webrelay': {
+                        console.log("Generate a webrelay URL to access a HTTP/HTTPS service on a remote device, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl WebRelay --id 'deviceid' --type http --port 80"));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl WebRelay --id 'deviceid' --type https --port 443"));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [deviceid]     - The device identifier.");
+                        } else {
+                            console.log("  --id '[deviceid]'     - The device identifier.");
+                        }
+                        console.log("  --type [http,https]   - Type of relay from remote device, http or https.");
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --port [portnumber]   - Set alternative port for http or https, default is 80 for http and 443 for https.");
+                        break;
+                    }
                     case 'deviceopenurl': {
                         console.log("Open a web page on a remote device, Example usages:\r\n");
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceOpenUrl --id 'deviceid' --openurl http://meshcentral.com"));
@@ -926,15 +1053,17 @@ if (args['_'].length == 0) {
                         console.log("Display a message on the remote device, Example usages:\r\n");
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceMessage --id 'deviceid' --msg \"message\""));
                         console.log(winRemoveSingleQuotes("  MeshCtrl DeviceMessage --id 'deviceid' --msg \"message\" --title \"title\""));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl DeviceMessage --id 'deviceid' --msg \"message\" --title \"title\" --timeout 120000"));
                         console.log("\r\nRequired arguments:\r\n");
                         if (process.platform == 'win32') {
-                            console.log("  --id [deviceid]        - The device identifier.");
+                            console.log("  --id [deviceid]          - The device identifier.");
                         } else {
-                            console.log("  --id '[deviceid]'      - The device identifier.");
+                            console.log("  --id '[deviceid]'        - The device identifier.");
                         }
-                        console.log("  --msg [message]        - The message to display.");
+                        console.log("  --msg [message]          - The message to display.");
                         console.log("\r\nOptional arguments:\r\n");
-                        console.log("  --title [title]        - Messagebox title, default is \"MeshCentral\".");
+                        console.log("  --title [title]          - Messagebox title, default is \"MeshCentral\".");
+                        console.log("  --timeout [miliseconds]  - After timeout messagebox vanishes, 0 keeps messagebox open until closed manually, default is 120000 (2 Minutes).");
                         break;
                     }
                     case 'devicetoast': {
@@ -952,6 +1081,52 @@ if (args['_'].length == 0) {
                         console.log("  --title [title]        - Toast title, default is \"MeshCentral\".");
                         break;
                     }
+                    case 'groupmessage': {
+                        console.log("Open a message box on remote devices in a specific device group, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl GroupMessage --id 'devicegroupid' --msg \"message\""));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl GroupMessage --id 'devicegroupid' --msg \"message\" --title \"title\""));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl GroupMessage --id 'devicegroupid' --msg \"message\" --title \"title\" --timeout 120000"));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [devicegroupid]     - The device identifier.");
+                        } else {
+                            console.log("  --id '[devicegroupid]'   - The device identifier.");
+                        }
+                        console.log("  --msg [message]          - The message to display.");
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --title [title]          - Messagebox title, default is \"MeshCentral\".");
+                        console.log("  --timeout [miliseconds]  - After timeout messagebox vanishes, 0 keeps messagebox open until closed manually, default is 120000 (2 Minutes).");
+                        break;
+                    }
+                    case 'grouptoast': {
+                        console.log("Display a toast notification on remote devices in a specific device group, Example usages:\r\n");
+                        console.log(winRemoveSingleQuotes("  MeshCtrl GroupToast --id 'devicegroupid' --msg \"message\""));
+                        console.log(winRemoveSingleQuotes("  MeshCtrl GroupToast --id 'devicegroupid' --msg \"message\" --title \"title\""));
+                        console.log("\r\nRequired arguments:\r\n");
+                        if (process.platform == 'win32') {
+                            console.log("  --id [devicegroupid]   - The device identifier.");
+                        } else {
+                            console.log("  --id '[devicegroupid]' - The device identifier.");
+                        }
+                        console.log("  --msg [message]        - The message to display.");
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --title [title]        - Toast title, default is \"MeshCentral\".");
+                        break;
+                    }
+                    case 'report': {
+                        console.log("Generate a CSV report, Example usages:\r\n");
+                        console.log("  MeshCtrl Report --type sessions --devicegroup mesh//...");
+                        console.log("  MeshCtrl Report --type traffic --json");
+                        console.log("  MeshCtrl Report --type logins --groupby day");
+                        console.log("  MeshCtrl Report --type db");
+                        console.log("\r\nOptional arguments:\r\n");
+                        console.log("  --start [yyyy-mm-ddThh:mm:ss] - Filter the results starting at that date. Defaults to last 24h and last week when used with --groupby day. Usable with sessions, traffic and logins");
+                        console.log("  --end [yyyy-mm-ddThh:mm:ss]   - Filter the results ending at that date. Defaults to now. Usable with sessions, traffic and logins");
+                        console.log("  --groupby [name]              - How to group results. Options: user, day, device. Defaults to user. User and day usable in sessions and logins, device usable in sessions.");
+                        console.log("  --devicegroup [devicegroupid] - Filter the results by device group. Usable in sessions");
+                        console.log("  --showtraffic                 - Add traffic data in sessions report");
+                        break;
+                    }
                     default: {
                         console.log("Get help on an action. Type:\r\n\r\n  help [action]\r\n\r\nPossible actions are: " + possibleCommands.join(', ') + '.');
                     }
@@ -961,7 +1136,46 @@ if (args['_'].length == 0) {
         }
     }
 
-    if (ok) { serverConnect(); }
+    if (ok) {
+        if(args.loginpass===true){
+            const readline = require('readline');
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: false
+            });
+            process.stdout.write('Enter your password: ');
+            const stdin = process.openStdin();
+            stdin.setRawMode(true); // Set raw mode to prevent echoing of characters
+            stdin.resume();
+            args.loginpass = '';
+            process.stdin.on('data', (char) => {
+                char = char + '';
+                switch (char) {
+                    case '\n':
+                    case '\r':
+                    case '\u0004': // They've finished entering their password
+                        stdin.setRawMode(false);
+                        stdin.pause();
+                        process.stdout.clearLine(); process.stdout.cursorTo(0);
+                        rl.close();
+                        serverConnect();
+                        break;
+                    case '\u0003': // Ctrl+C
+                        process.stdout.write('\n');
+                        process.exit();
+                        break;
+                    default: // Mask the password with "*"
+                        args.loginpass += char;
+                        process.stdout.clearLine(); process.stdout.cursorTo(0);
+                        process.stdout.write('Enter your password: ' + '*'.repeat(args.loginpass.length));
+                        break;
+                }
+            });
+        }else{
+            serverConnect();
+        }
+    }
 }
 
 function displayConfigHelp() {
@@ -982,8 +1196,8 @@ function displayConfigHelp() {
 
 function performConfigOperations(args) {
     var domainValues = ['title', 'title2', 'titlepicture', 'trustedcert', 'welcomepicture', 'welcometext', 'userquota', 'meshquota', 'newaccounts', 'usernameisemail', 'newaccountemaildomains', 'newaccountspass', 'newaccountsrights', 'geolocation', 'lockagentdownload', 'userconsentflags', 'Usersessionidletimeout', 'auth', 'ldapoptions', 'ldapusername', 'ldapuserbinarykey', 'ldapuseremail', 'footer', 'certurl', 'loginKey', 'userallowedip', 'agentallowedip', 'agentnoproxy', 'agentconfig', 'orphanagentuser', 'httpheaders', 'yubikey', 'passwordrequirements', 'limits', 'amtacmactivation', 'redirects', 'sessionrecording', 'hide'];
-    var domainObjectValues = [ 'ldapoptions', 'httpheaders', 'yubikey', 'passwordrequirements', 'limits', 'amtacmactivation', 'redirects', 'sessionrecording' ];
-    var domainArrayValues = [ 'newaccountemaildomains', 'newaccountsrights', 'loginkey', 'agentconfig' ];
+    var domainObjectValues = ['ldapoptions', 'httpheaders', 'yubikey', 'passwordrequirements', 'limits', 'amtacmactivation', 'redirects', 'sessionrecording'];
+    var domainArrayValues = ['newaccountemaildomains', 'newaccountsrights', 'loginkey', 'agentconfig'];
     var configChange = false;
     var fs = require('fs');
     var path = require('path');
@@ -997,7 +1211,7 @@ function performConfigOperations(args) {
     if (fs.existsSync(configFile) == false) { console.log("Unable to find config.json."); return; }
     var config = null;
     try { config = fs.readFileSync(configFile).toString('utf8'); } catch (ex) { console.log("Error: Unable to read config.json"); return; }
-    try { config = require(configFile); } catch (e) { console.log('ERROR: Unable to parse ' + configFilePath + '.'); return null; }
+    try { config = JSON.parse(fs.readFileSync(configFile)); } catch (e) { console.log('ERROR: Unable to parse ' + configFile + '.'); return null; }
     if (args.adddomain != null) {
         didSomething++;
         if (config.domains == null) { config.domains = {}; }
@@ -1126,10 +1340,10 @@ function serverConnect() {
     // Cookie authentication
     var ckey = null, loginCookie = null;
     if (args.loginkey != null) {
-        // User key passed in a argument hex
+        // User key passed in as argument hex
         if (args.loginkey.length != 160) { loginCookie = args.loginkey; }
         ckey = Buffer.from(args.loginkey, 'hex');
-        if (ckey != 80) { ckey = null; loginCookie = args.loginkey; }
+        if (ckey.length != 80) { ckey = null; loginCookie = args.loginkey; }
     } else if (args.loginkeyfile != null) {
         // Load key from hex file
         var fs = require('fs');
@@ -1145,10 +1359,10 @@ function serverConnect() {
         var domainid = '', username = 'admin';
         if (args.logindomain != null) { domainid = args.logindomain; }
         if (args.loginuser != null) { username = args.loginuser; }
-        url += '?auth=' + encodeCookie({ userid: 'user/' + domainid + '/' + username, domainid: domainid }, ckey);
+        url += (url.indexOf('?key=') >= 0 ? '&auth=' : '?auth=') + encodeCookie({ userid: 'user/' + domainid + '/' + username, domainid: domainid }, ckey);
     } else {
         if (args.logindomain != null) { console.log("--logindomain can only be used along with --loginkey."); process.exit(); return; }
-        if (loginCookie != null) { url += '?auth=' + loginCookie; }
+        if (loginCookie != null) { url += (url.indexOf('?key=') >= 0 ? '&auth=' : '?auth=') + loginCookie; }
     }
 
     const ws = new WebSocket(url, options);
@@ -1168,7 +1382,7 @@ function serverConnect() {
             case 'listdevices': {
                 if (args.details) {
                     // Get list of devices with lots of details
-                    ws.send(JSON.stringify({ action: 'getDeviceDetails', type: (args.csv)?'csv':'json' }));
+                    ws.send(JSON.stringify({ action: 'getDeviceDetails', type: (args.csv) ? 'csv' : 'json' }));
                 } else if (args.group) {
                     ws.send(JSON.stringify({ action: 'nodes', meshname: args.group, responseid: 'meshctrl' }));
                 } else if (args.id) {
@@ -1181,7 +1395,7 @@ function serverConnect() {
             }
             case 'listevents': {
                 limit = null;
-                if (args.limit) { limit = parseInt(args.limit); } 
+                if (args.limit) { limit = parseInt(args.limit); }
                 if ((typeof limit != 'number') || (limit < 1)) { limit = null; }
 
                 var cmd = null;
@@ -1353,6 +1567,7 @@ function serverConnect() {
                 var op = { action: 'createmesh', meshname: args.name, meshtype: 2, responseid: 'meshctrl' };
                 if (args.desc) { op.desc = args.desc; }
                 if (args.amtonly) { op.meshtype = 1; }
+                if (args.agentless) { op.meshtype = 3; }
                 if (args.features) { op.flags = parseInt(args.features); }
                 if (args.consent) { op.consent = parseInt(args.consent); }
                 ws.send(JSON.stringify(op));
@@ -1361,6 +1576,29 @@ function serverConnect() {
             case 'removedevicegroup': {
                 var op = { action: 'deletemesh', responseid: 'meshctrl' };
                 if (args.id) { op.meshid = args.id; } else if (args.group) { op.meshname = args.group; }
+                ws.send(JSON.stringify(op));
+                break;
+            }
+            case 'addamtdevice': {
+                var op = { action: 'addamtdevice', amttls: 1, responseid: 'meshctrl' };
+                if (args.id) { op.meshid = args.id; }
+                if ((typeof args.devicename == 'string') && (args.devicename != '')) { op.devicename = args.devicename; }
+                if ((typeof args.hostname == 'string') && (args.hostname != '')) { op.hostname = args.hostname; }
+                if ((typeof args.user == 'string') && (args.user != '')) { op.amtusername = args.user; }
+                if ((typeof args.pass == 'string') && (args.pass != '')) { op.amtpassword = args.pass; }
+                if (args.notls) { op.amttls = 0; }
+                ws.send(JSON.stringify(op));
+                break;
+            }
+            case 'addlocaldevice': {
+                var op = { action: 'addlocaldevice', type: 4, responseid: 'meshctrl' };
+                if (args.id) { op.meshid = args.id; }
+                if ((typeof args.devicename == 'string') && (args.devicename != '')) { op.devicename = args.devicename; }
+                if ((typeof args.hostname == 'string') && (args.hostname != '')) { op.hostname = args.hostname; }
+                if (args.type) {
+                    if ((typeof parseInt(args.type) != 'number') || isNaN(parseInt(args.type))) { console.log("Invalid type."); process.exit(1); return; }
+                    op.type = args.type;
+                }
                 ws.send(JSON.stringify(op));
                 break;
             }
@@ -1390,7 +1628,7 @@ function serverConnect() {
                 break;
             }
             case 'movetodevicegroup': {
-                var op = { action: 'changeDeviceMesh', responseid: 'meshctrl', nodeids: [ args.devid ] };
+                var op = { action: 'changeDeviceMesh', responseid: 'meshctrl', nodeids: [args.devid] };
                 if (args.id) { op.meshid = args.id; } else if (args.group) { op.meshname = args.group; }
                 ws.send(JSON.stringify(op));
                 break;
@@ -1483,6 +1721,11 @@ function serverConnect() {
                 ws.send(JSON.stringify({ action: 'getsysinfo', nodeid: args.id, nodeinfo: true, responseid: 'meshctrl' }));
                 break;
             }
+            case 'removedevice': {
+                var op = { action: 'removedevices', nodeids: [ args.id ], responseid: 'meshctrl' };
+                ws.send(JSON.stringify(op));
+                break;
+            }
             case 'editdevice': {
                 var op = { action: 'changedevice', nodeid: args.id, responseid: 'meshctrl' };
                 if (typeof args.name == 'string') { op.name = args.name; }
@@ -1497,7 +1740,9 @@ function serverConnect() {
             case 'runcommand': {
                 var runAsUser = 0;
                 if (args.runasuser) { runAsUser = 1; } else if (args.runasuseronly) { runAsUser = 2; }
-                ws.send(JSON.stringify({ action: 'runcommands', nodeids: [args.id], type: ((args.powershell) ? 2 : 0), cmds: args.run, responseid: 'meshctrl', runAsUser: runAsUser }));
+                var reply = false;
+                if (args.reply) { reply = true; }
+                ws.send(JSON.stringify({ action: 'runcommands', nodeids: [args.id], type: ((args.powershell) ? 2 : 0), cmds: args.run, responseid: 'meshctrl', runAsUser: runAsUser, reply: reply }));
                 break;
             }
             case 'shell':
@@ -1520,6 +1765,15 @@ function serverConnect() {
                 } else if (args.sleep) {
                     // Sleep operation
                     ws.send(JSON.stringify({ action: 'poweraction', nodeids: nodes, actiontype: 4, responseid: 'meshctrl' }));
+                } else if (args.amton) {
+                    // Intel AMT Power on operation
+                    ws.send(JSON.stringify({ action: 'poweraction', nodeids: nodes, actiontype: 302, responseid: 'meshctrl' }));
+                } else if (args.amtoff) {
+                    // Intel AMT Power off operation
+                    ws.send(JSON.stringify({ action: 'poweraction', nodeids: nodes, actiontype: 308, responseid: 'meshctrl' }));
+                } else if (args.amtreset) {
+                    // Intel AMT Power reset operation
+                    ws.send(JSON.stringify({ action: 'poweraction', nodeids: nodes, actiontype: 310, responseid: 'meshctrl' }));
                 } else {
                     console.log('No power operation specified.');
                     process.exit(1);
@@ -1531,6 +1785,10 @@ function serverConnect() {
                 var u = settings.xxurl.replace('wss://', 'https://').replace('/control.ashx', '/meshagents');
                 if (u.indexOf('?') > 0) { u += '&'; } else { u += '?'; }
                 u += 'id=' + args.type + '&meshid=' + args.id;
+                if (args.installflags) {
+                    if ((typeof parseInt(args.installflags) != 'number') || isNaN(parseInt(args.installflags)) || (parseInt(args.installflags) < 0) || (parseInt(args.installflags) > 2)) { console.log("Invalid Installflags."); process.exit(1); return; }
+                    u += '&installflags=' + args.installflags;
+                }
                 const options = { rejectUnauthorized: false, checkServerIdentity: onVerifyServer }
                 const fs = require('fs');
                 const https = require('https');
@@ -1568,6 +1826,29 @@ function serverConnect() {
                 req.end()
                 break;
             }
+            case 'webrelay': {
+                var protocol = null;
+                if (args.type != null) {
+                    if (args.type == 'http') {
+                        protocol = 1;
+                    } else if (args.type == 'https') {
+                        protocol = 2;
+                    } else {
+                        console.log("Unknown protocol type: " + args.type); process.exit(1);
+                    }
+                }
+                var port = null;
+                if (typeof args.port == 'number') {
+                    if ((args.port < 1) || (args.port > 65535)) { console.log("Port number must be between 1 and 65535."); process.exit(1); }
+                    port = args.port;
+                } else if (protocol == 1) {
+                    port = 80;
+                } else if (protocol == 2) {
+                    port = 443;
+                }
+                ws.send(JSON.stringify({ action: 'webrelay', nodeid: args.id, port: port, appid: protocol, responseid: 'meshctrl' }));
+                break;
+            }
             case 'devicesharing': {
                 if (args.add) {
                     if (args.add.length == 0) { console.log("Invalid guest name."); process.exit(1); }
@@ -1576,10 +1857,12 @@ function serverConnect() {
                     var p = 0;
                     if (args.type != null) {
                         var shareTypes = args.type.toLowerCase().split(',');
-                        for (var i in shareTypes) { if ((shareTypes[i] != 'terminal') && (shareTypes[i] != 'desktop') && (shareTypes[i] != 'files')) { console.log("Unknown sharing type: " + shareTypes[i]); process.exit(1); } }
+                        for (var i in shareTypes) { if ((shareTypes[i] != 'terminal') && (shareTypes[i] != 'desktop') && (shareTypes[i] != 'files') && (shareTypes[i] != 'http') && (shareTypes[i] != 'https')) { console.log("Unknown sharing type: " + shareTypes[i]); process.exit(1); } }
                         if (shareTypes.indexOf('terminal') >= 0) { p |= 1; }
                         if (shareTypes.indexOf('desktop') >= 0) { p |= 2; }
                         if (shareTypes.indexOf('files') >= 0) { p |= 4; }
+                        if (shareTypes.indexOf('http') >= 0) { p |= 8; }
+                        if (shareTypes.indexOf('https') >= 0) { p |= 16; }
                     }
                     if (p == 0) { p = 2; } // Desktop
 
@@ -1614,6 +1897,19 @@ function serverConnect() {
                         }
                     }
 
+                    var port = null;
+                    // Set Port Number if http or https
+                    if ((p & 8) || (p & 16)) {
+                        if (typeof args.port == 'number') {
+                            if ((args.port < 1) || (args.port > 65535)) { console.log("Port number must be between 1 and 65535."); process.exit(1); }
+                            port = args.port;
+                        } else if ((p & 8)) {
+                            port = 80;
+                        } else if ((p & 16)) {
+                            port = 443;
+                        }
+                    }
+
                     // Start and end time
                     var start = null, end = null;
                     if (args.start) { start = Math.floor(Date.parse(args.start) / 1000); end = start + (60 * 60); }
@@ -1630,14 +1926,14 @@ function serverConnect() {
                         if ((typeof args.duration != 'number') || (args.duration < 1)) { console.log("Invalid duration value."); process.exit(1); return; }
 
                         // Recurring sharing
-                        ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, start: start, expire: args.duration, recurring: recurring, viewOnly: viewOnly, responseid: 'meshctrl' }));
+                        ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, start: start, expire: args.duration, recurring: recurring, viewOnly: viewOnly, port: port, responseid: 'meshctrl' }));
                     } else {
                         if ((start == null) && (end == null)) {
                             // Unlimited sharing
-                            ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, expire: 0, viewOnly: viewOnly, responseid: 'meshctrl' }));
+                            ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, expire: 0, viewOnly: viewOnly, port: port, responseid: 'meshctrl' }));
                         } else {
                             // Time limited sharing
-                            ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, start: start, end: end, viewOnly: viewOnly, responseid: 'meshctrl' }));
+                            ws.send(JSON.stringify({ action: 'createDeviceShareLink', nodeid: args.id, guestname: args.add, p: p, consent: consent, start: start, end: end, viewOnly: viewOnly, port: port, responseid: 'meshctrl' }));
                         }
                     }
                 } else if (args.remove) {
@@ -1652,11 +1948,54 @@ function serverConnect() {
                 break;
             }
             case 'devicemessage': {
-                ws.send(JSON.stringify({ action: 'msg', type: 'messagebox', nodeid: args.id, title: args.title ? args.title : "MeshCentral", msg: args.msg, responseid: 'meshctrl' }));
+                ws.send(JSON.stringify({ action: 'msg', type: 'messagebox', nodeid: args.id, title: args.title ? args.title : "MeshCentral", msg: args.msg, timeout: args.timeout ? args.timeout : 120000, responseid: 'meshctrl' }));
                 break;
             }
             case 'devicetoast': {
                 ws.send(JSON.stringify({ action: 'toast', nodeids: [args.id], title: args.title ? args.title : "MeshCentral", msg: args.msg, responseid: 'meshctrl' }));
+                break;
+            }
+            case 'groupmessage': {
+                ws.send(JSON.stringify({ action: 'nodes', meshid: args.id, responseid: 'meshctrl' }));
+                break;
+            }
+            case 'grouptoast': {
+                ws.send(JSON.stringify({ action: 'nodes', meshid: args.id, responseid: 'meshctrl' }));
+                break;
+            }
+            case 'report': {
+                var reporttype = 1;
+                switch(args.type) {
+                    case 'traffic':
+                        reporttype = 2;
+                        break;
+                    case 'logins':
+                        reporttype = 3;
+                        break;
+                    case 'db':
+                        reporttype = 4;
+                        break;
+                }
+                
+                var reportgroupby = 1;
+                if(args.groupby){
+                    reportgroupby = args.groupby === 'device' ? 2 : args.groupby === 'day' ? 3: 1;
+                }
+                
+                var start = null, end = null;
+                if (args.start) {
+                    start = Math.floor(Date.parse(args.start) / 1000);
+                } else {
+                    start = reportgroupby === 3 ? Math.round(new Date().getTime() / 1000) - (168 * 3600) : Math.round(new Date().getTime() / 1000) - (24 * 3600);
+                }
+                if (args.end) {
+                    end = Math.floor(Date.parse(args.end) / 1000);
+                } else {
+                    end = Math.round(new Date().getTime() / 1000);
+                }                    
+                if (end <= start) { console.log("End time must be ahead of start time."); process.exit(1); return; }
+                
+                ws.send(JSON.stringify({ action: 'report', type: reporttype, groupBy: reportgroupby, devGroup: args.devicegroup || null, start, end, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, tf: new Date().getTimezoneOffset(), showTraffic: args.hasOwnProperty('showtraffic'), l: 'en', responseid: 'meshctrl' }));
                 break;
             }
         }
@@ -1671,11 +2010,11 @@ function serverConnect() {
             var srights = args.rights.toLowerCase().split(',');
             if (srights.indexOf('full') != -1) { siteadmin = 0xFFFFFFFF; }
             if (srights.indexOf('none') != -1) { siteadmin = 0x00000000; }
-            if (srights.indexOf('backup') != -1) { siteadmin |= 0x00000001; }
+            if (srights.indexOf('backup') != -1 || srights.indexOf('serverbackup') != -1) { siteadmin |= 0x00000001; }
             if (srights.indexOf('manageusers') != -1) { siteadmin |= 0x00000002; }
-            if (srights.indexOf('restore') != -1) { siteadmin |= 0x00000004; }
+            if (srights.indexOf('restore') != -1 || srights.indexOf('serverrestore') != -1) { siteadmin |= 0x00000004; }
             if (srights.indexOf('fileaccess') != -1) { siteadmin |= 0x00000008; }
-            if (srights.indexOf('update') != -1) { siteadmin |= 0x00000010; }
+            if (srights.indexOf('update') != -1 || srights.indexOf('serverupdate') != -1) { siteadmin |= 0x00000010; }
             if (srights.indexOf('locked') != -1) { siteadmin |= 0x00000020; }
             if (srights.indexOf('nonewgroups') != -1) { siteadmin |= 0x00000040; }
             if (srights.indexOf('notools') != -1) { siteadmin |= 0x00000080; }
@@ -1683,6 +2022,7 @@ function serverConnect() {
             if (srights.indexOf('recordings') != -1) { siteadmin |= 0x00000200; }
             if (srights.indexOf('locksettings') != -1) { siteadmin |= 0x00000400; }
             if (srights.indexOf('allevents') != -1) { siteadmin |= 0x00000800; }
+            if (srights.indexOf('nonewdevices') != -1) { siteadmin |= 0x00001000; }
         }
 
         if (args.siteadmin) { siteadmin = 0xFFFFFFFF; }
@@ -1695,11 +2035,11 @@ function serverConnect() {
         return siteadmin;
     }
 
-    ws.on('close', function() { process.exit(); });
+    ws.on('close', function () { process.exit(); });
     ws.on('error', function (err) {
         if (err.code == 'ENOTFOUND') { console.log('Unable to resolve ' + url); }
         else if (err.code == 'ECONNREFUSED') { console.log('Unable to connect to ' + url); }
-        else { console.log(err); }
+        else { console.log('Unable to connect to ' + url); }
         process.exit();
     });
 
@@ -1879,6 +2219,9 @@ function serverConnect() {
             case 'toast': // TOAST
             case 'adduser': // ADDUSER
             case 'edituser': // EDITUSER
+            case 'addamtdevice': // ADDAMTDEVICE
+            case 'addlocaldevice': // ADDLOCALDEVICE
+            case 'removedevices': // REMOVEDEVICE
             case 'changedevice': // EDITDEVICE
             case 'deleteuser': // REMOVEUSER
             case 'createmesh': // ADDDEVICEGROUP
@@ -1910,6 +2253,7 @@ function serverConnect() {
                 break;
             }
             case 'createDeviceShareLink':
+            case 'webrelay':
                 if (data.result == 'OK') {
                     if (data.publicid) { console.log('ID: ' + data.publicid); }
                     console.log('URL: ' + data.url);
@@ -1945,11 +2289,11 @@ function serverConnect() {
                             console.log(x);
                             var mesh = [], user = [], node = [];
                             if (data.ugroups[i].links != null) { for (var j in data.ugroups[i].links) { if (j.startsWith('mesh/')) { mesh.push(j); } if (j.startsWith('user/')) { user.push(j); } if (j.startsWith('node/')) { node.push(j); } } }
-                            console.log('  Users:'); 
+                            console.log('  Users:');
                             if (user.length > 0) { for (var j in user) { console.log('    ' + user[j]); } } else { console.log('    (None)'); }
-                            console.log('  Device Groups:'); 
+                            console.log('  Device Groups:');
                             if (mesh.length > 0) { for (var j in mesh) { console.log('    ' + mesh[j] + ', ' + data.ugroups[i].links[mesh[j]].rights); } } else { console.log('    (None)'); }
-                            console.log('  Devices:'); 
+                            console.log('  Devices:');
                             if (node.length > 0) { for (var j in node) { console.log('    ' + node[j] + ', ' + data.ugroups[i].links[node[j]].rights); } } else { console.log('    (None)'); }
                         }
                     }
@@ -2044,7 +2388,7 @@ function serverConnect() {
                         if (args.filter != null) {
                             for (var meshid in data.nodes) {
                                 for (var d in data.nodes[meshid]) { data.nodes[meshid][d].meshid = meshid; }
-                                data.nodes[meshid] = parseSearchOrInput(data.nodes[meshid], args.filter.toLowerCase());
+                                data.nodes[meshid] = parseSearchOrInput(data.nodes[meshid], args.filter.toString().toLowerCase());
                             }
                         }
 
@@ -2072,7 +2416,7 @@ function serverConnect() {
                         } else if (args.json) {
                             // Return all devices in JSON format
                             var nodes = [];
-                            
+
                             for (var i in data.nodes) {
                                 const devicesInMesh = data.nodes[i];
                                 for (var j in devicesInMesh) {
@@ -2101,6 +2445,30 @@ function serverConnect() {
                         }
                     }
                     process.exit();
+                }
+                if ((settings.cmd == 'groupmessage') && (data.responseid == 'meshctrl')) {
+                    if ((data.nodes != null)) {
+                        for (var i in data.nodes) {
+                            for (let index = 0; index < data.nodes[i].length; index++) {
+                                const element = data.nodes[i][index];
+                                ws.send(JSON.stringify({ action: 'msg', type: 'messagebox', nodeid: element._id, title: args.title ? args.title : "MeshCentral", msg: args.msg, timeout: args.timeout ? args.timeout : 120000 }));
+                            }
+                        }
+                    }
+
+                    setTimeout(function(){ console.log('ok'); process.exit(); }, 1000);
+                }
+                if ((settings.cmd == 'grouptoast') && (data.responseid == 'meshctrl')) {
+                    if (data.nodes != null) {
+                        for (var i in data.nodes) {
+                            var nodes = [];
+                            for (let index = 0; index < data.nodes[i].length; index++) {
+                                const element = data.nodes[i][index];
+                                nodes.push(element._id);
+                            }
+                            ws.send(JSON.stringify({ action: 'toast', nodeids: nodes, title: args.title ? args.title : "MeshCentral", msg: args.msg, responseid: 'meshctrl' }));
+                        }
+                    }
                 }
                 break;
             }
@@ -2171,6 +2539,8 @@ function serverConnect() {
                 if (data.cause == 'noauth') {
                     if (data.msg == 'tokenrequired') {
                         console.log('Authentication token required, use --token [number].');
+                    } else if (data.msg == 'nokey') {
+                        console.log('URL key is invalid or missing, please specify ?key=xxx in url');
                     } else {
                         if ((args.loginkeyfile != null) || (args.loginkey != null)) {
                             console.log('Invalid login, check the login key and that this computer has the correct time.');
@@ -2187,8 +2557,18 @@ function serverConnect() {
                     console.log(data.result);
                     process.exit();
                 } else {
-                    ws.send(JSON.stringify({ action: 'loginTokens', responseid: 'meshctrl' }));
+                    if (args.json) {
+                        console.log(data);
+                    } else {
+                        console.log("New login token created.");
+                        if (data.name) { console.log("Token name: " + data.name); }
+                        if (data.created) { console.log("Created: " + new Date(data.created).toLocaleString()); }
+                        if (data.expire) { console.log("Expire: " + new Date(data.expire).toLocaleString()); }
+                        if (data.tokenUser) { console.log("Username: " + data.tokenUser); }
+                        if (data.tokenPass) { console.log("Password: " + data.tokenPass); }
+                    }
                 }
+                process.exit();
                 break;
             }
             case 'loginTokens': {
@@ -2212,6 +2592,15 @@ function serverConnect() {
             }
             case 'getDeviceDetails': {
                 console.log(data.data);
+                process.exit();
+            }
+            case 'report': {
+                console.log('group,' + data.data.columns.flatMap(c => c.id).join(','));
+                Object.keys(data.data.groups).forEach(gk => {
+                    data.data.groups[gk].entries.forEach(e => {
+                        console.log(gk + ',' + Object.values(e).join(','));
+                    });
+                });
                 process.exit();
             }
             default: { break; }
@@ -2317,9 +2706,9 @@ function getDevicesThatMatchFilter(nodes, x) {
             var rs = x.split(/\s+/).join('|'), rx = new RegExp(rs); // In some cases (like +), this can throw an exception.
             for (var d in nodes) {
                 //if (showRealNames) {
-                    //if (nodes[d].rnamel != null && rx.test(nodes[d].rnamel.toLowerCase())) { r.push(nodes[d]); }
+                //if (nodes[d].rnamel != null && rx.test(nodes[d].rnamel.toLowerCase())) { r.push(nodes[d]); }
                 //} else {
-                    if (rx.test(nodes[d].name.toLowerCase())) { r.push(nodes[d]); }
+                if (rx.test(nodes[d].name.toLowerCase())) { r.push(nodes[d]); }
                 //}
             }
         } catch (ex) { for (var d in nodes) { r.push(nodes[d]); } }
@@ -2392,7 +2781,7 @@ function connectTunnel(url) {
                     if ((cmd.action == 'uploadack') || (cmd.action == 'uploadstart')) {
                         settings.inFlight--;
                         if (settings.uploadFile == null) { if (settings.inFlight == 0) { process.exit(); } return; } // If the file is closed and there is no more in-flight data, exit.
-                        var loops = (cmd.action == 'uploadstart')?16:1; // If this is the first data to be sent, hot start now. We are going to have 16 blocks of data in-flight.
+                        var loops = (cmd.action == 'uploadstart') ? 16 : 1; // If this is the first data to be sent, hot start now. We are going to have 16 blocks of data in-flight.
                         for (var i = 0; i < loops; i++) {
                             if (settings.uploadFile == null) continue;
                             var buf = Buffer.alloc(65565);
@@ -2434,7 +2823,7 @@ function connectTunnel(url) {
         // node meshctrl download --id oL4Y6Eg0qjnpHFrp1AxfxnBPenbDGnDSkC@HSOnAheIyd51pKhqSCUgJZakzwfKl --file c:\temp\MC-8Languages.png --target c:\temp\bob.png
         settings.tunnelws.on('message', function (rawdata) {
             if (settings.tunnelwsstate == 1) {
-                if ((rawdata.length > 0) && (rawdata[0] != '{')) {
+                if ((rawdata.length > 0) && (rawdata.toString()[0] != '{')) {
                     // This is binary data, this test is ok because 4 first bytes is a control value.
                     if ((rawdata.length > 4) && (settings.downloadFile != null)) { settings.downloadSize += (rawdata.length - 4); require('fs').writeSync(settings.downloadFile, rawdata, 4, rawdata.length - 4); }
                     if ((rawdata[3] & 1) != 0) { // Check end flag
@@ -2515,7 +2904,7 @@ function displayDeviceInfo(sysinfo, lastconnect, network, nodes) {
             }
         }
     }
-    if (node == null) {
+    if ((sysinfo == null && lastconnect == null && network == null) || (node == null)) {
         console.log("Invalid device id");
         process.exit(); return;
     }
@@ -2568,7 +2957,7 @@ function displayDeviceInfo(sysinfo, lastconnect, network, nodes) {
     // MeshAgent
     if (node.agent) {
         var output = {}, outputCount = 0;
-        var agentsStr = ["Unknown", "Windows 32bit console", "Windows 64bit console", "Windows 32bit service", "Windows 64bit service", "Linux 32bit", "Linux 64bit", "MIPS", "XENx86", "Android ARM", "Linux ARM", "MacOS 32bit", "Android x86", "PogoPlug ARM", "Android APK", "Linux Poky x86-32bit", "MacOS 64bit", "ChromeOS", "Linux Poky x86-64bit", "Linux NoKVM x86-32bit", "Linux NoKVM x86-64bit", "Windows MinCore console", "Windows MinCore service", "NodeJS", "ARM-Linaro", "ARMv6l / ARMv7l", "ARMv8 64bit", "ARMv6l / ARMv7l / NoKVM", "Unknown", "Unknown", "FreeBSD x86-64"];
+        var agentsStr = ["Unknown", "Windows 32bit console", "Windows 64bit console", "Windows 32bit service", "Windows 64bit service", "Linux 32bit", "Linux 64bit", "MIPS", "XENx86", "Android", "Linux ARM", "macOS x86-32bit", "Android x86", "PogoPlug ARM", "Android", "Linux Poky x86-32bit", "macOS x86-64bit", "ChromeOS", "Linux Poky x86-64bit", "Linux NoKVM x86-32bit", "Linux NoKVM x86-64bit", "Windows MinCore console", "Windows MinCore service", "NodeJS", "ARM-Linaro", "ARMv6l / ARMv7l", "ARMv8 64bit", "ARMv6l / ARMv7l / NoKVM", "MIPS24KC (OpenWRT)", "Apple Silicon", "FreeBSD x86-64", "Unknown", "Linux ARM 64 bit (glibc/2.24 NOKVM)", "Alpine Linux x86 64 Bit (MUSL)", "Assistant (Windows)", "Armada370 - ARM32/HF (libc/2.26)", "OpenWRT x86-64", "OpenBSD x86-64", "Unknown", "Unknown", "MIPSEL24KC (OpenWRT)", "ARMADA/CORTEX-A53/MUSL (OpenWRT)", "Windows ARM 64bit console", "Windows ARM 64bit service"];
         if ((node.agent != null) && (node.agent.id != null) && (node.agent.ver != null)) {
             var str = '';
             if (node.agent.id <= agentsStr.length) { str = agentsStr[node.agent.id]; } else { str = agentsStr[0]; }
@@ -2587,6 +2976,9 @@ function displayDeviceInfo(sysinfo, lastconnect, network, nodes) {
             } else {
                 output["Last agent address"] = splitip[0]; outputCount++; // IPv4
             }
+        }
+        if ((node.agent != null) && (node.agent.tag != null)) {
+            output["Tag"] = node.agent.tag; outputCount++;
         }
         if (outputCount > 0) { info["Mesh Agent"] = output; }
     }

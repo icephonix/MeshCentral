@@ -2,7 +2,7 @@
 ~<area-name>
 Hej [[[NAME]]]
 ~</area-name>
-Användaren [[[USERNAME]]] på servern [[[SERVERNAME]]] ([[[SERVERURL]] / [[[URLARGS1]]) ber dig installera programvara för att starta fjärrkontrollsessionen.
+Användaren [[[USERNAME]]] på servern [[[SERVERNAME]]] ([[[SERVERURL]]/[[[URLARGS1]]) ber dig installera programvara för att starta fjärrkontrollsessionen.
 ~<area-msg>
 ~
 Meddelande: [[[[MSG]]]
@@ -26,6 +26,12 @@ För Linux, klipp och klistra in följande i en terminal för att installera age
 ~wget -q "[[[SERVERURL]]]/meshagents?script=1" --no-check-certificate -O ./meshinstall.sh && chmod 755 ./meshinstall.sh && sudo ./meshinstall.sh [[[SERVERURL]]] '[[[MESHIDHEX]]]'
 ~
 ~</area-linux>
+~<area-assistant>
+För MeshCentral Assistant på Windows, gå till följande länk för att slutföra processen:
+~
+~[[[SERVERURL]]]/meshagents?id=10006&meshid=[[[MESHIDHEX]]]&tag=mailto:[[[EMAIL]]]
+~
+~</area-assistant>
 ~<area-link>
 För att installera programvaran, navigera till [[[SERVERURL]]] [[[LINKURL]]] [[[URLARGS2]]] och följ instruktionerna.
 ~</area-link>

@@ -75,14 +75,16 @@
         }
     </style>
     <script language="javascript">
+        var random = '{{{randomlength}}}' // Random length string for BREACH mitigation
         var client = null;
         var canvas = null;
         var urlargs = parseUriArgs();
         if (urlargs.key && (isAlphaNumeric(urlargs.key) == false)) { delete urlargs.key; }
         var cookie = '{{{cookie}}}';
-        var serverCredentials = (decodeURIComponent('{{{serverCredentials}}}') == 'true');
+        var serverCredentials = parseInt('{{{serverCredentials}}}');
         var name = decodeURIComponent('{{{name}}}');
         if (name != '') { document.title = name + ' - ' + document.title; }
+        var features = parseInt('{{{features}}}');
 
         function load() {
             if (name != '') { QH('computerName', EscapeHtml(name)); }
@@ -96,7 +98,7 @@
                 QE('connectButton', false);
             }
 
-            if (serverCredentials == true) {
+            if (serverCredentials == 1) {
                 QV('dropdowndomain', true);
                 Q('d3coreMode').value = 1;
             } else {
@@ -159,7 +161,7 @@
             QV('rowdomain', newCreds);
             QV('rowusername', newCreds);
             QV('rowpassword', newCreds);
-            QV('rowremember', newCreds);
+            QV('rowremember', newCreds && ((features & 1) == 0));
             if (newCreds) Q('inputUsername').focus();
         }
 

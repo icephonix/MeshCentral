@@ -46,7 +46,7 @@
                 <div id=TermParent style="display:none">
                     <pre id=Term></pre>
                 </div>
-                <div id=XTermParent style="display:none;overflow:scroll;max-height:calc(100vh - 58px);height:calc(100vh - 58px)">
+                <div id=XTermParent style="display:none;overflow:scroll;max-height:calc(100vh - 58px);height:calc(100vh - 58px);text-align:left">
                 </div>
                 <div id=p11DeskConsoleMsg style="display:none;cursor:pointer;position:absolute;left:30px;top:17px;color:yellow;background-color:rgba(0,0,0,0.6);padding:10px;border-radius:5px" onclick=clearConsoleMsg()></div>
             </div>
@@ -96,6 +96,7 @@
         </div>
     </div>
     <script>
+        var random = '{{{randomlength}}}' // Random length string for BREACH mitigation
         var recFile = null;
         var recFilePtr = 0;
         var recFileStartTime = 0;
@@ -447,7 +448,7 @@
                 agentDesktop.onPreDrawImage = preCanvasDraw;
                 agentDesktop.State = 3;
                 deskAdjust();
-                QV('ConvertAsWebM', browser == 'chrome'); // Only show the "Convert to WebM button when in Chrome
+                QV('ConvertAsWebM', true);
             }
             else if (recFileMetadata.protocol == 101) {
                 // Intel AMT Redirection
@@ -487,7 +488,7 @@
                 if (recFileMetadata.lowcolor) { amtDesktop.lowcolor = recFileMetadata.lowcolor; }
                 amtDesktop.state = 3;
                 deskAdjust();
-                QV('ConvertAsWebM', browser == 'chrome'); // Only show the "Convert to WebM button when in Chrome
+                QV('ConvertAsWebM', true);
             }
             QV('metadatadiv', true);
             QH('metadatadiv', x);
@@ -1042,8 +1043,13 @@
             }
         }
 
+        // This method has caused exceptions: https://github.com/Ylianst/MeshCentral/issues/4302
         function ArrayBufferToString(buffer) {
-            return BinaryToString(String.fromCharCode.apply(null, Array.prototype.slice.apply(new Uint8Array(buffer))));
+            try { return BinaryToString(String.fromCharCode.apply(null, Array.prototype.slice.apply(new Uint8Array(buffer)))); } catch (ex) { }
+            console.log('ArrayBufferToString - Unable to convert ' + buffer.byteLength + ' bytes.');
+            var s = '', u = new Uint8Array(buffer);
+            for (var i = 0; i < buffer.byteLength; i++) { s += String.fromCharCode(u[i]); }
+            return s;
         }
 
         function StringToArrayBuffer(string) {
@@ -1102,10 +1108,10 @@
 
         function writeXTerm(data) {
             if (term == null) return;
-            if (typeof data == 'string') {
-                term.writeUtf8(data);
+            if (term.writeUtf8) {
+                if (typeof data == 'string') { term.writeUtf8(data); } else { term.writeUtf8(new Uint8Array(data)); }
             } else {
-                term.writeUtf8(new Uint8Array(data));
+                if (typeof data == 'string') { term.write(data); } else { term.write(new Uint8Array(data)); }
             }
         }
 

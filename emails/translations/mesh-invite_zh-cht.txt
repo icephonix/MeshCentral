@@ -1,4 +1,4 @@
-[[[SERVERNAME]]]-邀請
+[[[SERVERNAME]]] - 邀請
 ~<area-name>
 你好[[[NAME]]]，
 ~</area-name>
@@ -26,6 +26,12 @@
 ~wget -q "[[[SERVERURL]]]/meshagents?script=1" --no-check-certificate -O ./meshinstall.sh && chmod 755 ./meshinstall.sh && sudo ./meshinstall.sh [[[SERVERURL]]] '[[[MESHIDHEX]]]'
 ~
 ~</area-linux>
+~<area-assistant>
+對於 Windows 上的 MeshCentral Assistant，導航到以下鏈接以完成該過程：
+~
+~[[[SERVERURL]]]/meshagents?id=10006&meshid=[[[MESHIDHEX]]]&tag=mailto:[[[EMAIL]]]
+~
+~</area-assistant>
 ~<area-link>
 要安裝軟體，請導航至[[[SERVERURL]]][[[LINKURL]]][[[URLARGS2]]]，然後按照說明進行操作。
 ~</area-link>

@@ -1,16 +1,21 @@
 {
-  "$schema": "http://info.meshcentral.com/downloads/meshcentral-config-schema.json",
+  "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
   "__comment__": "This is a sample configuration file, all values and sections that start with underscore (_) are ignored. Edit a section and remove the _ in front of the name. Refer to the user's guide for details.",
   "settings": {
     "_cert": "myserver.mydomain.com",
+    "_SQLite3": true,
+    "_acebase": { "_sponsor": true },
     "_mongoDb": "mongodb://127.0.0.1:27017",
     "_mongoDbName": "meshcentral",
     "_mongoDbChangeStream": true,
+    "_mongoDbBulkOperations": true,
     "_WANonly": true,
     "_LANonly": true,
+    "_maintenanceMode": true,
+    "_certificatePrivateKeyPassword": [ "password1", "password2" ],
+    "_sessionTime": 60,
     "_sessionKey": "MyReallySecretPassword1",
     "_sessionSameSite": "strict",
-    "_certificatePrivateKeyPassword": [ "password1", "password2" ],
     "_dbEncryptKey": "MyReallySecretPassword2",
     "_dbRecordsEncryptKey": "MyReallySecretPassword",
     "_dbRecordsDecryptKey": "MyReallySecretPassword",
@@ -26,28 +31,47 @@
     "_redirPort": 80,
     "_redirPortBind": "127.0.0.1",
     "_redirAliasPort": 80,
+    "_relayPort": 453,
+    "_relayAliasPort": 463,
+    "_relayDNS": "relay.myserver.mydomain.com",
     "_agentPort": 1234,
     "_agentPortBind": "127.0.0.1",
     "_agentAliasPort": 1234,
     "_agentAliasDNS": "agents.myserver.mydomain.com",
-    "_agentPortTls": true,
+    "_agentPortTls": false,
+    "_agentLogDump": true,
+    "_agentCoreDump": true,
+    "_agentCoreDumpUsers": "user1,user2",
+    "_agentSignLock": true,
+    "_agentTimeStampServer": "http://timestamp.digicert.com",
+    "_agentTimeStampProxy": "http://1.2.3.4:80",
+    "_ignoreAgentHashCheck": true,
     "_exactPorts": true,
     "_allowLoginToken": true,
+    "_StrictTransportSecurity": true,
     "_allowFraming": true,
     "_cookieIpCheck": false,
     "_cookieEncoding": "hex",
-    "_compression": true,
-    "_wscompression": false,
-    "_agentwscompression": true,
-    "_agentsInRam": false,
     "_webRTC": false,
     "_nice404": false,
     "_selfUpdate": true,
+    "_cleanNpmCacheOnUpdate": true,
     "_browserPing": 60,
     "_browserPong": 60,
+    "_agentsInRam": false,
     "_agentPing": 60,
     "_agentPong": 60,
+    "_orphanAgentUser": "admin",
     "_agentIdleTimeout": 150,
+    "_webPageLengthRandomization": false,
+    "_compression": true,
+    "_wsCompression": false,
+    "_agentWsCompression": true,
+    "_noAgentUpdate": 1,
+    "_agentUpdateSystem": 1,
+    "_temporaryAgentUpdate": false,
+    "_amtScanner": false,
+    "_meshScanner": false,
     "_meshErrorLogPath": "c:\\tmp",
     "_npmPath": "c:\\npm.exe",
     "_npmProxy": "http://1.2.3.4:80",
@@ -55,6 +79,7 @@
     "_webPush": { "email": "xxxxx@xxxxx.com" },
     "_publicPushNotifications": true,
     "_desktopMultiplex": true,
+    "_ipBlockedUserRedirect": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     "_userAllowedIP": "127.0.0.1,192.168.1.0/24",
     "_userBlockedIP": "127.0.0.1,::1,192.168.0.100",
     "_agentAllowedIP": "192.168.0.100/24",
@@ -74,15 +99,21 @@
     "_mpsAliasPort": 4433,
     "_mpsAliasHost": "mps.mydomain.com",
     "_mpsTlsOffload": true,
+    "_mpsHighSecurity": true,
     "_no2FactorAuth": true,
+    "_lockAgentDownload": true, 
+    "_runOnServerStarted": "c:\\tmp\\mcstart.bat",
+    "_runOnServerUpdated": "c:\\tmp\\mcupdate.bat",
+    "_runOnServerError": "c:\\tmp\\mcerror.bat",
     "_log": "main,web,webrequest,cert",
+    "_debug": "main,web,webrequest,cert",
     "_syslog": "meshcentral",
     "_syslogauth": "meshcentral-auth",
     "_syslogjson": "meshcentral-json",
     "_syslogtcp": "localhost:514",
     "_webrtcConfig": {
       "iceServers": [
-        { "urls": "stun:stun.services.mozilla.com" },
+        { "urls": "stun:stun.cloudflare.com:3478" },
         { "urls": "stun:stun.l.google.com:19302" }
       ]
     },
@@ -102,6 +133,16 @@
         "password": "pass",
         "folderName": "MeshCentral-Backups",
         "maxFiles": 10
+      },
+      "_s3": {
+        "accessKey": "MYLONGACCESSKEY",
+        "secretKey": "MYLONGSECRETKEY",
+        "endpoint": "myS3.myserver.com",
+        "port": 9000,
+        "ssl": false,
+        "bucketName": "test",
+        "folderName": "MeshCentral-Backups",
+        "maxfiles": 10
       }
     },
     "_redirects": {
@@ -119,13 +160,20 @@
       "count": 10,
       "coolofftime": 10
     },
-    "watchDog": { "interval": 100, "timeout": 400 },
+    "watchDog": {
+      "interval": 100,
+      "timeout": 400
+    },
     "_AmtProvisioningServer": {
       "port": 9971,
       "deviceGroup": "mesh//xxxxxxxxxxxxxxxxxxxxx",
       "newMebxPassword": "amtpassword",
       "trustedFqdn": "sample.com",
       "ip": "192.168.1.1"
+    },
+    "_crowdsec": {
+      "url": "http://localhost:8080",
+      "apiKey": "BOUNCER_API_KEY"
     },
     "_plugins": { "enabled": true }
   },
@@ -135,21 +183,29 @@
     "footer": "Default page footer",
     "newAccounts": false
   },
-  "_domains": {
+  "domains": {
     "": {
       "_siteStyle": 2,
       "title": "MyServer",
       "title2": "Servername",
       "_titlePicture": "title-sample.png",
       "_loginPicture": "title-sample.png",
+      "_pwaLogo": "title-sample.png",
+      "_rootRedirect": "https://www.youtube.com/watch?v=Gs069dndIYk",
+      "_mobileSite": false,
+      "_maxDeviceView": 1000,
+      "_unknownUserRootRedirect": "https://www.youtube.com/watch?v=2Q_ZzBGPdqE",
+      "_nightMode": 1,
+      "_scrollToTop": true,
       "_userQuota": 1048576,
       "_meshQuota": 248576,
-      "minify": true,
-      "_guestDeviceSharing" : false,
-      "_AutoRemoveInactiveDevices": 37,
-      "_DeviceSearchBarServerAndClientName": false,
       "_loginKey": [ "abc", "123" ],
       "_agentKey": [ "abc", "123" ],
+      "_ipkvm": false,
+      "minify": true,
+      "_hidePowerTimeline": true,
+      "_showNotesPanel": true,
+      "_userSessionsSort": "Username",
       "_newAccounts": true,
       "_newAccountsUserGroups": [ "ugrp//xxxxxxxxxxxxxxxxx" ],
       "_userNameIsEmail": true,
@@ -164,11 +220,28 @@
       "_hide": 4,
       "_footer": "<a href='https://twitter.com/mytwitter'>Twitter</a>",
       "_loginfooter": "This is a private server.",
-      "_certUrl": "https://192.168.2.106:443/",
-      "_altMessenging": {
-        "name": "Jitsi",
-        "url": "https://meet.jit.si/myserver-{0}"
+      "_allowSavingDeviceCredentials": false,
+      "_guestDeviceSharing": false,
+      "_AutoRemoveInactiveDevices": 37,
+      "_DeviceSearchBarServerAndClientName": false,
+      "_agentSelfGuestSharing": {
+        "expire": 120
       },
+      "_certUrl": "https://192.168.2.106:443/",
+      "_altMessenging": [
+        {
+          "name": "Jitsi",
+          "url": "https://meet.jit.si/myserver-{0}",
+          "localurl": "https://meet.jit.si/myserver-local-{0}",
+          "type": "device"
+        },
+        {
+          "name": "Jitsi",
+          "url": "https://meet.jit.si/myserver-{0}-{1}-{2}-{3}",
+          "localurl": "https://meet.jit.si/myserver-local-{0}-{1}-{2}-{3}",
+          "type": "user"
+        }
+      ],
       "_deviceMeshRouterLinks": {
         "rdp": true,
         "ssh": true,
@@ -188,9 +261,35 @@
           }
         ]
       },
+      "_assistantTypeAgentInvite": 2,
+      "PreconfiguredScripts": [
+        {
+          "name": "Run NotePad as user",
+          "file": "scripts/notepad.bat",
+          "type": "bat",
+          "runas": "user"
+        },
+        {
+          "name": "Run NotePad as agent",
+          "cmd": "notepad.exe",
+          "type": "bat",
+          "runas": "agent"
+        },
+        {
+          "name": "Run echo",
+          "cmd": "echo \"hello world\"",
+          "type": "sh",
+          "runas": "agent"
+        },
+        {
+          "name": "Agent Update",
+          "cmd": "agentupdate",
+          "type": "agent"
+        }
+      ],
       "PreconfiguredRemoteInput": [
         {
-          "name": "CompagnyUrl",
+          "name": "CompanyUrl",
           "value": "https://help.mycompany.com/"
         },
         {
@@ -201,14 +300,15 @@
           "name": "Welcome",
           "value": "Default welcome text"
         }
-     ],
+      ],
       "myServer": {
         "Backup": false,
         "Restore": false,
         "Upgrade": false,
         "ErrorLog": false,
         "Console": false,
-        "Trace": false
+        "Trace": false,
+        "Config": false
       },
       "_passwordRequirements": {
         "min": 8,
@@ -222,21 +322,27 @@
         "skip2factor": "127.0.0.1,192.168.2.0/24",
         "oldPasswordBan": 5,
         "banCommonPasswords": false,
-        "twoFactorTimeout": 300
+        "twoFactorTimeout": 300,
+        "duo2factor": true
       },
       "_twoFactorCookieDurationDays": 30,
       "_agentInviteCodes": true,
       "_agentNoProxy": true,
+      "_lockAgentDownload": true, 
       "_geoLocation": true,
+      "_ipLocation": true,
       "_novnc": false,
-      "_mstsc": true,
+      "_mstsc": false,
       "_ssh": true,
       "_WebEmailsPath": "/myserver/email-templates",
       "_consentMessages": {
         "title": "MeshCentral",
         "desktop": "{0} requesting remote desktop access. Grant access?",
         "terminal": "{0} requesting remote terminal access. Grant access?",
-        "files": "{0} requesting remote files access. Grant access?"
+        "files": "{0} requesting remote files access. Grant access?",
+        "consentTimeout": 30,
+        "autoAcceptOnTimeout": false,
+        "oldStyle": true
       },
       "_notificationMessages": {
         "title": "MeshCentral",
@@ -245,28 +351,37 @@
         "files": "{0} started a remote files session."
       },
       "_agentCustomization": {
-        "displayName": "Compagny® Product™",
-        "description": "Compagny® Product™ agent for remote monitoring, management and assistance.",
-        "companyName": "Compagny",
-        "serviceName": "compagnyagent",
+        "displayName": "CompanyÂ® Productâ„¢",
+        "description": "CompanyÂ® Productâ„¢ agent for remote monitoring, management and assistance.",
+        "companyName": "CompanyÂ®",
+        "serviceName": "companyagent",
         "image": "agent-logo.png",
         "fileName": "compagnyagent"
       },
+      "_agentFileInfo": {
+        "icon": "agent.ico",
+        "filedescription": "sample_filedescription",
+        "fileversion": "0.1.2.3",
+        "internalname": "sample_internalname",
+        "legalcopyright": "sample_legalcopyright",
+        "originalfilename": "sample_originalfilename",
+        "productname": "sample_productname",
+        "productversion": "v0.1.2.3"
+      },
       "_assistantCustomization": {
-        "title": "Compagny® Product™",
+        "title": "CompanyÂ® Productâ„¢",
         "image": "assistant-logo.png",
         "fileName": "compagny"
       },
       "_androidCustomization": {
-        "title": "Compagny® Product™",
-        "subtitle": "Product Subtitle™",
+        "title": "CompanyÂ® Productâ„¢",
+        "subtitle": "Product Subtitleâ„¢",
         "image": "assistant-logo.png"
       },
       "_userAllowedIP": "127.0.0.1,192.168.1.0/24",
       "_userBlockedIP": "127.0.0.1,::1,192.168.0.100",
       "_agentAllowedIP": "192.168.0.100/24",
       "_agentBlockedIP": "127.0.0.1,::1",
-      "_orphanAgentUser": "admin",
       "___userSessionIdleTimeout__": "Number of user idle minutes before auto-disconnect",
       "_userSessionIdleTimeout": 30,
       "userConsentFlags": {
@@ -301,16 +416,32 @@
       ],
       "_amtAcmActivation": {
         "log": "amtactivation.log",
+        "strictCommonName": false,
         "certs": {
           "mycertname": {
-            "certfiles": [ "amtacm-leafcert.crt", "amtacm-intermediate1.crt", "amtacm-intermediate2.crt", "amtacm-rootcert.crt" ],
+            "certfiles": [
+              "amtacm-leafcert.crt",
+              "amtacm-intermediate1.crt",
+              "amtacm-intermediate2.crt",
+              "amtacm-rootcert.crt"
+            ],
             "keyfile": "amtacm-leafcert.key"
           }
         }
       },
       "_amtManager": {
-        "adminAccounts": [{ "user": "admin", "pass": "MyP@ssw0rd" }],
-        "environmentDetection": [ "domain1.com", "domain2.com", "domain3.com", "domain4.com" ],
+        "adminAccounts": [
+          {
+            "user": "admin",
+            "pass": "MyP@ssw0rd"
+          }
+        ],
+        "environmentDetection": [
+          "domain1.com",
+          "domain2.com",
+          "domain3.com",
+          "domain4.com"
+        ],
         "wifiProfiles": [
           {
             "name": "Profile1",
@@ -324,6 +455,11 @@
       "_redirects": {
         "meshcommander": "https://www.meshcommander.com/"
       },
+      "_duo2factor": {
+        "integrationkey": "mykey",
+        "secretkey": "mysecret",
+        "apihostname": "api-xxxxxxxxxxx.duosecurity.com"
+      },
       "_yubikey": {
         "id": "0000",
         "secret": "xxxxxxxxxxxxxxxxxxxxx",
@@ -333,7 +469,8 @@
         "Strict-Transport-Security": "max-age=360000",
         "x-frame-options": "SAMEORIGIN"
       },
-      "_agentConfig": [ "webSocketMaskOverride=1", "coreDumpEnabled=1" ],
+      "_agentConfig": [ "coreDumpEnabled=1" ],
+      "_assistantConfig": [ "disableUpdate=1" ],
       "_sessionRecording": {
         "_onlySelectedUsers": true,
         "_onlySelectedUserGroups": true,
@@ -341,6 +478,7 @@
         "_filepath": "C:\\temp",
         "_index": true,
         "_maxRecordings": 10,
+        "_maxRecordingDays": 15,
         "_maxRecordingSizeMegabytes": 3,
         "__protocols__": "Is an array: 1 = Terminal, 2 = Desktop, 5 = Files, 100 = Intel AMT WSMAN, 101 = Intel AMT Redirection, 200 = Messenger",
         "protocols": [ 1, 2, 101 ]
@@ -363,13 +501,6 @@
         },
         "github": {
           "_callbackurl": "https://server/auth-github-callback",
-          "newAccounts": true,
-          "_newAccountsUserGroups": [ "ugrp//xxxxxxxxxxxxxxxxx" ],
-          "clientid": "xxxxxxxxxxxxxxxxxxxxxxx",
-          "clientsecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-        },
-        "reddit": {
-          "_callbackurl": "https://server/auth-reddit-callback",
           "newAccounts": true,
           "_newAccountsUserGroups": [ "ugrp//xxxxxxxxxxxxxxxxx" ],
           "clientid": "xxxxxxxxxxxxxxxxxxxxxxx",
@@ -400,6 +531,25 @@
           "entityid": "meshcentral",
           "idpurl": "https://server/saml2",
           "cert": "saml.pem"
+        },
+        "oidc": {
+          "issuer": {
+            "issuer": "https://sso.server.com",
+            "end_session_endpoint": "https://sso.server.com/logout"
+          },
+          "client": {
+            "client_id": "00000000-0000-0000-0000-000000000000",
+            "client_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          },
+          "groups": {
+            "required": [ "groupA", "groupB", "groupC" ],
+            "siteadmin": [ "groupA" ],
+            "sync": {
+              "enable": true,
+              "filter": [ "groupB", "groupC" ]
+            }
+          },
+          "newAccounts": true
         }
       }
     },
@@ -413,26 +563,11 @@
       "_LDAPUserName": "gecos",
       "_LDAPUserKey": "uid",
       "_LDAPUserEmail": "otherMail",
-      "_LDAPPptions": {
-        "url": "test",
-        "anne": {
-          "gecos": "Anne O'Nyme",
-          "displayName": "O Nyme anne",
-          "uid": "anneonyme",
-          "mail": "anneonyme@example.com",
-          "email": "anneonyme@example.com",
-          "otherMail": [ "other.anneonyme@example.com", "anneonyme@example.com" ]
-        },
-        "so": {
-          "displayName": "Sticker Sophie",
-          "gecos": "Sophie Sticker",
-          "uid": "ssticker",
-          "mail": "ssticker@example.com",
-          "email": "ssticker@example.com",
-          "otherMail": [ "other.ssticker@example.com", "ssticker@example.com" ]
-        }
-      },
-      "__LDAPOptions": {
+      "_LDAPUserGroups": "memberOf",
+      "_LDAPSiteAdminGroups": [ "CN=Domain Admins,CN=Users,DC=sample,DC=com" ],
+      "_LDAPUserRequiredGroupMembership": [ "CN=Domain Admins,CN=Users,DC=sample,DC=com" ],
+      "_LDAPSyncWithUserGroups": { "filter": [ "CN=Domain Admins" ] },
+      "_LDAPOptions": {
         "URL": "ldap://1.2.3.4:389",
         "BindDN": "CN=svc_meshcentral,CN=Users,DC=meshcentral,DC=local",
         "BindCredentials": "Password.1",
@@ -451,7 +586,11 @@
     "email": "myemail@myserver.com",
     "names": "myserver.com,customer1.myserver.com",
     "skipChallengeVerification": false,
-    "production": false
+    "production": false,
+    "zerossl": {
+      "kid": "a1b2c3d4e5",
+      "hmacKey": "a1b2c3d4e5"
+    }
   },
   "_peers": {
     "serverId": "server1",
@@ -469,16 +608,19 @@
     "___tlscertcheck__": "When set to false, the TLS certificate of the SMTP server is not checked.",
     "_tlscertcheck": false,
     "__tlsstrict__": "When set to true, TLS cypher setup is more limited, SSLv2 and SSLv3 are not allowed.",
-    "_tlsstrict": true
+    "_tlsstrict": true,
+    "_emailDelaySeconds": 300
   },
   "_sendgrid": {
     "from": "myemail@myserver.com",
-    "apikey": "***********"
+    "apikey": "***********",
+    "_emailDelaySeconds": 300
   },
   "_sendmail": {
     "newline": "unix",
     "path": "/usr/sbin/sendmail",
-    "_args": [ "-f", "foo@example.com" ]
+    "_args": [ "-f", "foo@example.com" ],
+    "_emailDelaySeconds": 300
   },
   "_sms": {
     "provider": "twilio",
@@ -496,5 +638,27 @@
     "provider": "telnyx",
     "apikey": "xxxxxxx",
     "from": "1-555-555-5555"
+  },
+  "____sms": {
+    "provider": "url",
+    "url": "http://example.com/sms.ashx?phone={{phone}}&message={{message}}"
+  },
+  "_messaging": {
+    "_telegram": {
+      "apiid": 0,
+      "apihash": "xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "session": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "useWSS": "false",
+      "connectionRetries": 60
+    },
+    "_discord": {
+      "serverurl": "https://discord.gg/xxxxxxxxx",
+      "token": "xxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "_ntfy": {
+      "host": "https://[my]ntfy.sh",
+      "userurl": "https://[my]ntfy.sh/userhelp",
+      "authorization": "Basic xxxxxxxxxxxxxxxxxxxx" 
+    }
   }
 }

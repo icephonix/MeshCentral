@@ -80,6 +80,7 @@
         </div>
     </div>
     <script>
+        var random = '{{{randomlength}}}' // Random length string for BREACH mitigation
         var term = null;
         var termfit = null;
         var tunnel = null;
@@ -180,10 +181,10 @@
         }
 
         function tunnelUpdate(data) {
-            if (typeof data == 'string') {
-                term.writeUtf8(data);
+            if (term.writeUtf8) {
+                if (typeof data == 'string') { term.writeUtf8(data); } else { term.writeUtf8(new Uint8Array(data)); }
             } else {
-                term.writeUtf8(new Uint8Array(data));
+                if (typeof data == 'string') { term.write(data); } else { term.write(new Uint8Array(data)); }
             }
         }
 

@@ -818,7 +818,7 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
             if ((d.length >= 16) && (d.substring(0, 15) == '\0KvmDataChannel')) {
                 if (obj.kvmDataSupported == false) { obj.kvmDataSupported = true; /*console.log('KVM Data Channel Supported.');*/ }
                 if (((obj.onKvmDataAck == -1) && (d.length == 16)) || (d.charCodeAt(15) != 0)) { obj.onKvmDataAck = true; }
-                if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-DataChannel-Recv(' + (d.length - 16) + '): ' + d.substring(16)); }
+                try { if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-DataChannel-Recv(' + (d.length - 16) + '): ' + d.substring(16)); } } catch (ex) { }
                 if (d.length >= 16) { obj.onKvmData(d.substring(16)); } // Event the data and ack
                 if ((obj.onKvmDataAck == true) && (obj.onKvmDataPending.length > 0)) { obj.sendKvmData(obj.onKvmDataPending.shift()); } // Send pending data
             } else if ((d.length >= 13) && (d.substring(0, 11) == '\0KvmExtCmd\0')) {
@@ -834,7 +834,7 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
                 if (cmd == 4) { obj.sendKvmExtCmd(3); }
             } else {
                 console.log('Got KVM clipboard data:', d);
-                if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-ClipBoard-Recv(' + d.length + '): ' + rstr2hex(d) + ', ' + d); }
+                try { if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-ClipBoard-Recv(' + d.length + '): ' + rstr2hex(d) + ', ' + d); } } catch (ex) { }
             }
         }
         // ###END###{DesktopInband}
@@ -852,7 +852,7 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
         if (obj.onKvmDataAck !== true) {
             obj.onKvmDataPending.push(x);
         } else {
-            if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-DataChannel-Send(' + x.length + '): ' + x); }
+            try { if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-DataChannel-Send(' + x.length + '): ' + x); } } catch (ex) { }
             x = '\0KvmDataChannel\0' + x;
             obj.send(String.fromCharCode(6, 0, 0, 0) + IntToStr(x.length) + x);
             obj.onKvmDataAck = false;
@@ -867,7 +867,7 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
 
     // ###BEGIN###{DesktopClipboard}
     obj.sendClipboardData = function (x) {
-        if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-ClipBoard-Send(' + x.length + '): ' + rstr2hex(x) + ', ' + x); }
+        try { if (urlvars && urlvars['kvmdatatrace']) { console.log('KVM-ClipBoard-Send(' + x.length + '): ' + rstr2hex(x) + ', ' + x); } } catch (ex) { }
         obj.send(String.fromCharCode(6, 0, 0, 0) + IntToStr(x.length) + x);
     }
     // ###END###{DesktopClipboard}
@@ -884,6 +884,8 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
         c.onmouseup = obj.mouseup;
         c.onmousedown = obj.mousedown;
         c.onmousemove = obj.mousemove;
+        //c.onmousewheel = obj.mousewheel;
+        c.onwheel = obj.mousewheel;
         //if (navigator.userAgent.match(/mozilla/i)) c.DOMMouseScroll = obj.xxDOMMouseScroll; else c.onmousewheel = obj.xxMouseWheel;
         _MouseInputGrab = true;
     }
@@ -894,6 +896,8 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
         c.onmousemove = null;
         c.onmouseup = null;
         c.onmousedown = null;
+        //c.onmousewheel = null;
+        c.onwheel = null;
         //if (navigator.userAgent.match(/mozilla/i)) c.DOMMouseScroll = null; else c.onmousewheel = null;
         _MouseInputGrab = false;
     }
@@ -921,6 +925,22 @@ var CreateAmtRemoteDesktop = function (divid, scrolldiv) {
 
     // RFB 'PointerEvent' and mouse handlers
     obj.mousedblclick = function (e) { }
+    obj.mousewheel = function (e) {
+        var v = 0;
+        if (typeof e.deltaY == 'number') { v = -1 * e.deltaY; }
+        else if (typeof e.detail == 'number') { v = -1 * e.detail; }
+        else if (typeof e.wheelDelta == 'number') { v = e.wheelDelta; }
+        if (v == 0) return;
+
+        // Reverse mouse wheel if needed
+        if (obj.ReverseMouseWheel) { v = -1 * v; }
+
+        var tmpmask = obj.buttonmask;
+        obj.buttonmask |= (1 << ((v > 0) ? 3 : 4));
+        obj.mousemove(e, 1);
+        obj.buttonmask = tmpmask;
+        return obj.mousemove(e, 1);
+    }
     obj.mousedown = function (e) { obj.buttonmask |= (1 << e.button); return obj.mousemove(e, 1); }
     obj.mouseup = function (e) { obj.buttonmask &= (0xFFFF - (1 << e.button)); return obj.mousemove(e, 1); }
     obj.mousemove = function (e, force) {

@@ -40,7 +40,6 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.tls = require('tls');
     obj.path = require('path');
     obj.bodyParser = require('body-parser');
-    obj.session = require('cookie-session');
     obj.exphbs = require('express-handlebars');
     obj.crypto = require('crypto');
     obj.common = require('./common.js');
@@ -52,7 +51,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.meshIderHandler = require('./amt/amt-ider.js');
     obj.meshUserHandler = require('./meshuser.js');
     obj.interceptor = require('./interceptor');
-    obj.uaparser = require('./ua-parser');
+    obj.uaparser = require('ua-parser-js');
     const constants = (obj.crypto.constants ? obj.crypto.constants : require('constants')); // require('constants') is deprecated in Node 11.10, use require('crypto').constants instead.
 
     // Setup WebAuthn / FIDO2
@@ -73,6 +72,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.users = {};                             // UserID --> User
     obj.meshes = {};                            // MeshID --> Mesh (also called device group)
     obj.userGroups = {};                        // UGrpID --> User Group
+    obj.useNodeDefaultTLSCiphers = args.usenodedefaulttlsciphers; // Use TLS ciphers provided by node
+    obj.tlsCiphers = args.tlsciphers;           // List of TLS ciphers to use
     obj.userAllowedIp = args.userallowedip;     // List of allowed IP addresses for users
     obj.agentAllowedIp = args.agentallowedip;   // List of allowed IP addresses for agents
     obj.agentBlockedIp = args.agentblockedip;   // List of blocked IP addresses for agents
@@ -84,46 +85,62 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.blockedAgents = 0;
     obj.renderPages = null;
     obj.renderLanguages = [];
-    obj.destroyedSessions = {};
+    obj.destroyedSessions = {};                 // userid/req.session.x --> destroyed session time
+
+    // Web relay sessions
+    var webRelayNextSessionId = 1;
+    var webRelaySessions = {}                   // UserId/SessionId/Host --> Web Relay Session
+    var webRelayCleanupTimer = null;
+
+    // Monitor web relay session removals
+    parent.AddEventDispatch(['server-shareremove'], obj);
+    obj.HandleEvent = function (source, event, ids, id) {
+        if (event.action == 'removedDeviceShare') {
+            for (var relaySessionId in webRelaySessions) {
+                // A share was removed that matches an active session, close the web relay session.
+                if (webRelaySessions[relaySessionId].xpublicid === event.publicid) { webRelaySessions[relaySessionId].close(); }
+            }
+        }
+    }
 
     // Mesh Rights
-    const MESHRIGHT_EDITMESH            = 0x00000001;
-    const MESHRIGHT_MANAGEUSERS         = 0x00000002;
-    const MESHRIGHT_MANAGECOMPUTERS     = 0x00000004;
-    const MESHRIGHT_REMOTECONTROL       = 0x00000008;
-    const MESHRIGHT_AGENTCONSOLE        = 0x00000010;
-    const MESHRIGHT_SERVERFILES         = 0x00000020;
-    const MESHRIGHT_WAKEDEVICE          = 0x00000040;
-    const MESHRIGHT_SETNOTES            = 0x00000080;
-    const MESHRIGHT_REMOTEVIEWONLY      = 0x00000100;
-    const MESHRIGHT_NOTERMINAL          = 0x00000200;
-    const MESHRIGHT_NOFILES             = 0x00000400;
-    const MESHRIGHT_NOAMT               = 0x00000800;
-    const MESHRIGHT_DESKLIMITEDINPUT    = 0x00001000;
-    const MESHRIGHT_LIMITEVENTS         = 0x00002000;
-    const MESHRIGHT_CHATNOTIFY          = 0x00004000;
-    const MESHRIGHT_UNINSTALL           = 0x00008000;
-    const MESHRIGHT_NODESKTOP           = 0x00010000;
-    const MESHRIGHT_REMOTECOMMAND       = 0x00020000;
-    const MESHRIGHT_RESETOFF            = 0x00040000;
-    const MESHRIGHT_GUESTSHARING        = 0x00080000;
-    const MESHRIGHT_ADMIN               = 0xFFFFFFFF;
+    const MESHRIGHT_EDITMESH = 0x00000001;
+    const MESHRIGHT_MANAGEUSERS = 0x00000002;
+    const MESHRIGHT_MANAGECOMPUTERS = 0x00000004;
+    const MESHRIGHT_REMOTECONTROL = 0x00000008;
+    const MESHRIGHT_AGENTCONSOLE = 0x00000010;
+    const MESHRIGHT_SERVERFILES = 0x00000020;
+    const MESHRIGHT_WAKEDEVICE = 0x00000040;
+    const MESHRIGHT_SETNOTES = 0x00000080;
+    const MESHRIGHT_REMOTEVIEWONLY = 0x00000100;
+    const MESHRIGHT_NOTERMINAL = 0x00000200;
+    const MESHRIGHT_NOFILES = 0x00000400;
+    const MESHRIGHT_NOAMT = 0x00000800;
+    const MESHRIGHT_DESKLIMITEDINPUT = 0x00001000;
+    const MESHRIGHT_LIMITEVENTS = 0x00002000;
+    const MESHRIGHT_CHATNOTIFY = 0x00004000;
+    const MESHRIGHT_UNINSTALL = 0x00008000;
+    const MESHRIGHT_NODESKTOP = 0x00010000;
+    const MESHRIGHT_REMOTECOMMAND = 0x00020000;
+    const MESHRIGHT_RESETOFF = 0x00040000;
+    const MESHRIGHT_GUESTSHARING = 0x00080000;
+    const MESHRIGHT_ADMIN = 0xFFFFFFFF;
 
     // Site rights
-    const SITERIGHT_SERVERBACKUP        = 0x00000001;
-    const SITERIGHT_MANAGEUSERS         = 0x00000002;
-    const SITERIGHT_SERVERRESTORE       = 0x00000004;
-    const SITERIGHT_FILEACCESS          = 0x00000008;
-    const SITERIGHT_SERVERUPDATE        = 0x00000010;
-    const SITERIGHT_LOCKED              = 0x00000020;
-    const SITERIGHT_NONEWGROUPS         = 0x00000040;
-    const SITERIGHT_NOMESHCMD           = 0x00000080;
-    const SITERIGHT_USERGROUPS          = 0x00000100;
-    const SITERIGHT_RECORDINGS          = 0x00000200;
-    const SITERIGHT_LOCKSETTINGS        = 0x00000400;
-    const SITERIGHT_ALLEVENTS           = 0x00000800;
-    const SITERIGHT_NONEWDEVICES        = 0x00001000;
-    const SITERIGHT_ADMIN               = 0xFFFFFFFF;
+    const SITERIGHT_SERVERBACKUP = 0x00000001;
+    const SITERIGHT_MANAGEUSERS = 0x00000002;
+    const SITERIGHT_SERVERRESTORE = 0x00000004;
+    const SITERIGHT_FILEACCESS = 0x00000008;
+    const SITERIGHT_SERVERUPDATE = 0x00000010;
+    const SITERIGHT_LOCKED = 0x00000020;
+    const SITERIGHT_NONEWGROUPS = 0x00000040;
+    const SITERIGHT_NOMESHCMD = 0x00000080;
+    const SITERIGHT_USERGROUPS = 0x00000100;
+    const SITERIGHT_RECORDINGS = 0x00000200;
+    const SITERIGHT_LOCKSETTINGS = 0x00000400;
+    const SITERIGHT_ALLEVENTS = 0x00000800;
+    const SITERIGHT_NONEWDEVICES = 0x00001000;
+    const SITERIGHT_ADMIN = 0xFFFFFFFF;
 
     // Setup SSPI authentication if needed
     if ((obj.parent.platform == 'win32') && (obj.args.nousers != true) && (obj.parent.config != null) && (obj.parent.config.domains != null)) {
@@ -136,12 +153,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.webCertificateHashBase64 = Buffer.from(obj.webCertificateHash, 'binary').toString('base64').replace(/\+/g, '@').replace(/\//g, '$');
     obj.webCertificateFullHash = parent.certificateOperations.getCertHashBinary(obj.certificates.web.cert);
     obj.webCertificateFullHashs = { '': obj.webCertificateFullHash };
-    obj.webCertificateExpire = { '': Date.parse(parent.certificateOperations.forge.pki.certificateFromPem(parent.certificates.web.cert).validity.notAfter) };
+    obj.webCertificateExpire = { '': parent.certificateOperations.getCertificateExpire(parent.certificates.web.cert) };
     obj.agentCertificateHashHex = parent.certificateOperations.getPublicKeyHash(obj.certificates.agent.cert);
     obj.agentCertificateHashBase64 = Buffer.from(obj.agentCertificateHashHex, 'hex').toString('base64').replace(/\+/g, '@').replace(/\//g, '$');
     obj.agentCertificateAsn1 = parent.certificateOperations.forge.asn1.toDer(parent.certificateOperations.forge.pki.certificateToAsn1(parent.certificateOperations.forge.pki.certificateFromPem(parent.certificates.agent.cert))).getBytes();
-    obj.defaultWebCertificateHash = parent.certificateOperations.getPublicKeyHashBinary(obj.certificates.webdefault.cert);
-    obj.defaultWebCertificateFullHash = parent.certificateOperations.getCertHashBinary(obj.certificates.webdefault.cert);
+    obj.defaultWebCertificateHash = obj.certificates.webdefault ? parent.certificateOperations.getPublicKeyHashBinary(obj.certificates.webdefault.cert) : null;
+    obj.defaultWebCertificateFullHash = obj.certificates.webdefault ? parent.certificateOperations.getCertHashBinary(obj.certificates.webdefault.cert) : null;
 
     // Compute the hash of all of the web certificates for each domain
     for (var i in obj.parent.config.domains) {
@@ -195,7 +212,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.wsPeerSessions3 = {};         // ServerId --> UserId --> [ SessionId ]
     obj.sessionsCount = {};           // Merged session counters, used when doing server peering. UserId --> SessionCount
     obj.wsrelays = {};                // Id -> Relay
-    obj.desktoprelays = {};           // Id -> Desktop Multiplexor Relay
+    obj.desktoprelays = {};           // Id -> Desktop Multiplexer Relay
     obj.wsPeerRelays = {};            // Id -> { ServerId, Time }
     var tlsSessionStore = {};         // Store TLS session information for quick resume.
     var tlsSessionStoreCount = 0;     // Number of cached TLS session information in store.
@@ -235,7 +252,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         for (i in docs) { var u = obj.users[docs[i]._id] = docs[i]; domainUserCount[u.domain]++; }
         for (i in parent.config.domains) {
             if ((parent.config.domains[i].share == null) && (domainUserCount[i] == 0)) {
-                // If newaccounts is set to no new accounts, but no accounts exists, temporarly allow account creation.
+                // If newaccounts is set to no new accounts, but no accounts exists, temporarily allow account creation.
                 //if ((parent.config.domains[i].newaccounts === 0) || (parent.config.domains[i].newaccounts === false)) { parent.config.domains[i].newaccounts = 2; }
                 console.log('Server ' + ((i == '') ? '' : (i + ' ')) + 'has no users, next new account will be site administrator.');
             }
@@ -427,7 +444,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         if (!user) { fn(new Error('cannot find user')); return; }
                         if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
 
-                        // Succesful login token authentication
+                        // Successful login token authentication
                         var loginOptions = { tokenName: loginToken.name, tokenUser: loginToken.tokenUser };
                         if (loginToken.expire != 0) { loginOptions.expire = loginToken.expire; }
                         return fn(null, user._id, null, loginOptions);
@@ -436,227 +453,265 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }, 0);
             });
         } else if (domain.auth == 'ldap') {
-            if (domain.ldapoptions.url == 'test') {
-                // Fake LDAP login
-                var xxuser = domain.ldapoptions[name.toLowerCase()];
-                if (xxuser == null) {
-                    fn(new Error('invalid password'));
-                    return;
+            // This method will handle LDAP login
+            const ldapHandler = function ldapHandlerFunc(err, xxuser) {
+                if (err) { parent.debug('ldap', 'LDAP Error: ' + err); if (ldapHandlerFunc.ldapobj) { try { ldapHandlerFunc.ldapobj.close(); } catch (ex) { console.log(ex); } } fn(new Error('invalid password')); return; }
+
+                // Save this LDAP user to file if needed
+                if (typeof domain.ldapsaveusertofile == 'string') {
+                    obj.fs.appendFile(domain.ldapsaveusertofile, JSON.stringify(xxuser) + '\r\n\r\n', function (err) { });
+                }
+
+                // Work on getting the userid for this LDAP user
+                var shortname = null;
+                var username = xxuser['displayName'];
+                if (typeof domain.ldapusername == 'string') {
+                    if (domain.ldapusername.indexOf('{{{') >= 0) { username = assembleStringFromObject(domain.ldapusername, xxuser); } else { username = xxuser[domain.ldapusername]; }
+                } else { username = xxuser['displayName'] ? xxuser['displayName'] : xxuser['name']; }
+                if (domain.ldapuserbinarykey) {
+                    // Use a binary key as the userid
+                    if (xxuser[domain.ldapuserbinarykey]) { shortname = Buffer.from(xxuser[domain.ldapuserbinarykey], 'binary').toString('hex').toLowerCase(); }
+                } else if (domain.ldapuserkey) {
+                    // Use a string key as the userid
+                    if (xxuser[domain.ldapuserkey]) { shortname = xxuser[domain.ldapuserkey]; }
                 } else {
-                    var username = xxuser['displayName'];
-                    if (domain.ldapusername) { username = xxuser[domain.ldapusername]; }
-                    var shortname = null;
-                    if (domain.ldapuserbinarykey) {
-                        // Use a binary key as the userid
-                        if (xxuser[domain.ldapuserbinarykey]) { shortname = Buffer.from(xxuser[domain.ldapuserbinarykey], 'binary').toString('hex'); }
-                    } else if (domain.ldapuserkey) {
-                        // Use a string key as the userid
-                        if (xxuser[domain.ldapuserkey]) { shortname = xxuser[domain.ldapuserkey]; }
-                    } else {
-                        // Use the default key as the userid
-                        if (xxuser.objectSid) { shortname = Buffer.from(xxuser.objectSid, 'binary').toString('hex').toLowerCase(); }
-                        else if (xxuser.objectGUID) { shortname = Buffer.from(xxuser.objectGUID, 'binary').toString('hex').toLowerCase(); }
-                        else if (xxuser.name) { shortname = xxuser.name; }
-                        else if (xxuser.cn) { shortname = xxuser.cn; }
+                    // Use the default key as the userid
+                    if (xxuser['objectSid']) { shortname = Buffer.from(xxuser['objectSid'], 'binary').toString('hex').toLowerCase(); }
+                    else if (xxuser['objectGUID']) { shortname = Buffer.from(xxuser['objectGUID'], 'binary').toString('hex').toLowerCase(); }
+                    else if (xxuser['name']) { shortname = xxuser['name']; }
+                    else if (xxuser['cn']) { shortname = xxuser['cn']; }
+                }
+                if (shortname == null) { fn(new Error('no user identifier')); if (ldapHandlerFunc.ldapobj) { try { ldapHandlerFunc.ldapobj.close(); } catch (ex) { console.log(ex); } } return; }
+                if (username == null) { username = shortname; }
+                var userid = 'user/' + domain.id + '/' + shortname;
+
+                // Get the list of groups this user is a member of.
+                var userMemberships = xxuser[(typeof domain.ldapusergroups == 'string') ? domain.ldapusergroups : 'memberOf'];
+                if (typeof userMemberships == 'string') { userMemberships = [userMemberships]; }
+                if (Array.isArray(userMemberships) == false) { userMemberships = []; }
+
+                // See if the user is required to be part of an LDAP user group in order to log into this server.
+                if (typeof domain.ldapuserrequiredgroupmembership == 'string') { domain.ldapuserrequiredgroupmembership = [domain.ldapuserrequiredgroupmembership]; }
+                if (Array.isArray(domain.ldapuserrequiredgroupmembership)) {
+                    // Look for a matching LDAP user group
+                    var userMembershipMatch = false;
+                    for (var i in domain.ldapuserrequiredgroupmembership) { if (userMemberships.indexOf(domain.ldapuserrequiredgroupmembership[i]) >= 0) { userMembershipMatch = true; } }
+                    if (userMembershipMatch === false) { parent.authLog('ldapHandler', 'LDAP denying login to a user that is not a member of a LDAP required group.'); fn('denied'); return; } // If there is no match, deny the login
+                }
+
+                // Check if user is in an site administrator group
+                var siteAdminGroup = null;
+                if (typeof domain.ldapsiteadmingroups == 'string') { domain.ldapsiteadmingroups = [domain.ldapsiteadmingroups]; }
+                if (Array.isArray(domain.ldapsiteadmingroups)) {
+                    siteAdminGroup = false;
+                    for (var i in domain.ldapsiteadmingroups) {
+                        if (userMemberships.indexOf(domain.ldapsiteadmingroups[i]) >= 0) { siteAdminGroup = domain.ldapsiteadmingroups[i]; }
                     }
-                    if (shortname == null) { fn(new Error('no user identifier')); return; }
-                    if (username == null) { username = shortname; }
-                    var userid = 'user/' + domain.id + '/' + shortname;
-                    var user = obj.users[userid];
-                    var email = null;
-                    if (domain.ldapuseremail) {
-                        email = xxuser[domain.ldapuseremail];
-                    } else if (xxuser.mail) { // use default 
-                        email = xxuser.mail;
+                }
+
+                // See if we need to sync LDAP user memberships with user groups
+                if (domain.ldapsyncwithusergroups === true) { domain.ldapsyncwithusergroups = {}; }
+                if (typeof domain.ldapsyncwithusergroups == 'object') {
+                    // LDAP user memberships sync is enabled, see if there are any filters to apply
+                    if (typeof domain.ldapsyncwithusergroups.filter == 'string') { domain.ldapsyncwithusergroups.filter = [domain.ldapsyncwithusergroups.filter]; }
+                    if (Array.isArray(domain.ldapsyncwithusergroups.filter)) {
+                        const g = [];
+                        for (var i in userMemberships) {
+                            var match = false;
+                            for (var j in domain.ldapsyncwithusergroups.filter) {
+                                if (userMemberships[i].indexOf(domain.ldapsyncwithusergroups.filter[j]) >= 0) { match = true; }
+                            }
+                            if (match) { g.push(userMemberships[i]); }
+                        }
+                        userMemberships = g;
                     }
-                    if ('[object Array]' == Object.prototype.toString.call(email)) {
-                        // mail may be multivalued in ldap in which case, answer is an array. Use the 1st value.
-                        email = email[0];
+                } else {
+                    // LDAP user memberships sync is disabled, sync the user with empty membership
+                    userMemberships = [];
+                }
+
+                // Get the email address for this LDAP user
+                var email = null;
+                if (domain.ldapuseremail) { email = xxuser[domain.ldapuseremail]; } else if (xxuser['mail']) { email = xxuser['mail']; } // Use given field name or default
+                if (Array.isArray(email)) { email = email[0]; } // Mail may be multivalued in LDAP in which case, answer is an array. Use the 1st value.
+                if (email) { email = email.toLowerCase(); } // it seems some code elsewhere also lowercase the emailaddress, so let's be consistent.
+
+                // Get the real name for this LDAP user
+                var realname = null;
+                if (typeof domain.ldapuserrealname == 'string') {
+                    if (domain.ldapuserrealname.indexOf('{{{') >= 0) { realname = assembleStringFromObject(domain.ldapuserrealname, xxuser); } else { realname = xxuser[domain.ldapuserrealname]; }
+                }
+                else { if (typeof xxuser['name'] == 'string') { realname = xxuser['name']; } }
+
+                // Get the phone number for this LDAP user
+                var phonenumber = null;
+                if (domain.ldapuserphonenumber) { phonenumber = xxuser[domain.ldapuserphonenumber]; }
+                else { if (typeof xxuser['telephoneNumber'] == 'string') { phonenumber = xxuser['telephoneNumber']; } }
+
+                // Work on getting the image of this LDAP user
+                var userimage = null, userImageBuffer = null;
+                if (xxuser._raw) { // Using _raw allows us to get data directly as buffer.
+                    if (domain.ldapuserimage && xxuser[domain.ldapuserimage]) { userImageBuffer = xxuser._raw[domain.ldapuserimage]; }
+                    else if (xxuser['thumbnailPhoto']) { userImageBuffer = xxuser._raw['thumbnailPhoto']; }
+                    else if (xxuser['jpegPhoto']) { userImageBuffer = xxuser._raw['jpegPhoto']; }
+                    if (userImageBuffer != null) {
+                        if ((userImageBuffer[0] == 0xFF) && (userImageBuffer[1] == 0xD8) && (userImageBuffer[2] == 0xFF) && (userImageBuffer[3] == 0xE0)) { userimage = 'data:image/jpeg;base64,' + userImageBuffer.toString('base64'); }
+                        if ((userImageBuffer[0] == 0x89) && (userImageBuffer[1] == 0x50) && (userImageBuffer[2] == 0x4E) && (userImageBuffer[3] == 0x47)) { userimage = 'data:image/png;base64,' + userImageBuffer.toString('base64'); }
                     }
-                    if (email) { email = email.toLowerCase(); } // it seems some code otherwhere also lowercase the emailaddress. be compatible.
+                }
 
-                    if (user == null) {
-                        // Create a new user
-                        var user = { type: 'user', _id: userid, name: username, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
-                        if (email) { user['email'] = email; user['emailVerified'] = true; }
-                        if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
-                        if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
-                        var usercount = 0;
-                        for (var i in obj.users) { if (obj.users[i].domain == domain.id) { usercount++; } }
-                        if (usercount == 0) { user.siteadmin = 4294967295; /*if (domain.newaccounts === 2) { delete domain.newaccounts; }*/ } // If this is the first user, give the account site admin.
+                // Display user information extracted from LDAP data
+                parent.authLog('ldapHandler', 'LDAP user login, id: ' + shortname + ', username: ' + username + ', email: ' + email + ', realname: ' + realname + ', phone: ' + phonenumber + ', image: ' + (userimage != null));
 
-                        // Auto-join any user groups
-                        if (typeof domain.newaccountsusergroups == 'object') {
-                            for (var i in domain.newaccountsusergroups) {
-                                var ugrpid = domain.newaccountsusergroups[i];
-                                if (ugrpid.indexOf('/') < 0) { ugrpid = 'ugrp/' + domain.id + '/' + ugrpid; }
-                                var ugroup = obj.userGroups[ugrpid];
-                                if (ugroup != null) {
-                                    // Add group to the user
-                                    if (user.links == null) { user.links = {}; }
-                                    user.links[ugroup._id] = { rights: 1 };
+                // If there is a testing userid, use that
+                if (ldapHandlerFunc.ldapShortName) {
+                    shortname = ldapHandlerFunc.ldapShortName;
+                    userid = 'user/' + domain.id + '/' + shortname;
+                }
 
-                                    // Add user to the group
-                                    ugroup.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
-                                    db.Set(ugroup);
+                // Save the user image
+                if (userimage != null) { parent.db.Set({ _id: 'im' + userid, image: userimage }); } else { db.Remove('im' + userid); }
 
-                                    // Notify user group change
-                                    var event = { etype: 'ugrp', ugrpid: ugroup._id, name: ugroup.name, desc: ugroup.desc, action: 'usergroupchange', links: ugroup.links, msgid: 71, msgArgs: [user.name, ugroup.name], msg: 'Added user ' + user.name + ' to user group ' + ugroup.name, addUserDomain: domain.id };
-                                    if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
-                                    parent.DispatchEvent(['*', ugroup._id, user._id], obj, event);
-                                }
+                // Close the LDAP object
+                if (ldapHandlerFunc.ldapobj) { try { ldapHandlerFunc.ldapobj.close(); } catch (ex) { console.log(ex); } }
+
+                // Check if the user already exists
+                var user = obj.users[userid];
+                if (user == null) {
+                    // This user does not exist, create a new account.
+                    var user = { type: 'user', _id: userid, name: username, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
+                    if (email) { user['email'] = email; user['emailVerified'] = true; }
+                    if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
+                    if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
+                    var usercount = 0;
+                    for (var i in obj.users) { if (obj.users[i].domain == domain.id) { usercount++; } }
+                    if (usercount == 0) { user.siteadmin = 4294967295; /*if (domain.newaccounts === 2) { delete domain.newaccounts; }*/ } // If this is the first user, give the account site admin.
+
+                    // Auto-join any user groups
+                    if (typeof domain.newaccountsusergroups == 'object') {
+                        for (var i in domain.newaccountsusergroups) {
+                            var ugrpid = domain.newaccountsusergroups[i];
+                            if (ugrpid.indexOf('/') < 0) { ugrpid = 'ugrp/' + domain.id + '/' + ugrpid; }
+                            var ugroup = obj.userGroups[ugrpid];
+                            if (ugroup != null) {
+                                // Add group to the user
+                                if (user.links == null) { user.links = {}; }
+                                user.links[ugroup._id] = { rights: 1 };
+
+                                // Add user to the group
+                                ugroup.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
+                                db.Set(ugroup);
+
+                                // Notify user group change
+                                var event = { etype: 'ugrp', ugrpid: ugroup._id, name: ugroup.name, desc: ugroup.desc, action: 'usergroupchange', links: ugroup.links, msgid: 71, msgArgs: [user.name, ugroup.name], msg: 'Added user ' + user.name + ' to user group ' + ugroup.name, addUserDomain: domain.id };
+                                if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
+                                parent.DispatchEvent(['*', ugroup._id, user._id], obj, event);
                             }
                         }
+                    }
 
-                        obj.users[user._id] = user;
+                    // Check the user real name
+                    if (realname) { user.realname = realname; }
+
+                    // Check the user phone number
+                    if (phonenumber) { user.phone = phonenumber; }
+
+                    // Indicate that this user has a image
+                    if (userimage != null) { user.flags = 1; }
+
+                    // See if the user is a member of the site admin group.
+                    if (typeof siteAdminGroup === 'string') {
+                        parent.authLog('ldapHandler', `LDAP: Granting site admin privilages to new user "${user.name}" found in admin group: ${siteAdminGroup}`);
+                        user.siteadmin = 0xFFFFFFFF;
+                    }
+
+                    // Sync the user with LDAP matching user groups
+                    if (syncExternalUserGroups(domain, user, userMemberships, 'ldap') == true) { userChanged = true; }
+
+                    obj.users[user._id] = user;
+                    obj.db.SetUser(user);
+                    var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msgid: 128, msgArgs: [user.name], msg: 'Account created, name is ' + user.name, domain: domain.id };
+                    if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
+                    obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
+                    return fn(null, user._id);
+                } else {
+                    var userChanged = false;
+
+                    // This is an existing user
+                    // If the display username has changes, update it.
+                    if (user.name != username) { user.name = username; userChanged = true; }
+
+                    // Check if user email has changed
+                    if (user.email && !email) { // email unset in ldap => unset
+                        delete user.email;
+                        delete user.emailVerified;
+                        userChanged = true;
+                    } else if (user.email != email) { // update email
+                        user['email'] = email;
+                        user['emailVerified'] = true;
+                        userChanged = true;
+                    }
+
+                    // Check the user real name
+                    if (realname != user.realname) { user.realname = realname; userChanged = true; }
+
+                    // Check the user phone number
+                    if (phonenumber != user.phone) { user.phone = phonenumber; userChanged = true; }
+
+                    // Check the user image flag
+                    if ((userimage != null) && ((user.flags == null) || ((user.flags & 1) == 0))) { if (user.flags == null) { user.flags = 1; } else { user.flags += 1; } userChanged = true; }
+                    if ((userimage == null) && (user.flags != null) && ((user.flags & 1) != 0)) { if (user.flags == 1) { delete user.flags; } else { user.flags -= 1; } userChanged = true; }
+
+                    // See if the user is a member of the site admin group.
+                    if ((typeof siteAdminGroup === 'string') && (user.siteadmin !== 0xFFFFFFFF)) {
+                        parent.authLog('ldapHandler', `LDAP: Granting site admin privilages to user "${user.name}" found in administrator group: ${siteAdminGroup}`);
+                        user.siteadmin = 0xFFFFFFFF;
+                        userChanged = true;
+                    } else if ((siteAdminGroup === false) && (user.siteadmin === 0xFFFFFFFF)) {
+                        parent.authLog('ldapHandler', `LDAP: Revoking site admin privilages from user "${user.name}" since they are not found in any administrator groups.`);
+                        delete user.siteadmin;
+                        userChanged = true;
+                    }
+
+                    // Synd the user with LDAP matching user groups
+                    if (syncExternalUserGroups(domain, user, userMemberships, 'ldap') == true) { userChanged = true; }
+
+                    // If the user changed, save the changes to the database here
+                    if (userChanged) {
                         obj.db.SetUser(user);
-                        var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msgid: 128, msgArgs: [user.name], msg: 'Account created, name is ' + user.name, domain: domain.id };
-                        if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
-                        obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
-                        return fn(null, user._id);
+                        var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 154, msg: 'Account changed to sync with LDAP data.', domain: domain.id };
+                        if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
+                        parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
+                    }
+
+                    // If user is locker out, block here.
+                    if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
+                    return fn(null, user._id);
+                }
+            }
+
+            if (domain.ldapoptions.url == 'test') {
+                // Test LDAP login
+                var xxuser = domain.ldapoptions[name.toLowerCase()];
+                if (xxuser == null) { fn(new Error('invalid password')); return; } else {
+                    ldapHandler.ldapShortName = name.toLowerCase();
+                    if (typeof xxuser == 'string') {
+                        // The test LDAP user points to a JSON file where the user information is, load it.
+                        ldapHandler(null, require(xxuser));
                     } else {
-                        // This is an existing user
-                        // If the display username has changes, update it.
-                        if (user.name != username) {
-                            user.name = username;
-                            obj.db.SetUser(user);
-                            var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 127, msgArgs: [user.name], msg: 'Changed account display name to ' + user.name, domain: domain.id };
-                            if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
-                            parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
-                        }
-                        // Check if user email has changed
-                        var emailreason = null;
-                        if (user.email && !email) { // email unset in ldap => unset
-                            delete user.email;
-                            delete user.emailVerified;
-                            emailreason = 'Unset email (no more email in LDAP)'
-                        } else if (user.email != email) { // update email
-                            user['email'] = email;
-                            user['emailVerified'] = true;
-                            emailreason = 'Set account email to ' + email + '. Sync with LDAP.';
-                        }
-                        if (emailreason) {
-                            obj.db.SetUser(user);
-                            var event = { etype: 'user', userid: userid, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msg: emailreason, domain: domain.id };
-                            if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
-                            parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
-                        }
-                        // If user is locker out, block here.
-                        if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
-                        return fn(null, user._id);
+                        // The test user information is in the config.json, use it.
+                        ldapHandler(null, xxuser);
                     }
                 }
             } else {
                 // LDAP login
                 var LdapAuth = require('ldapauth-fork');
+                if (domain.ldapoptions == null) { domain.ldapoptions = {}; }
+                domain.ldapoptions.includeRaw = true; // This allows us to get data as buffers which is useful for images.
                 var ldap = new LdapAuth(domain.ldapoptions);
-                ldap.on('error', function (err) { console.log('ldap error: ', err); });
-                ldap.authenticate(name, pass, function (err, xxuser) {
-                    try { ldap.close(); } catch (ex) { console.log(ex); } // Close the LDAP object
-                    if (err) { fn(new Error('invalid password')); return; }
-                    var shortname = null;
-                    var email = null;
-                    if (domain.ldapuseremail) {
-                        email = xxuser[domain.ldapuseremail];
-                    } else if (xxuser.mail) {
-                        email = xxuser.mail;
-                    }
-                    if ('[object Array]' == Object.prototype.toString.call(email)) {
-                        // mail may be multivalued in ldap in which case, answer would be an array. Use the 1st one.
-                        email = email[0];
-                    }
-                    if (email) { email = email.toLowerCase(); } // it seems some code otherwhere also lowercase the emailaddress. be compatible.
-                    var username = xxuser['displayName'];
-                    if (domain.ldapusername) { username = xxuser[domain.ldapusername]; }
-                    if (domain.ldapuserbinarykey) {
-                        // Use a binary key as the userid
-                        if (xxuser[domain.ldapuserbinarykey]) { shortname = Buffer.from(xxuser[domain.ldapuserbinarykey], 'binary').toString('hex').toLowerCase(); }
-                    } else if (domain.ldapuserkey) {
-                        // Use a string key as the userid
-                        if (xxuser[domain.ldapuserkey]) { shortname = xxuser[domain.ldapuserkey]; }
-                    } else {
-                        // Use the default key as the userid
-                        if (xxuser.objectSid) { shortname = Buffer.from(xxuser.objectSid, 'binary').toString('hex').toLowerCase(); }
-                        else if (xxuser.objectGUID) { shortname = Buffer.from(xxuser.objectGUID, 'binary').toString('hex').toLowerCase(); }
-                        else if (xxuser.name) { shortname = xxuser.name; }
-                        else if (xxuser.cn) { shortname = xxuser.cn; }
-                    }
-                    if (shortname == null) { fn(new Error('no user identifier')); return; }
-                    if (username == null) { username = shortname; }
-                    var userid = 'user/' + domain.id + '/' + shortname;
-                    var user = obj.users[userid];
-
-                    if (user == null) {
-                        // This user does not exist, create a new account.
-                        var user = { type: 'user', _id: userid, name: username, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
-                        if (email) { user['email'] = email; user['emailVerified'] = true; }
-                        if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
-                        if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
-                        var usercount = 0;
-                        for (var i in obj.users) { if (obj.users[i].domain == domain.id) { usercount++; } }
-                        if (usercount == 0) { user.siteadmin = 4294967295; /*if (domain.newaccounts === 2) { delete domain.newaccounts; }*/ } // If this is the first user, give the account site admin.
-
-                        // Auto-join any user groups
-                        if (typeof domain.newaccountsusergroups == 'object') {
-                            for (var i in domain.newaccountsusergroups) {
-                                var ugrpid = domain.newaccountsusergroups[i];
-                                if (ugrpid.indexOf('/') < 0) { ugrpid = 'ugrp/' + domain.id + '/' + ugrpid; }
-                                var ugroup = obj.userGroups[ugrpid];
-                                if (ugroup != null) {
-                                    // Add group to the user
-                                    if (user.links == null) { user.links = {}; }
-                                    user.links[ugroup._id] = { rights: 1 };
-
-                                    // Add user to the group
-                                    ugroup.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
-                                    db.Set(ugroup);
-
-                                    // Notify user group change
-                                    var event = { etype: 'ugrp', ugrpid: ugroup._id, name: ugroup.name, desc: ugroup.desc, action: 'usergroupchange', links: ugroup.links, msgid: 71, msgArgs: [user.name, ugroup.name], msg: 'Added user ' + user.name + ' to user group ' + ugroup.name, addUserDomain: domain.id };
-                                    if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
-                                    parent.DispatchEvent(['*', ugroup._id, user._id], obj, event);
-                                }
-                            }
-                        }
-
-                        obj.users[user._id] = user;
-                        obj.db.SetUser(user);
-                        var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msgid: 128, msgArgs: [user.name], msg: 'Account created, name is ' + user.name, domain: domain.id };
-                        if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
-                        obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
-                        return fn(null, user._id);
-                    } else {
-                        // This is an existing user
-                        // If the display username has changes, update it.
-                        if (user.name != username) {
-                            user.name = username;
-                            obj.db.SetUser(user);
-                            var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 127, msgArgs: [user.name], msg: 'Changed account display name to ' + user.name, domain: domain.id };
-                            if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
-                            parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
-                        }
-                        // Check if user email has changed
-                        var emailreason = null;
-                        if (user.email && !email) { // email unset in ldap => unset
-                            delete user.email;
-                            delete user.emailVerified;
-                            emailreason = 'Unset email (no more email in LDAP)'
-                        } else if (user.email != email) { // update email
-                            user['email'] = email;
-                            user['emailVerified'] = true;
-                            emailreason = 'Set account email to ' + email + '. Sync with LDAP.';
-                        }
-                        if (emailreason) {
-                            obj.db.SetUser(user);
-                            var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msg: emailreason, domain: domain.id };
-                            if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
-                            parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
-                        }
-                        // If user is locker out, block here.
-                        if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
-                        return fn(null, user._id);
-                    }
-                });
+                ldapHandler.ldapobj = ldap;
+                ldap.on('error', function (err) { parent.debug('ldap', 'LDAP OnError: ' + err); try { ldap.close(); } catch (ex) { console.log(ex); } }); // Close the LDAP object
+                ldap.authenticate(name, pass, ldapHandler);
             }
         } else {
             // Regular login
@@ -750,10 +805,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     // Request or connection says open regardless of the response
     function getDomain(req) {
         if (req.xdomain != null) { return req.xdomain; } // Domain already set for this request, return it.
-        if (req.headers.host != null) { var d = obj.dnsDomains[req.headers.host.split(':')[0].toLowerCase()]; if (d != null) return d; } // If this is a DNS name domain, return it here.
-        var x = req.url.split('/');
+        if ((req.hostname == 'localhost') && (req.query.domainid != null)) { const d = parent.config.domains[req.query.domainid]; if (d != null) return d; } // This is a localhost access with the domainid specified in the URL
+        if (req.hostname != null) { const d = obj.dnsDomains[req.hostname.toLowerCase()]; if (d != null) return d; } // If this is a DNS name domain, return it here.
+        const x = req.url.split('/');
         if (x.length < 2) return parent.config.domains[''];
-        var y = parent.config.domains[x[1].toLowerCase()];
+        const y = parent.config.domains[x[1].toLowerCase()];
         if ((y != null) && (y.dns == null)) { return parent.config.domains[x[1].toLowerCase()]; }
         return parent.config.domains[''];
     }
@@ -764,37 +820,79 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain.auth == 'sspi') { parent.debug('web', 'handleLogoutRequest: failed checks.'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
 
+        // If a HTTP header is required, check new UserRequiredHttpHeader
+        if (domain.userrequiredhttpheader && (typeof domain.userrequiredhttpheader == 'object')) { var ok = false; for (var i in req.headers) { if (domain.userrequiredhttpheader[i.toLowerCase()] == req.headers[i]) { ok = true; } } if (ok == false) { res.sendStatus(404); return; } }
+
         res.set({ 'Cache-Control': 'no-store' });
         // Destroy the user's session to log them out will be re-created next request
         var userid = req.session.userid;
         if (req.session.userid) {
             var user = obj.users[req.session.userid];
-            if (user != null) { obj.parent.DispatchEvent(['*'], obj, { etype: 'user', userid: user._id, username: user.name, action: 'logout', msgid: 2, msg: 'Account logout', domain: domain.id }); }
+            if (user != null) {
+                obj.parent.authLog('https', 'User ' + user.name + ' logout from ' + req.clientIp + ' port ' + req.connection.remotePort, { sessionid: req.session.x, useragent: req.headers['user-agent'] });
+                obj.parent.DispatchEvent(['*'], obj, { etype: 'user', userid: user._id, username: user.name, action: 'logout', msgid: 2, msg: 'Account logout', domain: domain.id });
+            }
             if (req.session.x) { clearDestroyedSessions(); obj.destroyedSessions[req.session.userid + '/' + req.session.x] = Date.now(); } // Destroy this session
         }
         req.session = null;
         parent.debug('web', 'handleLogoutRequest: success.');
 
         // If this user was logged in using an authentication strategy and there is a logout URL, use it.
-        if ((userid != null) && (domain.authstrategies != null)) {
-            const u = userid.split('/')[2];
-            if (u.startsWith('~twitter:') && (domain.authstrategies.twitter != null) && (typeof domain.authstrategies.twitter.logouturl == 'string')) { res.redirect(domain.authstrategies.twitter.logouturl); return; }
-            if (u.startsWith('~google:') && (domain.authstrategies.google != null) && (typeof domain.authstrategies.google.logouturl == 'string')) { res.redirect(domain.authstrategies.google.logouturl); return; }
-            if (u.startsWith('~github:') && (domain.authstrategies.github != null) && (typeof domain.authstrategies.github.logouturl == 'string')) { res.redirect(domain.authstrategies.github.logouturl); return; }
-            if (u.startsWith('~reddit:') && (domain.authstrategies.reddit != null) && (typeof domain.authstrategies.reddit.logouturl == 'string')) { res.redirect(domain.authstrategies.reddit.logouturl); return; }
-            if (u.startsWith('~azure:') && (domain.authstrategies.azure != null) && (typeof domain.authstrategies.azure.logouturl == 'string')) { res.redirect(domain.authstrategies.azure.logouturl); return; }
-            if (u.startsWith('~jumpcloud:') && (domain.authstrategies.jumpcloud != null) && (typeof domain.authstrategies.jumpcloud.logouturl == 'string')) { res.redirect(domain.authstrategies.jumpcloud.logouturl); return; }
-            if (u.startsWith('~saml:') && (domain.authstrategies.saml != null) && (typeof domain.authstrategies.saml.logouturl == 'string')) { res.redirect(domain.authstrategies.saml.logouturl); return; }
-            if (u.startsWith('~intel:') && (domain.authstrategies.intel != null) && (typeof domain.authstrategies.intel.logouturl == 'string')) { res.redirect(domain.authstrategies.intel.logouturl); return; }
+        if ((userid != null) && (domain.authstrategies?.authStrategyFlags != null)) {
+            let logouturl = null;
+            let userStrategy = ((userid.split('/')[2]).split(':')[0]).substring(1);
+            // Setup logout url for oidc
+            if (userStrategy == 'oidc' && domain.authstrategies.oidc != null) {
+                if (typeof domain.authstrategies.oidc.logouturl == 'string') {
+                    logouturl = domain.authstrategies.oidc.logouturl;
+                } else if (typeof domain.authstrategies.oidc.issuer.end_session_endpoint == 'string' && typeof domain.authstrategies.oidc.client.post_logout_redirect_uri == 'string') {
+                    logouturl = domain.authstrategies.oidc.issuer.end_session_endpoint + '?post_logout_redirect_uri=' + domain.authstrategies.oidc.client.post_logout_redirect_uri;
+                } else if (typeof domain.authstrategies.oidc.issuer.end_session_endpoint == 'string') {
+                    logouturl = domain.authstrategies.oidc.issuer.end_session_endpoint;
+                }
+                // Log out all other strategies
+            } else if ((domain.authstrategies[userStrategy] != null) && (typeof domain.authstrategies[userStrategy].logouturl == 'string')) { logouturl = domain.authstrategies[userStrategy].logouturl; }
+            // If custom logout was setup, use it
+            if (logouturl != null) {
+                parent.authLog('handleLogoutRequest', userStrategy.toUpperCase() + ': LOGOUT: ' + logouturl);
+                res.redirect(logouturl);
+                return;
+            }
         }
 
         // This is the default logout redirect to the login page
-        if (req.query.key != null) { res.redirect(domain.url + '?key=' + req.query.key); } else { res.redirect(domain.url); }
+        if (req.query.key != null) { res.redirect(domain.url + 'login?key=' + encodeURIComponent(req.query.key)); } else { res.redirect(domain.url + 'login'); }
+    }
+
+    // Return an object with 2FA type if 2-step auth can be skipped
+    function checkUserOneTimePasswordSkip(domain, user, req, loginOptions) {
+        if (parent.config.settings.no2factorauth == true) return null;
+
+        // If this login occurred using a login token, no 2FA needed.
+        if ((loginOptions != null) && (typeof loginOptions.tokenName === 'string')) { return { twoFactorType: 'tokenlogin' }; }
+
+        // Check if we can skip 2nd factor auth because of the source IP address
+        if ((req != null) && (req.clientIp != null) && (domain.passwordrequirements != null) && (domain.passwordrequirements.skip2factor != null)) {
+            for (var i in domain.passwordrequirements.skip2factor) { if (require('ipcheck').match(req.clientIp, domain.passwordrequirements.skip2factor[i]) === true) { return { twoFactorType: 'ipaddr' }; } }
+        }
+
+        // Check if a 2nd factor cookie is present
+        if (typeof req.headers.cookie == 'string') {
+            const cookies = req.headers.cookie.split('; ');
+            for (var i in cookies) {
+                if (cookies[i].startsWith('twofactor=')) {
+                    var twoFactorCookie = obj.parent.decodeCookie(decodeURIComponent(cookies[i].substring(10)), obj.parent.loginCookieEncryptionKey, (30 * 24 * 60)); // If the cookies does not have an expire field, assume 30 day timeout.
+                    if ((twoFactorCookie != null) && ((twoFactorCookie.ip == null) || checkCookieIp(twoFactorCookie.ip, req.clientIp)) && (twoFactorCookie.userid == user._id)) { return { twoFactorType: 'cookie' }; }
+                }
+            }
+        }
+
+        return null;
     }
 
     // Return true if this user has 2-step auth active
     function checkUserOneTimePasswordRequired(domain, user, req, loginOptions) {
-        // If this login occured using a login token, no 2FA needed.
+        // If this login occurred using a login token, no 2FA needed.
         if ((loginOptions != null) && (typeof loginOptions.tokenName === 'string')) { return false; }
 
         // Check if we can skip 2nd factor auth because of the source IP address
@@ -807,8 +905,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             const cookies = req.headers.cookie.split('; ');
             for (var i in cookies) {
                 if (cookies[i].startsWith('twofactor=')) {
-                    var twoFactorCookie = obj.parent.decodeCookie(decodeURIComponent(cookies[i].substring(10)), obj.parent.loginCookieEncryptionKey, (30 * 24 * 60)); // If the cookies does not have an expire feild, assume 30 day timeout.
-                    if ((twoFactorCookie != null) && ((obj.args.cookieipcheck === false) || (twoFactorCookie.ip == null) || (twoFactorCookie.ip === req.clientIp)) && (twoFactorCookie.userid == user._id)) { return false; }
+                    var twoFactorCookie = obj.parent.decodeCookie(decodeURIComponent(cookies[i].substring(10)), obj.parent.loginCookieEncryptionKey, (30 * 24 * 60)); // If the cookies does not have an expire field, assume 30 day timeout.
+                    if ((twoFactorCookie != null) && ((twoFactorCookie.ip == null) || checkCookieIp(twoFactorCookie.ip, req.clientIp)) && (twoFactorCookie.userid == user._id)) { return false; }
                 }
             }
         }
@@ -816,8 +914,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         // See if SMS 2FA is available
         var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
 
+        // See if Messenger 2FA is available
+        var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
+
         // Check if a 2nd factor is present
-        return ((parent.config.settings.no2factorauth !== true) && (sms2fa || (user.otpsecret != null) || ((user.email != null) && (user.emailVerified == true) && (domain.mailserver != null) && (user.otpekey != null)) || ((user.otphkeys != null) && (user.otphkeys.length > 0))));
+        return ((parent.config.settings.no2factorauth !== true) && (msg2fa || sms2fa || (user.otpsecret != null) || ((user.email != null) && (user.emailVerified == true) && (domain.mailserver != null) && (user.otpekey != null)) || (user.otpduo != null) || ((user.otphkeys != null) && (user.otphkeys.length > 0))));
     }
 
     // Check the 2-step auth token
@@ -831,11 +932,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.email2factor == false)) { otpemail = false; }
         var otpsms = (parent.smsserver != null);
         if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.sms2factor == false)) { otpsms = false; }
+        var otpmsg = ((parent.msgserver != null) && (parent.msgserver.providers != 0));
+        if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.msg2factor == false)) { otpmsg = false; }
 
         // Check 2FA login cookie
         if ((token != null) && (token.startsWith('cookie='))) {
-            var twoFactorCookie = obj.parent.decodeCookie(decodeURIComponent(token.substring(7)), obj.parent.loginCookieEncryptionKey, (30 * 24 * 60)); // If the cookies does not have an expire feild, assume 30 day timeout.
-            if ((twoFactorCookie != null) && ((obj.args.cookieipcheck === false) || (twoFactorCookie.ip == null) || (twoFactorCookie.ip === req.clientIp)) && (twoFactorCookie.userid == user._id)) { func(true); return; }
+            var twoFactorCookie = obj.parent.decodeCookie(decodeURIComponent(token.substring(7)), obj.parent.loginCookieEncryptionKey, (30 * 24 * 60)); // If the cookies does not have an expire field, assume 30 day timeout.
+            if ((twoFactorCookie != null) && ((twoFactorCookie.ip == null) || checkCookieIp(twoFactorCookie.ip, req.clientIp)) && (twoFactorCookie.userid == user._id)) { func(true, { twoFactorType: 'cookie' }); return; }
         }
 
         // Check email key
@@ -845,19 +948,31 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 user.otpekey = {};
                 obj.db.SetUser(user);
                 parent.debug('web', 'checkUserOneTimePassword: success (email).');
-                func(true);
+                func(true, { twoFactorType: 'email' });
                 return;
             }
         }
 
-        // Check sms key
+        // Check SMS key
         if ((otpsms) && (user.phone != null) && (user.otpsms != null) && (user.otpsms.d != null) && (user.otpsms.k === token)) {
             var deltaTime = (Date.now() - user.otpsms.d);
             if ((deltaTime > 0) && (deltaTime < 300000)) { // Allow 5 minutes to use the SMS token (10000 * 60 * 5).
                 delete user.otpsms;
                 obj.db.SetUser(user);
                 parent.debug('web', 'checkUserOneTimePassword: success (SMS).');
-                func(true);
+                func(true, { twoFactorType: 'sms' });
+                return;
+            }
+        }
+
+        // Check messenger key
+        if ((otpmsg) && (user.msghandle != null) && (user.otpmsg != null) && (user.otpmsg.d != null) && (user.otpmsg.k === token)) {
+            var deltaTime = (Date.now() - user.otpmsg.d);
+            if ((deltaTime > 0) && (deltaTime < 300000)) { // Allow 5 minutes to use the Messenger token (10000 * 60 * 5).
+                delete user.otpmsg;
+                obj.db.SetUser(user);
+                parent.debug('web', 'checkUserOneTimePassword: success (Messenger).');
+                func(true, { twoFactorType: 'messenger' });
                 return;
             }
         }
@@ -891,8 +1006,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         var origin = 'https://' + (domain.dns ? domain.dns : parent.certificates.CommonName);
                         if (httpport != 443) { origin += ':' + httpport; }
 
+                        var u2fchallenge = null;
+                        if ((req.session != null) && (req.session.e != null)) { const sec = parent.decryptSessionData(req.session.e); if (sec != null) { u2fchallenge = sec.u2f; } }
                         var assertionExpectations = {
-                            challenge: req.session.u2f,
+                            challenge: u2fchallenge,
                             origin: origin,
                             factor: 'either',
                             fmt: 'fido-u2f',
@@ -908,7 +1025,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             webAuthnKey.counter = webauthnResponse.counter;
                             obj.db.SetUser(user);
                             parent.debug('web', 'checkUserOneTimePassword: success (hardware).');
-                            func(true);
+                            func(true, { twoFactorType: 'fido' });
                         } else {
                             parent.debug('web', 'checkUserOneTimePassword: fail (hardware).');
                             func(false);
@@ -924,7 +1041,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         otplib.authenticator.options = { window: 2 }; // Set +/- 1 minute window
         if (user.otpsecret && (typeof (token) == 'string') && (token.length == 6) && (otplib.authenticator.check(token, user.otpsecret) == true)) {
             parent.debug('web', 'checkUserOneTimePassword: success (authenticator).');
-            func(true);
+            func(true, { twoFactorType: 'otp' });
             return;
         };
 
@@ -934,12 +1051,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             for (var i = 0; i < user.otpkeys.keys.length; i++) {
                 if ((tokenNumber === user.otpkeys.keys[i].p) && (user.otpkeys.keys[i].u === true)) {
                     parent.debug('web', 'checkUserOneTimePassword: success (one-time).');
-                    user.otpkeys.keys[i].u = false; func(true); return;
+                    user.otpkeys.keys[i].u = false; func(true, { twoFactorType: 'backup' }); return;
                 }
             }
         }
 
-        // Check OTP hardware key
+        // Check OTP hardware key (Yubikey OTP)
         if ((domain.yubikey != null) && (domain.yubikey.id != null) && (domain.yubikey.secret != null) && (user.otphkeys != null) && (user.otphkeys.length > 0) && (typeof (token) == 'string') && (token.length == 44)) {
             var keyId = token.substring(0, 12);
 
@@ -955,7 +1072,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 yubikeyotp.verifyOTP(request, function (err, results) {
                     if ((results != null) && (results.status == 'OK')) {
                         parent.debug('web', 'checkUserOneTimePassword: success (Yubikey).');
-                        func(true);
+                        func(true, { twoFactorType: 'hwotp' });
                     } else {
                         parent.debug('web', 'checkUserOneTimePassword: fail (Yubikey).');
                         func(false);
@@ -971,7 +1088,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
     // Return a U2F hardware key challenge
     function getHardwareKeyChallenge(req, domain, user, func) {
-        delete req.session.u2f;
+        var sec = {};
+        if (req.session == null) { req.session = {}; } else { try { sec = parent.decryptSessionData(req.session.e); } catch (ex) { } }
+
         if (user.otphkeys && (user.otphkeys.length > 0)) {
             // Get all WebAuthn keys
             var webAuthnKeys = [];
@@ -980,12 +1099,17 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 // Generate a Webauthn challenge, this is really easy, no need to call any modules to do this.
                 var authnOptions = { type: 'webAuthn', keyIds: [], timeout: 60000, challenge: obj.crypto.randomBytes(64).toString('base64') };
                 for (var i = 0; i < webAuthnKeys.length; i++) { authnOptions.keyIds.push(webAuthnKeys[i].keyId); }
-                req.session.u2f = authnOptions.challenge;
+                sec.u2f = authnOptions.challenge;
+                req.session.e = parent.encryptSessionData(sec);
                 parent.debug('web', 'getHardwareKeyChallenge: success');
                 func(JSON.stringify(authnOptions));
                 return;
             }
         }
+
+        // Remove the challenge if present
+        if (sec.u2f != null) { delete sec.u2f; req.session.e = parent.encryptSessionData(sec); }
+
         parent.debug('web', 'getHardwareKeyChallenge: fail');
         func('');
     }
@@ -1001,6 +1125,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
+        if (req.session == null) { req.session = {}; }
 
         // Check if this is a banned ip address
         if (obj.checkAllowLogin(req) == false) {
@@ -1014,7 +1140,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Normally, use the body username/password. If this is a token, use the username/password in the session.
         var xusername = req.body.username, xpassword = req.body.password;
-        if ((xusername == null) && (xpassword == null) && (req.body.token != null)) { xusername = req.session.tuser; xpassword = req.session.tpass; }
+        if ((xusername == null) && (xpassword == null) && (req.body.token != null)) {
+            const sec = parent.decryptSessionData(req.session.e);
+            xusername = sec.tuser; xpassword = sec.tpass;
+        }
 
         // Authenticate the user
         obj.authenticate(xusername, xpassword, domain, function (err, userid, passhint, loginOptions) {
@@ -1031,10 +1160,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                 var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.email != null) && (user.emailVerified == true) && (user.otpekey != null));
                 var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
+                var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
                 var push2fa = ((parent.firebase != null) && (user.otpdev != null));
+                var duo2fa = ((((typeof domain.duo2factor == 'object') && (typeof domain.duo2factor.integrationkey == 'string') && (typeof domain.duo2factor.secretkey == 'string') && (typeof domain.duo2factor.apihostname == 'string')) || ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.duo2factor != false))) && (user.otpduo != null));
+
+                // Check if two factor can be skipped
+                const twoFactorSkip = checkUserOneTimePasswordSkip(domain, user, req, loginOptions);
 
                 // Check if this user has 2-step login active
-                if ((req.session.loginmode != 6) && checkUserOneTimePasswordRequired(domain, user, req, loginOptions)) {
+                if ((twoFactorSkip == null) && (req.session.loginmode != 6) && checkUserOneTimePasswordRequired(domain, user, req, loginOptions)) {
                     if ((req.body.hwtoken == '**timeout**')) {
                         delete req.session; // Clear the session
                         res.redirect(domain.url + getQueryPortion(req));
@@ -1065,6 +1199,37 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         return;
                     }
 
+                    if ((req.body.hwtoken == '**msg**') && msg2fa) {
+                        // Cause a token to be sent to the user's messenger account
+                        user.otpmsg = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
+                        obj.db.SetUser(user);
+                        parent.debug('web', 'Sending 2FA message to: ' + user.msghandle);
+                        parent.msgserver.sendToken(domain, user.msghandle, user.otpmsg.k, obj.getLanguageCodes(req));
+                        // Ask for a login token & confirm message was sent
+                        req.session.messageid = 6; // "Message sent" message
+                        req.session.loginmode = 4;
+                        if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                        return;
+                    }
+
+                    if ((req.body.hwtoken == '**duo**') && duo2fa && (typeof domain.duo2factor == 'object') && (typeof domain.duo2factor.integrationkey == 'string') && (typeof domain.duo2factor.secretkey == 'string') && (typeof domain.duo2factor.apihostname == 'string')) {
+                        // Redirect to duo here
+                        const duo = require('@duosecurity/duo_universal');
+                        const client = new duo.Client({
+                            clientId: domain.duo2factor.integrationkey,
+                            clientSecret: domain.duo2factor.secretkey,
+                            apiHost: domain.duo2factor.apihostname,
+                            redirectUrl: obj.generateBaseURL(domain, req) + 'auth-duo' + (domain.loginkey != null ? ('?key=' + domain.loginkey) : '')
+                        });
+                        // Decrypt any session data
+                        const sec = parent.decryptSessionData(req.session.e);
+                        sec.duostate = client.generateState();
+                        req.session.e = parent.encryptSessionData(sec);
+                        parent.debug('web', 'Redirecting user ' + user._id + ' to Duo');
+                        res.redirect(client.createAuthUrl(user._id.split('/')[2], sec.duostate));
+                        return;
+                    }
+
                     // Handle device push notification 2FA request
                     // We create a browser cookie, send it back and when the browser connects it's web socket, it will trigger the push notification.
                     if ((req.body.hwtoken == '**push**') && push2fa && ((domain.passwordrequirements == null) || (domain.passwordrequirements.push2factor != false))) {
@@ -1076,11 +1241,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                         // Get the HTTPS port
                         var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port if specified
-                        if (obj.args.agentport != null) { httpsPort = obj.args.agentport; } // If an agent only port is enabled, use that.
-                        if (obj.args.agentaliasport != null) { httpsPort = obj.args.agentaliasport; } // If an agent alias port is specified, use that.
 
                         // Get the agent connection server name
-                        var serverName = obj.getWebServerName(domain);
+                        var serverName = obj.getWebServerName(domain, req);
                         if (typeof obj.args.agentaliasdns == 'string') { serverName = obj.args.agentaliasdns; }
 
                         // Build the connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
@@ -1096,7 +1259,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         return;
                     }
 
-                    checkUserOneTimePassword(req, domain, user, req.body.token, req.body.hwtoken, function (result) {
+                    checkUserOneTimePassword(req, domain, user, req.body.token, req.body.hwtoken, function (result, authData) {
                         if (result == false) {
                             var randomWaitTime = 0;
 
@@ -1114,9 +1277,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             if ((req.body.token != null) || (req.body.hwtoken != null)) {
                                 randomWaitTime = 2000 + (obj.crypto.randomBytes(2).readUInt16BE(0) % 4095); // This is a fail, wait a random time. 2 to 6 seconds.
                                 req.session.messageid = 108; // Invalid token, try again.
-                                if (obj.parent.authlog) { obj.parent.authLog('https', 'Failed 2FA for ' + xusername + ' from ' + cleanRemoteAddr(req.clientIp) + ' port ' + req.port); }
+                                obj.parent.authLog('https', 'Failed 2FA for ' + xusername + ' from ' + cleanRemoteAddr(req.clientIp) + ' port ' + req.port, { useragent: req.headers['user-agent'] });
                                 parent.debug('web', 'handleLoginRequest: invalid 2FA token');
-                                const ua = getUserAgentInfo(req);
+                                const ua = obj.getUserAgentInfo(req);
                                 obj.parent.DispatchEvent(['*', 'server-users', user._id], obj, { action: 'authfail', username: user.name, userid: user._id, domain: domain.id, msg: 'User login attempt with incorrect 2nd factor from ' + req.clientIp, msgid: 108, msgArgs: [req.clientIp, ua.browserStr, ua.osStr] });
                                 obj.setbad2Fa(req);
                             } else {
@@ -1128,10 +1291,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 req.session.loginmode = 4;
                                 if ((user.email != null) && (user.emailVerified == true) && (domain.mailserver != null) && (user.otpekey != null)) { req.session.temail = 1; }
                                 if ((user.phone != null) && (parent.smsserver != null)) { req.session.tsms = 1; }
+                                if ((user.msghandle != null) && (parent.msgserver != null) && (parent.msgserver.providers != 0)) { req.session.tmsg = 1; }
                                 if ((user.otpdev != null) && (parent.firebase != null)) { req.session.tpush = 1; }
-                                req.session.tuserid = userid;
-                                req.session.tuser = xusername;
-                                req.session.tpass = xpassword;
+                                if ((user.otpduo != null)) { req.session.tduo = 1; }
+                                req.session.e = parent.encryptSessionData({ tuserid: userid, tuser: xusername, tpass: xpassword });
                                 if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
                             }, randomWaitTime);
                         } else {
@@ -1140,11 +1303,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 var maxCookieAge = domain.twofactorcookiedurationdays;
                                 if (typeof maxCookieAge != 'number') { maxCookieAge = 30; }
                                 const twoFactorCookie = obj.parent.encodeCookie({ userid: user._id, expire: maxCookieAge * 24 * 60 /*, ip: req.clientIp*/ }, obj.parent.loginCookieEncryptionKey);
-                                res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: 'strict', secure: true });
+                                res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: parent.config.settings.sessionsamesite, secure: true });
                             }
 
                             // Check if email address needs to be confirmed
-                            var emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
+                            const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
                             if (emailcheck && (user.emailVerified !== true)) {
                                 parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
                                 req.session.messageid = 3; // "Email verification required" message
@@ -1156,8 +1319,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             }
 
                             // Login successful
-                            if (obj.parent.authlog) { obj.parent.authLog('https', 'Accepted password for ' + xusername + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
                             parent.debug('web', 'handleLoginRequest: successful 2FA login');
+                            if (authData != null) { if (loginOptions == null) { loginOptions = {}; } loginOptions.twoFactorType = authData.twoFactorType; }
                             completeLoginRequest(req, res, domain, user, userid, xusername, xpassword, direct, loginOptions);
                         }
                     });
@@ -1165,7 +1328,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
 
                 // Check if email address needs to be confirmed
-                var emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
+                const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
                 if (emailcheck && (user.emailVerified !== true)) {
                     parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
                     req.session.messageid = 3; // "Email verification required" message
@@ -1177,12 +1340,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
 
                 // Login successful
-                if (obj.parent.authlog) { obj.parent.authLog('https', 'Accepted password for ' + xusername + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
                 parent.debug('web', 'handleLoginRequest: successful login');
+                if (twoFactorSkip != null) { if (loginOptions == null) { loginOptions = {}; } loginOptions.twoFactorType = twoFactorSkip.twoFactorType; }
                 completeLoginRequest(req, res, domain, user, userid, xusername, xpassword, direct, loginOptions);
             } else {
                 // Login failed, log the error
-                if (obj.parent.authlog) { obj.parent.authLog('https', 'Failed password for ' + xusername + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
+                obj.parent.authLog('https', 'Failed password for ' + xusername + ' from ' + req.clientIp + ' port ' + req.connection.remotePort, { useragent: req.headers['user-agent'] });
 
                 // Wait a random delay
                 setTimeout(function () {
@@ -1192,13 +1355,19 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         if (err == 'locked') {
                             parent.debug('web', 'handleLoginRequest: login failed, locked account');
                             req.session.messageid = 110; // Account locked.
-                            const ua = getUserAgentInfo(req);
+                            const ua = obj.getUserAgentInfo(req);
                             obj.parent.DispatchEvent(['*', 'server-users', xuserid], obj, { action: 'authfail', userid: xuserid, username: xusername, domain: domain.id, msg: 'User login attempt on locked account from ' + req.clientIp, msgid: 109, msgArgs: [req.clientIp, ua.browserStr, ua.osStr] });
+                            obj.setbadLogin(req);
+                        } else if (err == 'denied') {
+                            parent.debug('web', 'handleLoginRequest: login failed, access denied');
+                            req.session.messageid = 111; // Access denied.
+                            const ua = obj.getUserAgentInfo(req);
+                            obj.parent.DispatchEvent(['*', 'server-users', xuserid], obj, { action: 'authfail', userid: xuserid, username: xusername, domain: domain.id, msg: 'Denied user login from ' + req.clientIp, msgid: 155, msgArgs: [req.clientIp, ua.browserStr, ua.osStr] });
                             obj.setbadLogin(req);
                         } else {
                             parent.debug('web', 'handleLoginRequest: login failed, bad username and password');
                             req.session.messageid = 112; // Login failed, check username and password.
-                            const ua = getUserAgentInfo(req);
+                            const ua = obj.getUserAgentInfo(req);
                             obj.parent.DispatchEvent(['*', 'server-users', xuserid], obj, { action: 'authfail', userid: xuserid, username: xusername, domain: domain.id, msg: 'Invalid user login attempt from ' + req.clientIp, msgid: 110, msgArgs: [req.clientIp, ua.browserStr, ua.osStr] });
                             obj.setbadLogin(req);
                         }
@@ -1225,9 +1394,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             parent.debug('web', 'handleLoginRequest: login ok, password change requested');
             req.session.loginmode = 6;
             req.session.messageid = 113; // Password change requested.
-            req.session.resettokenuserid = userid;
-            req.session.resettokenusername = xusername;
-            req.session.resettokenpassword = xpassword;
+
+            // Decrypt any session data
+            const sec = parent.decryptSessionData(req.session.e);
+            sec.rtuser = xusername;
+            sec.rtpass = xpassword;
+            req.session.e = parent.encryptSessionData(sec);
+
             if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
             return;
         }
@@ -1240,14 +1413,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         // Notify account login
         const targets = ['*', 'server-users', user._id];
         if (user.groups) { for (var i in user.groups) { targets.push('server-users:' + i); } }
-        const ua = getUserAgentInfo(req);
-        const loginEvent = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'login', msgid: 107, msgArgs: [req.clientIp, ua.browserStr, ua.osStr], msg: 'Account login', domain: domain.id, ip: req.clientIp, userAgent: req.headers['user-agent'] };
-        if ((loginOptions != null) && (loginOptions.tokenName != null) && (loginOptions.tokenUser != null)) { loginEvent.tokenName = loginOptions.tokenName; loginEvent.tokenUser = loginOptions.tokenUser; } // If a login token was used, add it to the event.
+        const ua = obj.getUserAgentInfo(req);
+        const loginEvent = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'login', msgid: 107, msgArgs: [req.clientIp, ua.browserStr, ua.osStr], msg: 'Account login from ' + req.clientIp + ', ' + ua.browserStr + ', ' + ua.osStr, domain: domain.id, ip: req.clientIp, userAgent: req.headers['user-agent'], rport: req.connection.remotePort };
+        if (loginOptions != null) {
+            if ((loginOptions.tokenName != null) && (loginOptions.tokenUser != null)) { loginEvent.tokenName = loginOptions.tokenName; loginEvent.tokenUser = loginOptions.tokenUser; } // If a login token was used, add it to the event.
+            if (loginOptions.twoFactorType != null) { loginEvent.twoFactorType = loginOptions.twoFactorType; }
+        }
         obj.parent.DispatchEvent(targets, obj, loginEvent);
 
         // Regenerate session when signing in to prevent fixation
         //req.session.regenerate(function () {
         // Store the user's primary key in the session store to be retrieved, or in this case the entire user object
+        delete req.session.e;
         delete req.session.u2f;
         delete req.session.loginmode;
         delete req.session.tuserid;
@@ -1255,6 +1432,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         delete req.session.tpass;
         delete req.session.temail;
         delete req.session.tsms;
+        delete req.session.tmsg;
         delete req.session.tpush;
         delete req.session.messageid;
         delete req.session.passhint;
@@ -1264,6 +1442,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         req.session.userid = userid;
         req.session.ip = req.clientIp;
         setSessionRandom(req);
+        obj.parent.authLog('https', 'Accepted password for ' + (xusername ? xusername : userid) + ' from ' + req.clientIp + ' port ' + req.connection.remotePort, { useragent: req.headers['user-agent'], sessionid: req.session.x });
 
         // If a login token was used, add this information and expire time to the session.
         if ((loginOptions != null) && (loginOptions.tokenName != null) && (loginOptions.tokenUser != null)) {
@@ -1302,6 +1481,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((domain.auth == 'sspi') || (domain.auth == 'ldap')) { parent.debug('web', 'handleCreateAccountRequest: failed checks.'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
 
         // Check if we are in maintenance mode
         if (parent.config.settings.maintenancemode != null) {
@@ -1316,6 +1496,26 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // If the email is the username, set this here.
         if (domain.usernameisemail) { req.body.username = req.body.email; }
+
+        // Check if there is domain.newAccountToken, check if supplied token is valid
+        if ((domain.newaccountspass != null) && (domain.newaccountspass != '') && (req.body.newaccountspass != domain.newaccountspass)) {
+            parent.debug('web', 'handleCreateAccountRequest: Invalid account creation token');
+            req.session.loginmode = 2;
+            req.session.messageid = 103; // Invalid account creation token.
+            if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+            return;
+        }
+
+        // If needed, check the new account creation CAPTCHA
+        if ((domain.newaccountscaptcha != null) && (domain.newaccountscaptcha !== false)) {
+            const c = parent.decodeCookie(req.body.captchaargs, parent.loginCookieEncryptionKey, 10); // 10 minute timeout
+            if ((c == null) || (c.type != 'newAccount') || (typeof c.captcha != 'string') || (c.captcha.length < 5) || (c.captcha != req.body.anewaccountcaptcha)) {
+                req.session.loginmode = 2;
+                req.session.messageid = 117; // Invalid security check
+                if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                return;
+            }
+        }
 
         // Accounts that start with ~ are not allowed
         if ((typeof req.body.username != 'string') || (req.body.username.length < 1) || (req.body.username[0] == '~')) {
@@ -1381,14 +1581,6 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             req.session.messageid = 102; // Existing account with this email address.
                             if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
                         } else {
-                            // Check if there is domain.newAccountToken, check if supplied token is valid
-                            if ((domain.newaccountspass != null) && (domain.newaccountspass != '') && (req.body.anewaccountpass != domain.newaccountspass)) {
-                                parent.debug('web', 'handleCreateAccountRequest: Invalid account creation token');
-                                req.session.loginmode = 2;
-                                req.session.messageid = 103; // Invalid account creation token.
-                                if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
-                                return;
-                            }
                             // Check if user exists
                             if (obj.users['user/' + domain.id + '/' + req.body.username.toLowerCase()]) {
                                 parent.debug('web', 'handleCreateAccountRequest: Username already exists');
@@ -1457,20 +1649,24 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain == null) { return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
+
+        // Decrypt any session data
+        const sec = parent.decryptSessionData(req.session.e);
 
         // Check everything is ok
-        if ((domain == null) || (domain.auth == 'sspi') || (domain.auth == 'ldap') || (typeof req.body.rpassword1 != 'string') || (typeof req.body.rpassword2 != 'string') || (req.body.rpassword1 != req.body.rpassword2) || (typeof req.body.rpasswordhint != 'string') || (req.session == null) || (typeof req.session.resettokenusername != 'string') || (typeof req.session.resettokenpassword != 'string')) {
+        const allowAccountReset = ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.allowaccountreset !== false));
+        if ((allowAccountReset === false) || (domain == null) || (domain.auth == 'sspi') || (domain.auth == 'ldap') || (typeof req.body.rpassword1 != 'string') || (typeof req.body.rpassword2 != 'string') || (req.body.rpassword1 != req.body.rpassword2) || (typeof req.body.rpasswordhint != 'string') || (req.session == null) || (typeof sec.rtuser != 'string') || (typeof sec.rtpass != 'string')) {
             parent.debug('web', 'handleResetPasswordRequest: checks failed');
+            delete req.session.e;
             delete req.session.u2f;
             delete req.session.loginmode;
             delete req.session.tuserid;
             delete req.session.tuser;
             delete req.session.tpass;
-            delete req.session.resettokenuserid;
-            delete req.session.resettokenusername;
-            delete req.session.resettokenpassword;
             delete req.session.temail;
             delete req.session.tsms;
+            delete req.session.tmsg;
             delete req.session.tpush;
             delete req.session.messageid;
             delete req.session.passhint;
@@ -1480,7 +1676,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
 
         // Authenticate the user
-        obj.authenticate(req.session.resettokenusername, req.session.resettokenpassword, domain, function (err, userid, passhint, loginOptions) {
+        obj.authenticate(sec.rtuser, sec.rtpass, domain, function (err, userid, passhint, loginOptions) {
             if (userid) {
                 // Login
                 var user = obj.users[userid];
@@ -1537,23 +1733,23 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             req.session.userid = userid;
                             req.session.ip = req.clientIp; // Bind this session to the IP address of the request
                             setSessionRandom(req);
-                            completeLoginRequest(req, res, domain, obj.users[userid], userid, req.session.tuser, req.session.tpass, direct, loginOptions);
+                            const sec = parent.decryptSessionData(req.session.e);
+                            completeLoginRequest(req, res, domain, obj.users[userid], userid, sec.tuser, sec.tpass, direct, loginOptions);
                         }, 0);
                     }
                 }, 0);
             } else {
                 // Failed, error out.
                 parent.debug('web', 'handleResetPasswordRequest: failed authenticate()');
+                delete req.session.e;
                 delete req.session.u2f;
                 delete req.session.loginmode;
                 delete req.session.tuserid;
                 delete req.session.tuser;
                 delete req.session.tpass;
-                delete req.session.resettokenuserid;
-                delete req.session.resettokenusername;
-                delete req.session.resettokenpassword;
                 delete req.session.temail;
                 delete req.session.tsms;
+                delete req.session.tmsg;
                 delete req.session.tpush;
                 delete req.session.messageid;
                 delete req.session.passhint;
@@ -1568,9 +1764,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     function handleResetAccountRequest(req, res, direct) {
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
-        if ((domain.auth == 'sspi') || (domain.auth == 'ldap') || (obj.args.lanonly == true) || (obj.parent.certificates.CommonName == null) || (obj.parent.certificates.CommonName.indexOf('.') == -1)) { parent.debug('web', 'handleResetAccountRequest: check failed'); res.sendStatus(404); return; }
+        const allowAccountReset = ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.allowaccountreset !== false));
+        if ((allowAccountReset === false) || (domain.auth == 'sspi') || (domain.auth == 'ldap') || (obj.args.lanonly == true) || (obj.parent.certificates.CommonName == null) || (obj.parent.certificates.CommonName.indexOf('.') == -1)) { parent.debug('web', 'handleResetAccountRequest: check failed'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
 
         // Always lowercase the email address
         if (req.body.email) { req.body.email = req.body.email.toLowerCase(); }
@@ -1612,7 +1810,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         var user = docs[i];
                         if (checkUserOneTimePasswordRequired(domain, user, req) == true) {
                             // Second factor setup, request it now.
-                            checkUserOneTimePassword(req, domain, user, req.body.token, req.body.hwtoken, function (result) {
+                            checkUserOneTimePassword(req, domain, user, req.body.token, req.body.hwtoken, function (result, authData) {
                                 if (result == false) {
                                     if (i == 0) {
 
@@ -1630,6 +1828,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                         parent.debug('web', 'handleResetAccountRequest: Invalid 2FA token, try again');
                                         if ((req.body.token != null) || (req.body.hwtoken != null)) {
                                             var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
+                                            var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
                                             if ((req.body.hwtoken == '**sms**') && sms2fa) {
                                                 // Cause a token to be sent to the user's phone number
                                                 user.otpsms = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
@@ -1637,9 +1836,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                 parent.debug('web', 'Sending 2FA SMS for password recovery to: ' + user.phone);
                                                 parent.smsserver.sendToken(domain, user.phone, user.otpsms.k, obj.getLanguageCodes(req));
                                                 req.session.messageid = 4; // SMS sent.
+                                            } else if ((req.body.hwtoken == '**msg**') && msg2fa) {
+                                                // Cause a token to be sent to the user's messager account
+                                                user.otpmsg = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
+                                                obj.db.SetUser(user);
+                                                parent.debug('web', 'Sending 2FA message for password recovery to: ' + user.msghandle);
+                                                parent.msgserver.sendToken(domain, user.msghandle, user.otpmsg.k, obj.getLanguageCodes(req));
+                                                req.session.messageid = 6; // Message sent.
                                             } else {
                                                 req.session.messageid = 108; // Invalid token, try again.
-                                                const ua = getUserAgentInfo(req);
+                                                const ua = obj.getUserAgentInfo(req);
                                                 obj.parent.DispatchEvent(['*', 'server-users', user._id], obj, { action: 'authfail', username: user.name, userid: user._id, domain: domain.id, msg: 'User login attempt with incorrect 2nd factor from ' + req.clientIp, msgid: 108, msgArgs: [req.clientIp, ua.browserStr, ua.osStr] });
                                                 obj.setbad2Fa(req);
                                             }
@@ -1701,6 +1907,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((domain.mailserver == null) || (domain.auth == 'sspi') || (domain.auth == 'ldap') || (typeof req.session.cuserid != 'string') || (obj.users[req.session.cuserid] == null) || (!obj.common.validateEmail(req.body.email, 1, 256))) { parent.debug('web', 'handleCheckAccountEmailRequest: failed checks.'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
 
         // Always lowercase the email address
         if (req.body.email) { req.body.email = req.body.email.toLowerCase(); }
@@ -1740,8 +1947,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         } else {
             // Check is email already exists
             obj.db.GetUserWithVerifiedEmail(domain.id, email, function (err, docs) {
-                if ((err != null) || (docs.length > 0)) {
-                    // Email already exitst
+                if ((err != null) || ((docs.length > 0) && (docs.find(function (u) { return (u._id === req.session.cuserid); }) < 0))) {
+                    // Email already exists
                     req.session.messageid = 102; // Existing account with this email address.
                 } else {
                     // Update the user and notify of user email address change
@@ -1782,28 +1989,28 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 var idsplit = cookie.u.split('/');
                 if ((idsplit.length != 3) || (idsplit[1] != domain.id)) {
                     parent.debug('web', 'handleCheckMailRequest: Invalid domain.');
-                    render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 1, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+                    render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 1, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
                 } else {
                     obj.db.Get(cookie.u, function (err, docs) {
                         if (docs.length == 0) {
                             parent.debug('web', 'handleCheckMailRequest: Invalid username.');
-                            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 2, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(idsplit[1]).replace(/'/g, '%27') }, req, domain));
+                            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 2, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(idsplit[1]).replace(/'/g, '%27') }, req, domain));
                         } else {
                             var user = docs[0];
                             if (user.email != cookie.e) {
                                 parent.debug('web', 'handleCheckMailRequest: Invalid e-mail.');
-                                render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 3, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
+                                render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 3, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
                             } else {
                                 if (cookie.a == 1) {
                                     // Account email verification
                                     if (user.emailVerified == true) {
                                         parent.debug('web', 'handleCheckMailRequest: email already verified.');
-                                        render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 4, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
+                                        render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 4, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
                                     } else {
                                         obj.db.GetUserWithVerifiedEmail(domain.id, user.email, function (err, docs) {
-                                            if (docs.length > 0) {
+                                            if ((docs.length > 0) && (docs.find(function (u) { return (u._id === user._id); }) < 0)) {
                                                 parent.debug('web', 'handleCheckMailRequest: email already in use.');
-                                                render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 5, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27') }, req, domain));
+                                                render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 5, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27') }, req, domain));
                                             } else {
                                                 parent.debug('web', 'handleCheckMailRequest: email verification success.');
 
@@ -1818,13 +2025,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                 obj.parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
 
                                                 // Send the confirmation page
-                                                render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 6, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
+                                                render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 6, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: encodeURIComponent(user.email).replace(/'/g, '%27'), arg2: encodeURIComponent(user.name).replace(/'/g, '%27') }, req, domain));
 
                                                 // Send a notification
                                                 obj.parent.DispatchEvent([user._id], obj, { action: 'notify', title: 'Email verified', value: user.email, nolog: 1, id: Math.random() });
 
-                                                // Send to authlog
-                                                if (obj.parent.authlog) { obj.parent.authLog('https', 'Verified email address ' + user.email + ' for user ' + user.name); }
+                                                // Send to authLog
+                                                obj.parent.authLog('https', 'Verified email address ' + user.email + ' for user ' + user.name, { useragent: req.headers['user-agent'] });
                                             }
                                         });
                                     }
@@ -1832,7 +2039,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                     // Account reset
                                     if (user.emailVerified != true) {
                                         parent.debug('web', 'handleCheckMailRequest: email not verified.');
-                                        render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 7, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: EscapeHtml(user.email), arg2: EscapeHtml(user.name) }, req, domain));
+                                        render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 7, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: EscapeHtml(user.email), arg2: EscapeHtml(user.name) }, req, domain));
                                     } else {
                                         if (req.query.confirm == 1) {
                                             // Set a temporary password
@@ -1856,28 +2063,28 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                     obj.parent.DispatchEvent(['*', 'server-users', user._id], obj, event);
 
                                                     // Send the new password
-                                                    render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 8, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: EscapeHtml(user.name), arg2: EscapeHtml(newpass) }, req, domain));
+                                                    render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 8, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), arg1: EscapeHtml(user.name), arg2: EscapeHtml(newpass) }, req, domain));
                                                     parent.debug('web', 'handleCheckMailRequest: send temporary password.');
 
-                                                    // Send to authlog
-                                                    if (obj.parent.authlog) { obj.parent.authLog('https', 'Performed account reset for user ' + user.name); }
+                                                    // Send to authLog
+                                                    obj.parent.authLog('https', 'Performed account reset for user ' + user.name);
                                                 }, 0);
                                             });
                                         } else {
                                             // Display a link for the user to confirm password reset
                                             // We must do this because GMail will also load this URL a few seconds after the user does and we don't want to cause two password resets.
-                                            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 14, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+                                            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 14, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
                                         }
                                     }
                                 } else {
-                                    render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 9, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+                                    render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 9, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
                                 }
                             }
                         }
                     });
                 }
             } else {
-                render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 10, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+                render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 1, msgid: 10, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
             }
         }
     }
@@ -1886,14 +2093,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     function handleInviteRequest(req, res) {
         const domain = getDomain(req);
         if (domain == null) { parent.debug('web', 'handleInviteRequest: failed checks.'); res.sendStatus(404); return; }
+        if (domain.agentinvitecodes != true) { nice404(req, res); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
-        if ((req.body.inviteCode == null) || (req.body.inviteCode == '')) { render(req, res, getRenderPage('invite', req, domain), getRenderArgs({ messageid: 0 }, req, domain)); return; } // No invitation code
+        if ((req.body == null) || (req.body.inviteCode == null) || (req.body.inviteCode == '')) { render(req, res, getRenderPage('invite', req, domain), getRenderArgs({ messageid: 0 }, req, domain)); return; } // No invitation code
 
         // Each for a device group that has this invite code.
         for (var i in obj.meshes) {
             if ((obj.meshes[i].domain == domain.id) && (obj.meshes[i].deleted == null) && (obj.meshes[i].invite != null) && (obj.meshes[i].invite.codes.indexOf(req.body.inviteCode) >= 0)) {
                 // Send invitation link, valid for 1 minute.
-                res.redirect(domain.url + 'agentinvite?c=' + parent.encodeCookie({ a: 4, mid: i, f: obj.meshes[i].invite.flags, expire: 1 }, parent.invitationLinkEncryptionKey) + (req.query.key ? ('&key=' + req.query.key) : '') + (req.query.hide ? ('&hide=' + req.query.hide) : ''));
+                res.redirect(domain.url + 'agentinvite?c=' + parent.encodeCookie({ a: 4, mid: i, f: obj.meshes[i].invite.flags, ag: obj.meshes[i].invite.ag, expire: 1 }, parent.invitationLinkEncryptionKey) + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + (req.query.hide ? ('&hide=' + encodeURIComponent(req.query.hide)) : ''));
                 return;
             }
         }
@@ -1909,29 +2117,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Check if we are in maintenance mode
         if ((parent.config.settings.maintenancemode != null) && (req.query.loginscreen !== '1')) {
-            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
             return;
         }
 
-        if (req.query.ws != null) {
-            // This is a query with a websocket relay cookie, check that the cookie is valid and use it.
-            var rcookie = parent.decodeCookie(req.query.ws, parent.loginCookieEncryptionKey, 60); // Cookie with 1 hour timeout
-            if ((rcookie != null) && (rcookie.domainid == domain.id) && (rcookie.nodeid != null) && (rcookie.tcpport != null)) {
-
-                // Fetch the node from the database
-                obj.db.Get(rcookie.nodeid, function (err, nodes) {
-                    if ((err != null) || (nodes.length != 1)) { res.sendStatus(404); return; }
-                    const node = nodes[0];
-
-                    // Check if we have RDP credentials for this device
-                    var serverCredentials = ((typeof node.rdp == 'object') && (typeof node.rdp.d == 'string') && (typeof node.rdp.u == 'string') && (typeof node.rdp.p == 'string'));
-
-                    // Render the page
-                    render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: req.query.ws, name: encodeURIComponent(req.query.name).replace(/'/g, '%27'), serverCredentials: serverCredentials }, req, domain));
-                });
-                return;
-            }
-        }
+        // Set features we want to send to this page
+        var features = 0;
+        if (domain.allowsavingdevicecredentials === false) { features |= 1; }
 
         // Get the logged in user if present
         var user = null;
@@ -1951,6 +2143,39 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         // No user login, exit now
         if (user == null) { res.sendStatus(401); return; }
 
+        if (req.query.ws != null) {
+            // This is a query with a websocket relay cookie, check that the cookie is valid and use it.
+            var rcookie = parent.decodeCookie(req.query.ws, parent.loginCookieEncryptionKey, 60); // Cookie with 1 hour timeout
+            if ((rcookie != null) && (rcookie.domainid == domain.id) && (rcookie.nodeid != null) && (rcookie.tcpport != null)) {
+
+                // Fetch the node from the database
+                obj.db.Get(rcookie.nodeid, function (err, nodes) {
+                    if ((err != null) || (nodes.length != 1)) { res.sendStatus(404); return; }
+                    const node = nodes[0];
+
+                    // Check if we have SSH/RDP credentials for this device
+                    var serverCredentials = 0;
+                    if (domain.allowsavingdevicecredentials !== false) {
+                        if (page == 'ssh') {
+                            if ((typeof node.ssh == 'object') && (typeof node.ssh.u == 'string') && (typeof node.ssh.p == 'string')) { serverCredentials = 1; } // Username and password
+                            else if ((typeof node.ssh == 'object') && (typeof node.ssh.k == 'string') && (typeof node.ssh.kp == 'string')) { serverCredentials = 2; } // Username, key and password
+                            else if ((typeof node.ssh == 'object') && (typeof node.ssh.k == 'string')) { serverCredentials = 3; } // Username and key. No password.
+                            else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].u == 'string') && (typeof node.ssh[user._id].p == 'string')) { serverCredentials = 1; } // Username and password in per user format
+                            else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].k == 'string') && (typeof node.ssh[user._id].kp == 'string')) { serverCredentials = 2; } // Username, key and password in per user format
+                            else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].k == 'string')) { serverCredentials = 3; } // Username and key. No password. in per user format
+                        } else {
+                            if ((typeof node.rdp == 'object') && (typeof node.rdp.d == 'string') && (typeof node.rdp.u == 'string') && (typeof node.rdp.p == 'string')) { serverCredentials = 1; } // Username and password in legacy format
+                            if ((typeof node.rdp == 'object') && (typeof node.rdp[user._id] == 'object') && (typeof node.rdp[user._id].d == 'string') && (typeof node.rdp[user._id].u == 'string') && (typeof node.rdp[user._id].p == 'string')) { serverCredentials = 1; } // Username and password in per user format
+                        }
+                    }
+
+                    // Render the page
+                    render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: req.query.ws, name: encodeURIComponent(req.query.name).replace(/'/g, '%27'), serverCredentials: serverCredentials, features: features }, req, domain));
+                });
+                return;
+            }
+        }
+
         // Check the nodeid
         if (req.query.node != null) {
             var nodeidsplit = req.query.node.split('/');
@@ -1964,38 +2189,51 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
 
         // If there is no nodeid, exit now
-        if (req.query.node == null) { render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: '', name: '' }, req, domain)); return; }
+        if (req.query.node == null) { render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: '', name: '', features: features }, req, domain)); return; }
 
         // Fetch the node from the database
         obj.db.Get(req.query.node, function (err, nodes) {
             if ((err != null) || (nodes.length != 1)) { res.sendStatus(404); return; }
             const node = nodes[0];
 
-            // Check if we have RDP credentials for this device
-            var serverCredentials = ((typeof node.rdp == 'object') && (typeof node.rdp.d == 'string') && (typeof node.rdp.u == 'string') && (typeof node.rdp.p == 'string'));
-
             // Check access rights, must have remote control rights
             if ((obj.GetNodeRights(user, node.meshid, node._id) & MESHRIGHT_REMOTECONTROL) == 0) { res.sendStatus(401); return; }
 
             // Figure out the target port
-            var port = 0;
+            var port = 0, serverCredentials = false;
             if (page == 'ssh') {
                 // SSH port
                 port = 22;
                 if (typeof node.sshport == 'number') { port = node.sshport; }
+
+                // Check if we have SSH credentials for this device
+                if (domain.allowsavingdevicecredentials !== false) {
+                    if ((typeof node.ssh == 'object') && (typeof node.ssh.u == 'string') && (typeof node.ssh.p == 'string')) { serverCredentials = 1; } // Username and password
+                    else if ((typeof node.ssh == 'object') && (typeof node.ssh.k == 'string') && (typeof node.ssh.kp == 'string')) { serverCredentials = 2; } // Username, key and password
+                    else if ((typeof node.ssh == 'object') && (typeof node.ssh.k == 'string')) { serverCredentials = 3; } // Username and key. No password.
+                    else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].u == 'string') && (typeof node.ssh[user._id].p == 'string')) { serverCredentials = 1; } // Username and password in per user format
+                    else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].k == 'string') && (typeof node.ssh[user._id].kp == 'string')) { serverCredentials = 2; } // Username, key and password in per user format
+                    else if ((typeof node.ssh == 'object') && (typeof node.ssh[user._id] == 'object') && (typeof node.ssh[user._id].k == 'string')) { serverCredentials = 3; } // Username and key. No password. in per user format
+                }
             } else {
                 // RDP port
                 port = 3389;
                 if (typeof node.rdpport == 'number') { port = node.rdpport; }
+
+                // Check if we have RDP credentials for this device
+                if (domain.allowsavingdevicecredentials !== false) {
+                    if ((typeof node.rdp == 'object') && (typeof node.rdp.d == 'string') && (typeof node.rdp.u == 'string') && (typeof node.rdp.p == 'string')) { serverCredentials = 1; } // Username and password
+                    if ((typeof node.rdp == 'object') && (typeof node.rdp[user._id] == 'object') && (typeof node.rdp[user._id].d == 'string') && (typeof node.rdp[user._id].u == 'string') && (typeof node.rdp[user._id].p == 'string')) { serverCredentials = 1; } // Username and password in per user format
+                }
             }
             if (req.query.port != null) { var qport = 0; try { qport = parseInt(req.query.port); } catch (ex) { } if ((typeof qport == 'number') && (qport > 0) && (qport < 65536)) { port = qport; } }
 
             // Generate a cookie and respond
             var cookie = parent.encodeCookie({ userid: user._id, domainid: user.domain, nodeid: node._id, tcpport: port }, parent.loginCookieEncryptionKey);
-            render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: cookie, name: encodeURIComponent(node.name).replace(/'/g, '%27'), serverCredentials: serverCredentials }, req, domain));
+            render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: cookie, name: encodeURIComponent(node.name).replace(/'/g, '%27'), serverCredentials: serverCredentials, features: features }, req, domain));
         });
     }
-    
+
     // Called to handle push-only requests
     function handleFirebasePushOnlyRelayRequest(req, res) {
         parent.debug('email', 'handleFirebasePushOnlyRelayRequest');
@@ -2043,10 +2281,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (mesh == null) { res.sendStatus(404); return; }
             var installflags = cookie.f;
             if (typeof installflags != 'number') { installflags = 0; }
+            var showagents = cookie.ag;
+            if (typeof showagents != 'number') { showagents = 0; }
             parent.debug('web', 'handleAgentInviteRequest using cookie.');
 
             // Build the mobile agent URL, this is used to connect mobile devices
-            var agentServerName = obj.getWebServerName(domain);
+            var agentServerName = obj.getWebServerName(domain, req);
             if (typeof obj.args.agentaliasdns == 'string') { agentServerName = obj.args.agentaliasdns; }
             var xdomain = (domain.dns == null) ? domain.id : '';
             var agentHttpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
@@ -2055,7 +2295,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             var magenturl = 'mc://' + agentServerName + ((agentHttpsPort != 443) ? (':' + agentHttpsPort) : '') + ((xdomain != '') ? ('/' + xdomain) : '') + ',' + obj.agentCertificateHashBase64 + ',' + mesh._id.split('/')[2];
 
             var meshcookie = parent.encodeCookie({ m: mesh._id.split('/')[2] }, parent.invitationLinkEncryptionKey);
-            render(req, res, getRenderPage('agentinvite', req, domain), getRenderArgs({ meshid: meshcookie, serverport: ((args.aliasport != null) ? args.aliasport : args.port), serverhttps: 1, servernoproxy: ((domain.agentnoproxy === true) ? '1' : '0'), meshname: encodeURIComponent(mesh.name).replace(/'/g, '%27'), installflags: installflags, magenturl: magenturl }, req, domain));
+            render(req, res, getRenderPage('agentinvite', req, domain), getRenderArgs({ meshid: meshcookie, serverport: ((args.aliasport != null) ? args.aliasport : args.port), serverhttps: 1, servernoproxy: ((domain.agentnoproxy === true) ? '1' : '0'), meshname: encodeURIComponent(mesh.name).replace(/'/g, '%27'), installflags: installflags, showagents: showagents, magenturl: magenturl, assistanttype: (domain.assistanttypeagentinvite ? domain.assistanttypeagentinvite : 0) }, req, domain));
         } else if (req.query.m != null) {
             // The MeshId is specified in the query string, use that
             var mesh = obj.meshes['mesh/' + domain.id + '/' + req.query.m.toLowerCase()];
@@ -2063,10 +2303,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             var installflags = 0;
             if (req.query.f) { installflags = parseInt(req.query.f); }
             if (typeof installflags != 'number') { installflags = 0; }
+            var showagents = 0;
+            if (req.query.f) { showagents = parseInt(req.query.ag); }
+            if (typeof showagents != 'number') { showagents = 0; }
             parent.debug('web', 'handleAgentInviteRequest using meshid.');
 
             // Build the mobile agent URL, this is used to connect mobile devices
-            var agentServerName = obj.getWebServerName(domain);
+            var agentServerName = obj.getWebServerName(domain, req);
             if (typeof obj.args.agentaliasdns == 'string') { agentServerName = obj.args.agentaliasdns; }
             var xdomain = (domain.dns == null) ? domain.id : '';
             var agentHttpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
@@ -2075,7 +2318,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             var magenturl = 'mc://' + agentServerName + ((agentHttpsPort != 443) ? (':' + agentHttpsPort) : '') + ((xdomain != '') ? ('/' + xdomain) : '') + ',' + obj.agentCertificateHashBase64 + ',' + mesh._id.split('/')[2];
 
             var meshcookie = parent.encodeCookie({ m: mesh._id.split('/')[2] }, parent.invitationLinkEncryptionKey);
-            render(req, res, getRenderPage('agentinvite', req, domain), getRenderArgs({ meshid: meshcookie, serverport: ((args.aliasport != null) ? args.aliasport : args.port), serverhttps: 1, servernoproxy: ((domain.agentnoproxy === true) ? '1' : '0'), meshname: encodeURIComponent(mesh.name).replace(/'/g, '%27'), installflags: installflags, magenturl: magenturl }, req, domain));
+            render(req, res, getRenderPage('agentinvite', req, domain), getRenderArgs({ meshid: meshcookie, serverport: ((args.aliasport != null) ? args.aliasport : args.port), serverhttps: 1, servernoproxy: ((domain.agentnoproxy === true) ? '1' : '0'), meshname: encodeURIComponent(mesh.name).replace(/'/g, '%27'), installflags: installflags, showagents: showagents, magenturl: magenturl, assistanttype: (domain.assistanttypeagentinvite ? domain.assistanttypeagentinvite : 0) }, req, domain));
         }
     }
 
@@ -2114,6 +2357,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((domain.auth == 'sspi') || (domain.auth == 'ldap')) { parent.debug('web', 'handleDeleteAccountRequest: failed checks.'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
 
         var user = null;
         if (req.body.authcookie) {
@@ -2297,6 +2541,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((domain.auth == 'sspi') || (domain.auth == 'ldap')) { parent.debug('web', 'handlePasswordChangeRequest: failed checks (1).'); res.sendStatus(404); return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (req.session.loginToken != null) { res.sendStatus(404); return; } // Do not allow this command when logged in using a login token
+        if (req.body == null) { res.sendStatus(404); return; } // Post body is empty or can't be parsed
 
         // Check if the user is logged and we have all required parameters
         if (!req.session || !req.session.userid || !req.body.apassword0 || !req.body.apassword1 || (req.body.apassword1 != req.body.apassword2) || (req.session.userid.split('/')[1] != domain.id)) {
@@ -2364,13 +2609,89 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         });
     }
 
-    // Called when a strategy login occured
-    // This is called after a succesful Oauth to Twitter, Google, GitHub...
+    // Called when a strategy login occurred
+    // This is called after a successful Oauth to Twitter, Google, GitHub...
     function handleStrategyLogin(req, res) {
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
-        parent.debug('web', 'handleStrategyLogin: ' + JSON.stringify(req.user));
-        if ((req.user != null) && (req.user.sid != null)) {
+        if ((req.user != null) && (req.user.sid != null) && (req.user.strategy != null)) {
+            const strategy = domain.authstrategies[req.user.strategy];
+            const groups = { 'enabled': typeof strategy.groups == 'object' }
+            parent.authLog(req.user.strategy.toUpperCase(), `User Authorized: ${JSON.stringify(req.user)}`);
+            if (groups.enabled) { // Groups only available for OIDC strategy currently
+                groups.userMemberships = obj.common.convertStrArray(req.user.groups);
+                groups.syncEnabled = (strategy.groups.sync === true || strategy.groups.sync?.filter) ? true : false;
+                groups.syncMemberships = [];
+                groups.siteAdminEnabled = strategy.groups.siteadmin ? true : false;
+                groups.grantAdmin = false;
+                groups.revokeAdmin = strategy.groups.revokeAdmin ? strategy.groups.revokeAdmin : true;
+                groups.requiredGroups = obj.common.convertStrArray(strategy.groups.required);
+                groups.siteAdmin = obj.common.convertStrArray(strategy.groups.siteadmin);
+                groups.syncFilter = obj.common.convertStrArray(strategy.groups.sync?.filter);
+
+                // Fancy Logs
+                let groupMessage = '';
+                if (groups.userMemberships.length == 1) { groupMessage = ` Found membership: "${groups.userMemberships[0]}"` }
+                else { groupMessage = ` Found ${groups.userMemberships.length} memberships: ["${groups.userMemberships.join('", "')}"]` }
+                parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}"` + groupMessage);
+
+                // Check user membership in required groups
+                if (groups.requiredGroups.length > 0) {
+                    let match = false
+                    for (var i in groups.requiredGroups) {
+                        if (groups.userMemberships.indexOf(groups.requiredGroups[i]) != -1) {
+                            match = true;
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" Membership to required group found: "${groups.requiredGroups[i]}"`);
+                        }
+                    }
+                    if (match === false) {
+                        parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" Login denied. No membership to required group.`);
+                        req.session.loginmode = 1;
+                        req.session.messageid = 111; // Access Denied.
+                        res.redirect(domain.url + getQueryPortion(req));
+                        return;
+                    }
+                }
+
+                // Check user membership in admin groups
+                if (groups.siteAdminEnabled === true) {
+                    groups.grantAdmin = false;
+                    for (var i in strategy.groups.siteadmin) {
+                        if (groups.userMemberships.indexOf(strategy.groups.siteadmin[i]) >= 0) {
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" User membership found in site admin group: "${strategy.groups.siteadmin[i]}"`);
+                            groups.siteAdmin = strategy.groups.siteadmin[i];
+                            groups.grantAdmin = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Check if we need to sync user-memberships (IdP) with user-groups (meshcentral)
+                if (groups.syncEnabled === true) {
+                    if (groups.syncFilter.length > 0){ // config.json has specified sync.filter so loop and use it
+                        for (var i in groups.syncFilter) {
+                            if (groups.userMemberships.indexOf(groups.syncFilter[i]) >= 0) { groups.syncMemberships.push(groups.syncFilter[i]); }
+                        }
+                    } else { // config.json doesnt have sync.filter specified so we are going to sync all the users groups from oidc instead
+                        for (var i in groups.userMemberships) {
+                            groups.syncMemberships.push(groups.userMemberships[i]);
+                        }
+                    }
+                    if (groups.syncMemberships.length > 0) {
+                        parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" User memberships to sync: ${groups.syncMemberships.join(', ')}`);
+                    } else {
+                        groups.syncMemberships = null;
+                        groups.syncEnabled = false;
+                        if (groups.syncFilter.length > 0){
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" No sync memberships found using filters: ${groups.syncFilter.join(', ')}`);
+                        } else {
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" No sync memberships found`);
+                        }
+                    }
+                }
+            }
+
+            // Check if the user already exists
             const userid = 'user/' + domain.id + '/' + req.user.sid;
             var user = obj.users[userid];
             if (user == null) {
@@ -2380,16 +2701,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if (domain.newaccounts === true) { newAccountAllowed = true; }
                 if (obj.common.validateStrArray(domain.newaccountrealms)) { newAccountRealms = domain.newaccountrealms; }
 
-                if ((domain.authstrategies != null) && (domain.authstrategies[req.user.strategy] != null)) {
+                if (domain.authstrategies[req.user.strategy]) {
                     if (domain.authstrategies[req.user.strategy].newaccounts === true) { newAccountAllowed = true; }
                     if (obj.common.validateStrArray(domain.authstrategies[req.user.strategy].newaccountrealms)) { newAccountRealms = domain.authstrategies[req.user.strategy].newaccountrealms; }
                 }
 
                 if (newAccountAllowed === true) {
                     // Create the user
-                    parent.debug('web', 'handleStrategyLogin: creating new user: ' + userid);
+                    parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: USER: "${req.user.sid}" Creating new login user: "${userid}"`);
                     user = { type: 'user', _id: userid, name: req.user.name, email: req.user.email, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
-                    if (req.user.email != null) { user.email = req.user.email; user.emailVerified = true; }
+                    if (req.user.email != null) { user.email = req.user.email; user.emailVerified = req.user.email_verified ? req.user.email_verified : true; }
                     if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; } // New accounts automatically assigned server rights.
                     if (domain.authstrategies[req.user.strategy].newaccountsrights) { user.siteadmin = obj.common.meshServerRightsArrayToNumber(domain.authstrategies[req.user.strategy].newaccountsrights); } // If there are specific SSO server rights, use these instead.
                     if (newAccountRealms) { user.groups = newAccountRealms; } // New accounts automatically part of some groups (Realms).
@@ -2421,6 +2742,20 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         }
                     }
 
+                    if (groups.enabled === true) {
+                        // Sync the user groups if enabled
+                        if (groups.syncEnabled === true) {
+                            // Set groupType to the preset name if it exists, otherwise use the strategy name
+                            const groupType = domain.authstrategies[req.user.strategy].custom?.preset ? domain.authstrategies[req.user.strategy].custom.preset : req.user.strategy;
+                            syncExternalUserGroups(domain, user, groups.syncMemberships, groupType);
+                        }
+                        // See if the user is a member of the site admin group.
+                        if (groups.grantAdmin === true) {
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" Granting site admin privilages`);
+                            user.siteadmin = 0xFFFFFFFF;
+                        }
+                    }
+
                     // Save the user
                     obj.db.SetUser(user);
 
@@ -2432,36 +2767,77 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                     req.session.userid = userid;
                     setSessionRandom(req);
+
+                    // Notify account login using SSO
+                    var targets = ['*', 'server-users', user._id];
+                    if (user.groups) { for (var i in user.groups) { targets.push('server-users:' + i); } }
+                    const ua = obj.getUserAgentInfo(req);
+                    const loginEvent = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'login', msgid: 107, msgArgs: [req.clientIp, ua.browserStr, ua.osStr], msg: 'Account login', domain: domain.id, ip: req.clientIp, userAgent: req.headers['user-agent'], twoFactorType: 'sso' };
+                    obj.parent.DispatchEvent(targets, obj, loginEvent);
                 } else {
                     // New users not allowed
-                    parent.debug('web', 'handleStrategyLogin: Can\'t create new accounts');
+                    parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: LOGIN FAILED: USER: "${req.user.sid}" New accounts are not allowed`);
                     req.session.loginmode = 1;
                     req.session.messageid = 100; // Unable to create account.
                     res.redirect(domain.url + getQueryPortion(req));
                     return;
                 }
-            } else {
-                // Login success
-                var userChange = false;
-                if ((req.user.name != null) && (req.user.name != user.name)) { user.name = req.user.name; userChange = true; }
-                if ((req.user.email != null) && (req.user.email != user.email)) { user.email = req.user.email; user.emailVerified = true; userChange = true; }
-                if (userChange) {
+            } else { // Login success
+                // Check for basic changes
+                var userChanged = false;
+                if ((req.user.name != null) && (req.user.name != user.name)) { user.name = req.user.name; userChanged = true; }
+                if ((req.user.email != null) && (req.user.email != user.email)) { user.email = req.user.email; user.emailVerified = true; userChanged = true; }
+
+                if (groups.enabled === true) {
+                    // Sync the user groups if enabled
+                    if (groups.syncEnabled === true) {
+                        syncExternalUserGroups(domain, user, groups.syncMemberships, req.user.strategy)
+                    }
+                    // See if the user is a member of the site admin group.
+                    if (groups.siteAdminEnabled === true) {
+                        if (groups.grantAdmin === true) {
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" Granting site admin privilages`);
+                            if (user.siteadmin !== 0xFFFFFFFF) { user.siteadmin = 0xFFFFFFFF; userChanged = true; }
+                        } else if ((groups.revokeAdmin === true) && (user.siteadmin === 0xFFFFFFFF)) {
+                            parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: GROUPS: USER: "${req.user.sid}" Revoking site admin privilages.`);
+                            delete user.siteadmin;
+                            userChanged = true;
+                        }
+                    }
+                }
+
+                // Update db record for user if there are changes detected
+                if (userChanged) {
+                    parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: CHANGED: USER: "${req.user.sid}" Updating user database entry`);
                     obj.db.SetUser(user);
 
-                    // Event user creation
+                    // Event user change
                     var targets = ['*', 'server-users'];
                     var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msg: 'Account changed', domain: domain.id };
                     if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
                     parent.DispatchEvent(targets, obj, event);
                 }
-                parent.debug('web', 'handleStrategyLogin: succesful login: ' + userid);
                 req.session.userid = userid;
                 setSessionRandom(req);
+
+                // Notify account login using SSO
+                var targets = ['*', 'server-users', user._id];
+                if (user.groups) { for (var i in user.groups) { targets.push('server-users:' + i); } }
+                const ua = obj.getUserAgentInfo(req);
+                const loginEvent = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'login', msgid: 107, msgArgs: [req.clientIp, ua.browserStr, ua.osStr], msg: 'Account login', domain: domain.id, ip: req.clientIp, userAgent: req.headers['user-agent'], twoFactorType: 'sso' };
+                obj.parent.DispatchEvent(targets, obj, loginEvent);
+                parent.authLog('handleStrategyLogin', `${req.user.strategy.toUpperCase()}: LOGIN SUCCESS: USER: "${req.user.sid}"`);
             }
+        } else if (req.session && req.session.userid && obj.users[req.session.userid]) {
+            parent.authLog('handleStrategyLogin', `User Already Authorised "${(req.session.passport && req.session.passport.user) ? req.session.passport.user : req.session.userid }"`);
+        } else {
+            parent.authLog('handleStrategyLogin', `LOGIN FAILED: REQUEST CONTAINS NO USER OR SID`);
         }
         //res.redirect(domain.url); // This does not handle cookie correctly.
         res.set('Content-Type', 'text/html');
-        res.end('<html><head><meta http-equiv="refresh" content=0;url="' + domain.url + '"></head><body></body></html>');
+        let url = domain.url;
+        if (Object.keys(req.query).length > 0) { url += "?" + Object.keys(req.query).map(function(key) { return encodeURIComponent(key) + "=" + encodeURIComponent(req.query[key]); }).join("&"); }
+        res.end('<html><head><meta http-equiv="refresh" content=0;url="' + url + '"></head><body></body></html>');
     }
 
     // Indicates that any request to "/" should render "default" or "login" depending on login state
@@ -2471,13 +2847,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL key
         if (!obj.args) { parent.debug('web', 'handleRootRequest: no obj.args.'); res.sendStatus(500); return; }
 
+        // If a HTTP header is required, check new UserRequiredHttpHeader
+        if (domain.userrequiredhttpheader && (typeof domain.userrequiredhttpheader == 'object')) { var ok = false; for (var i in req.headers) { if (domain.userrequiredhttpheader[i.toLowerCase()] == req.headers[i]) { ok = true; } } if (ok == false) { res.sendStatus(404); return; } }
+
         // If the session is expired, clear it.
         if ((req.session != null) && (typeof req.session.expire == 'number') && ((req.session.expire - Date.now()) <= 0)) { for (var i in req.session) { delete req.session[i]; } }
 
         // Check if we are in maintenance mode
         if ((parent.config.settings.maintenancemode != null) && (req.query.loginscreen !== '1')) {
             parent.debug('web', 'handleLoginRequest: Server under maintenance.');
-            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
             return;
         }
 
@@ -2486,16 +2865,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             var q = require('url').parse(req.url, true);
             if (!q.pathname.endsWith('/login')) { res.redirect(domain.unknownuserrootredirect + getQueryPortion(req)); return; }
         }
-        
+
         if ((domain.sspi != null) && ((req.query.login == null) || (obj.parent.loginCookieEncryptionKey == null))) {
             // Login using SSPI
             domain.sspi.authenticate(req, res, function (err) {
                 if ((err != null) || (req.connection.user == null)) {
-                    if (obj.parent.authlog) { obj.parent.authLog('https', 'Failed SSPI-auth for ' + req.connection.user + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
+                    obj.parent.authLog('https', 'Failed SSPI-auth for ' + req.connection.user + ' from ' + req.clientIp + ' port ' + req.connection.remotePort, { useragent: req.headers['user-agent'] });
                     parent.debug('web', 'handleRootRequest: SSPI auth required.');
-                    res.end('Authentication Required...');
+                    try { res.sendStatus(401); } catch (ex) { } // sspi.authenticate() should already have responded to this request.
                 } else {
-                    if (obj.parent.authlog) { obj.parent.authLog('https', 'Accepted SSPI-auth for ' + req.connection.user + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
                     parent.debug('web', 'handleRootRequest: SSPI auth ok.');
                     handleRootRequestEx(req, res, domain, direct);
                 }
@@ -2503,13 +2881,23 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         } else if (req.query.user && req.query.pass) {
             // User credentials are being passed in the URL. WARNING: Putting credentials in a URL is bad security... but people are requesting this option.
             obj.authenticate(req.query.user, req.query.pass, domain, function (err, userid, passhint, loginOptions) {
-                if (obj.parent.authlog) { obj.parent.authLog('https', 'Accepted password for ' + userid + ' from ' + req.clientIp + ' port ' + req.connection.remotePort); }
-                parent.debug('web', 'handleRootRequest: user/pass in URL auth ok.');
-                req.session.userid = userid;
-                delete req.session.currentNode;
-                req.session.ip = req.clientIp; // Bind this session to the IP address of the request
-                setSessionRandom(req);
-                handleRootRequestEx(req, res, domain, direct);
+                // 2FA is not supported in URL authentication method. If user has 2FA enabled, this login method fails.
+                var user = obj.users[userid];
+                if ((err == null) && checkUserOneTimePasswordRequired(domain, user, req, loginOptions) == true) {
+                    handleRootRequestEx(req, res, domain, direct);
+                } else if ((userid != null) && (err == null)) {
+                    // Login success
+                    parent.debug('web', 'handleRootRequest: user/pass in URL auth ok.');
+                    req.session.userid = userid;
+                    delete req.session.currentNode;
+                    req.session.ip = req.clientIp; // Bind this session to the IP address of the request
+                    setSessionRandom(req);
+                    obj.parent.authLog('https', 'Accepted password for ' + userid + ' from ' + req.clientIp + ' port ' + req.connection.remotePort, { useragent: req.headers['user-agent'], sessionid: req.session.x });
+                    handleRootRequestEx(req, res, domain, direct);
+                } else {
+                    // Login failed
+                    handleRootRequestEx(req, res, domain, direct);
+                }
             });
         } else if ((req.session != null) && (typeof req.session.loginToken == 'string')) {
             // Check if the loginToken is still valid
@@ -2557,7 +2945,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             setSessionRandom(req);
         } else if (req.query.login && (obj.parent.loginCookieEncryptionKey != null)) {
             var loginCookie = obj.parent.decodeCookie(req.query.login, obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-            //if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // If the cookie if binded to an IP address, check here.
+            //if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // If the cookie is bound to an IP address, check here.
             if ((loginCookie != null) && (loginCookie.a == 3) && (loginCookie.u != null) && (loginCookie.u.split('/')[1] == domain.id)) {
                 // If a login cookie was provided, setup the session here.
                 parent.debug('web', 'handleRootRequestEx: cookie auth ok.');
@@ -2583,6 +2971,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 delete req.session.currentNode;
                 req.session.ip = req.clientIp; // Bind this session to the IP address of the request
                 setSessionRandom(req);
+                obj.parent.authLog('https', 'Accepted SSPI-auth for ' + req.connection.user + ' from ' + req.clientIp + ' port ' + req.connection.remotePort, { useragent: req.headers['user-agent'], sessionid: req.session.x });
 
                 // Check if this user exists, create it if not.
                 user = obj.users[req.session.userid];
@@ -2658,7 +3047,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If the request has a "meshmessengerid", redirect to MeshMessenger
             // This situation happens when you get a push notification for a chat session, but are not logged in.
             if (req.query.meshmessengerid != null) {
-                res.redirect(domain.url + 'messenger?id=' + req.query.meshmessengerid + ((req.query.key != null) ? ('&key=' + req.query.key) : ''));
+                res.redirect(domain.url + 'messenger?id=' + encodeURIComponent(req.query.meshmessengerid) + ((req.query.key != null) ? ('&key=' + encodeURIComponent(req.query.key)) : ''));
                 return;
             }
 
@@ -2705,7 +3094,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                 // Create a authentication cookie
                 const authCookie = obj.parent.encodeCookie({ userid: dbGetFunc.user._id, domainid: domain.id, ip: req.clientIp }, obj.parent.loginCookieEncryptionKey);
-                const authRelayCookie = obj.parent.encodeCookie({ ruserid: dbGetFunc.user._id, domainid: domain.id }, obj.parent.loginCookieEncryptionKey);
+                const authRelayCookie = obj.parent.encodeCookie({ ruserid: dbGetFunc.user._id, x: req.session.x }, obj.parent.loginCookieEncryptionKey);
 
                 // Send the main web application
                 var extras = (dbGetFunc.req.query.key != null) ? ('&key=' + dbGetFunc.req.query.key) : '';
@@ -2714,6 +3103,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                 // Clean up the U2F challenge if needed
                 if (dbGetFunc.req.session.u2f) { delete dbGetFunc.req.session.u2f; };
+                if (dbGetFunc.req.session.e) {
+                    const sec = parent.decryptSessionData(dbGetFunc.req.session.e);
+                    if (sec.u2f != null) { delete sec.u2f; dbGetFunc.req.session.e = parent.encryptSessionData(sec); }
+                }
 
                 // Intel AMT Scanning options
                 var amtscanoptions = '';
@@ -2738,7 +3131,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if (domain.customui != null) { customui = encodeURIComponent(JSON.stringify(domain.customui)); }
 
                 // Server features
-                var serverFeatures = 127;
+                var serverFeatures = 255;
                 if (domain.myserver === false) { serverFeatures = 0; } // 64 = Show "My Server" tab
                 else if (typeof domain.myserver == 'object') {
                     if (domain.myserver.backup !== true) { serverFeatures -= 1; } // Disallow simple server backups
@@ -2747,14 +3140,20 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     if (domain.myserver.errorlog !== true) { serverFeatures -= 8; } // Disallow show server crash log
                     if (domain.myserver.console !== true) { serverFeatures -= 16; } // Disallow server console
                     if (domain.myserver.trace !== true) { serverFeatures -= 32; } // Disallow server tracing
+                    if (domain.myserver.config !== true) { serverFeatures -= 128; } // Disallow server configuration
                 }
                 if (obj.db.databaseType != 1) { // If not using NeDB, we can't backup using the simple system.
                     if ((serverFeatures & 1) != 0) { serverFeatures -= 1; } // Disallow server backups
                     if ((serverFeatures & 2) != 0) { serverFeatures -= 2; } // Disallow simple server restore
                 }
 
+                // Get WebRTC configuration
+                var webRtcConfig = null;
+                if (obj.parent.config.settings && obj.parent.config.settings.webrtcconfig && (typeof obj.parent.config.settings.webrtcconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(obj.parent.config.settings.webrtcconfig)).replace(/'/g, '%27'); }
+                else if (args.webrtcconfig && (typeof args.webrtcconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(args.webrtcconfig)).replace(/'/g, '%27'); }                
+
                 // Refresh the session
-                render(dbGetFunc.req, dbGetFunc.res, getRenderPage('default', dbGetFunc.req, domain), getRenderArgs({
+                render(dbGetFunc.req, dbGetFunc.res, getRenderPage(((domain.sitestyle == 3) || (req.query.sitestyle == 3) ? 'default3' : 'default'), dbGetFunc.req, domain), getRenderArgs({
                     authCookie: authCookie,
                     authRelayCookie: authRelayCookie,
                     viewmode: viewmode,
@@ -2762,7 +3161,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27'),
                     domain: domain.id,
                     debuglevel: parent.debugLevel,
-                    serverDnsName: obj.getWebServerName(domain),
+                    serverDnsName: obj.getWebServerName(domain, req),
                     serverRedirPort: args.redirport,
                     serverPublicPort: httpsPort,
                     serverfeatures: serverFeatures,
@@ -2776,7 +3175,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     footer: (domain.footer == null) ? '' : domain.footer,
                     webstate: encodeURIComponent(webstate).replace(/'/g, '%27'),
                     amtscanoptions: amtscanoptions,
-                    pluginHandler: (parent.pluginHandler == null) ? 'null' : parent.pluginHandler.prepExports()
+                    pluginHandler: (parent.pluginHandler == null) ? 'null' : parent.pluginHandler.prepExports(),
+                    webRelayPort: ((args.relaydns != null) ? ((typeof args.aliasport == 'number') ? args.aliasport : args.port) : ((parent.webrelayserver != null) ? ((typeof args.relayaliasport == 'number') ? args.relayaliasport : parent.webrelayserver.port) : 0)),
+                    webRelayDns: ((args.relaydns != null) ? args.relaydns[0] : ''),
+                    hidePowerTimeline: (domain.hidepowertimeline ? 'true' : 'false'),
+                    showNotesPanel: (domain.shownotespanel ? 'true' : 'false'),
+                    userSessionsSort: (domain.usersessionssort ? domain.usersessionssort : 'SessionId'),
+                    webrtcconfig: webRtcConfig
                 }, dbGetFunc.req, domain), user);
             }
             xdbGetFunc.req = req;
@@ -2787,12 +3192,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // Send back the login application
             // If this is a 2 factor auth request, look for a hardware key challenge.
             // Normal login 2 factor request
-            if (req.session && (req.session.loginmode == 4) && (req.session.tuserid)) {
-                var user = obj.users[req.session.tuserid];
-                if (user != null) {
-                    parent.debug('web', 'handleRootRequestEx: sending 2FA challenge.');
-                    getHardwareKeyChallenge(req, domain, user, function (hwchallenge) { handleRootRequestLogin(req, res, domain, hwchallenge, passRequirements); });
-                    return;
+            if (req.session && (req.session.loginmode == 4)) {
+                const sec = parent.decryptSessionData(req.session.e);
+                if ((sec != null) && (typeof sec.tuserid == 'string')) {
+                    const user = obj.users[sec.tuserid];
+                    if (user != null) {
+                        parent.debug('web', 'handleRootRequestEx: sending 2FA challenge.');
+                        getHardwareKeyChallenge(req, domain, user, function (hwchallenge) { handleRootRequestLogin(req, res, domain, hwchallenge, passRequirements); });
+                        return;
+                    }
                 }
             }
             // Password recovery 2 factor request
@@ -2821,7 +3229,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     }
 
     // Return a list of server supported features for a given domain and user
-    obj.getDomainUserFeatures = function(domain, user, req) {
+    obj.getDomainUserFeatures = function (domain, user, req) {
         var features = 0;
         var features2 = 0;
         if (obj.args.wanonly == true) { features += 0x00000001; } // WAN-only mode
@@ -2835,7 +3243,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         // 0x00000100 --> This feature flag is free for future use.
         if (obj.args.allowhighqualitydesktop !== false) { features += 0x00000200; } // Enable AllowHighQualityDesktop (Default true)
         if ((obj.args.lanonly == true) || (obj.args.mpsport == 0)) { features += 0x00000400; } // No CIRA
-        if ((obj.parent.serverSelfWriteAllowed == true) && (user != null) && (user.siteadmin == 0xFFFFFFFF)) { features += 0x00000800; } // Server can self-write (Allows self-update)
+        if ((obj.parent.serverSelfWriteAllowed == true) && (user != null) && ((user.siteadmin & 0x00000010) != 0)) { features += 0x00000800; } // Server can self-write (Allows self-update)
         if ((parent.config.settings.no2factorauth !== true) && (domain.auth != 'sspi') && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.nousers !== true) && (user._id.split('/')[2][0] != '~')) { features += 0x00001000; } // 2FA login supported
         if (domain.agentnoproxy === true) { features += 0x00002000; } // Indicates that agents should be installed without using a HTTP proxy
         if ((parent.config.settings.no2factorauth !== true) && domain.yubikey && domain.yubikey.id && domain.yubikey.secret && (user._id.split('/')[2][0] != '~')) { features += 0x00004000; } // Indicates Yubikey support
@@ -2863,7 +3271,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain.sessionrecording != null) { features += 0x08000000; } // Server recordings enabled
         if (domain.urlswitching === false) { features += 0x10000000; } // Disables the URL switching feature
         if (domain.novnc === false) { features += 0x20000000; } // Disables noVNC
-        if (domain.mstsc !== true) { features += 0x40000000; } // Disables MSTSC.js
+        if (domain.mstsc === false) { features += 0x40000000; } // Disables MSTSC.js
         if (obj.isTrustedCert(domain) == false) { features += 0x80000000; } // Indicate we are not using a trusted certificate
         if (obj.parent.amtManager != null) { features2 += 0x00000001; } // Indicates that the Intel AMT manager is active
         if (obj.parent.firebase != null) { features2 += 0x00000002; } // Indicates the server supports Firebase push messaging
@@ -2872,7 +3280,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (((obj.args.noagentupdate == 1) || (obj.args.noagentupdate == true))) { features2 += 0x00000010; } // No agent update
         if (parent.amtProvisioningServer != null) { features2 += 0x00000020; } // Intel AMT LAN provisioning server
         if (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.push2factor != false)) && (obj.parent.firebase != null)) { features2 += 0x00000040; } // Indicates device push notification 2FA is enabled
-        if ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.logintokens != false)) { features2 += 0x00000080; } // Indicates login tokens are allowed
+        if ((typeof domain.passwordrequirements != 'object') || ((domain.passwordrequirements.logintokens !== false) && ((Array.isArray(domain.passwordrequirements.logintokens) == false) || (domain.passwordrequirements.logintokens.indexOf(user._id) >= 0)))) { features2 += 0x00000080; } // Indicates login tokens are allowed
         if (req.session.loginToken != null) { features2 += 0x00000100; } // LoginToken mode, no account changes.
         if (domain.ssh == true) { features2 += 0x00000200; } // SSH is enabled
         if (domain.localsessionrecording === false) { features2 += 0x00000400; } // Disable local recording feature
@@ -2883,6 +3291,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain.devicesearchbarserverandclientname) { features2 += 0x00008000; } // Search bar will find both server name and client name
         if (domain.ipkvm) { features2 += 0x00010000; } // Indicates support for IP KVM device groups
         if ((domain.passwordrequirements) && (domain.passwordrequirements.otp2factor == false)) { features2 += 0x00020000; } // Indicates support for OTP 2FA is disabled
+        if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.backupcode2factor === false)) { features2 += 0x00040000; } // Indicates 2FA backup codes are disabled
+        if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.single2factorwarning === false)) { features2 += 0x00080000; } // Indicates no warning if a single 2FA is in use
+        if (domain.nightmode === 1) { features2 += 0x00100000; } // Always night mode
+        if (domain.nightmode === 2) { features2 += 0x00200000; } // Always day mode
+        if (domain.allowsavingdevicecredentials == false) { features2 += 0x00400000; } // Do not allow device credentials to be saved on the server
+        if ((typeof domain.files == 'object') && (domain.files.sftpconnect === false)) { features2 += 0x00800000; } // Remove the "SFTP Connect" button in the "Files" tab when the device is agent managed
+        if ((typeof domain.terminal == 'object') && (domain.terminal.sshconnect === false)) { features2 += 0x01000000; } // Remove the "SSH Connect" button in the "Terminal" tab when the device is agent managed
+        if ((parent.msgserver != null) && (parent.msgserver.providers != 0)) { features2 += 0x02000000; } // User messaging server is enabled
+        if ((parent.msgserver != null) && (parent.msgserver.providers != 0) && ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false))) { features2 += 0x04000000; } // User messaging 2FA is allowed
+        if (domain.scrolltotop == true) { features2 += 0x08000000; } // Show the "Scroll to top" button
+        if (domain.devicesearchbargroupname === true) { features2 += 0x10000000; } // Search bar will find by group name too
+        if (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.duo2factor != false)) && (typeof domain.duo2factor == 'object') && (typeof domain.duo2factor.integrationkey == 'string') && (typeof domain.duo2factor.secretkey == 'string') && (typeof domain.duo2factor.apihostname == 'string')) { features2 += 0x20000000; } // using Duo for 2FA is allowed
         return { features: features, features2: features2 };
     }
 
@@ -2903,7 +3323,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             delete req.session.messageid;
             delete req.session.passhint;
         }
-        var emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
+        const allowAccountReset = ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.allowaccountreset !== false));
+        const emailcheck = (allowAccountReset && (domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
 
         // Check if we are allowed to create new users using the login screen
         var newAccountsAllowed = true;
@@ -2912,13 +3333,20 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Encrypt the hardware key challenge state if needed
         var hwstate = null;
-        if (hardwareKeyChallenge) { hwstate = obj.parent.encodeCookie({ u: req.session.tuser, p: req.session.tpass, c: req.session.u2f }, obj.parent.loginCookieEncryptionKey) }
+        if (hardwareKeyChallenge && req.session) {
+            const sec = parent.decryptSessionData(req.session.e);
+            hwstate = obj.parent.encodeCookie({ u: sec.tuser, p: sec.tpass, c: sec.u2f }, obj.parent.loginCookieEncryptionKey)
+        }
 
         // Check if we can use OTP tokens with email. We can't use email for 2FA password recovery (loginmode 5).
         var otpemail = (loginmode != 5) && (domain.mailserver != null) && (req.session != null) && ((req.session.temail === 1) || (typeof req.session.temail == 'string'));
         if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.email2factor == false)) { otpemail = false; }
+        var otpduo = (req.session != null) && (req.session.tduo === 1);
+        if (((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.duo2factor == false)) || (typeof domain.duo2factor != 'object')) { otpduo = false; }
         var otpsms = (parent.smsserver != null) && (req.session != null) && (req.session.tsms === 1);
         if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.sms2factor == false)) { otpsms = false; }
+        var otpmsg = (parent.msgserver != null) && (req.session != null) && (req.session.tmsg === 1);
+        if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.msg2factor == false)) { otpmsg = false; }
         var otppush = (parent.firebase != null) && (req.session != null) && (req.session.tpush === 1);
         if ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.push2factor == false)) { otppush = false; }
         const autofido = ((typeof domain.passwordrequirements == 'object') && (domain.passwordrequirements.autofido2fa == true)); // See if FIDO should be automatically prompted if user account has it.
@@ -2933,8 +3361,14 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (typeof domain.authstrategies.twitter == 'object') { authStrategies.push('twitter'); }
             if (typeof domain.authstrategies.google == 'object') { authStrategies.push('google'); }
             if (typeof domain.authstrategies.github == 'object') { authStrategies.push('github'); }
-            if (typeof domain.authstrategies.reddit == 'object') { authStrategies.push('reddit'); }
             if (typeof domain.authstrategies.azure == 'object') { authStrategies.push('azure'); }
+            if (typeof domain.authstrategies.oidc == 'object') {
+                if (obj.common.validateObject(domain.authstrategies.oidc.custom) && obj.common.validateString(domain.authstrategies.oidc.custom.preset)) {
+                    authStrategies.push('oidc-' + domain.authstrategies.oidc.custom.preset);
+                } else {
+                    authStrategies.push('oidc');
+                }
+            }
             if (typeof domain.authstrategies.intel == 'object') { authStrategies.push('intel'); }
             if (typeof domain.authstrategies.jumpcloud == 'object') { authStrategies.push('jumpcloud'); }
             if (typeof domain.authstrategies.saml == 'object') { authStrategies.push('saml'); }
@@ -2950,38 +3384,59 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             twoFactorTimeout = domain.passwordrequirements.twofactortimeout * 1000;
         }
 
+        // Setup CAPTCHA if needed
+        var newAccountCaptcha = '', newAccountCaptchaImage = '';
+        if ((domain.newaccountscaptcha != null) && (domain.newaccountscaptcha !== false)) {
+            newAccountCaptcha = obj.parent.encodeCookie({ type: 'newAccount', captcha: require('svg-captcha').randomText(5) }, obj.parent.loginCookieEncryptionKey);
+            newAccountCaptchaImage = 'newAccountCaptcha.ashx?x=' + newAccountCaptcha;
+        }
+
+        // Check for flash errors from passport.js and make the array unique
+        var flashErrors = [];
+        if (req.session.flash && req.session.flash.error) {
+            flashErrors = obj.common.uniqueArray(req.session.flash.error);
+            req.session.flash = null;
+        }
+
         // Render the login page
         render(req, res,
-            getRenderPage((domain.sitestyle == 2) ? 'login2' : 'login', req, domain),
+            getRenderPage((domain.sitestyle >= 2) ? 'login2' : 'login', req, domain),
             getRenderArgs({
                 loginmode: loginmode,
                 rootCertLink: getRootCertLink(domain),
-                newAccount: newAccountsAllowed,
-                newAccountPass: (((domain.newaccountspass == null) || (domain.newaccountspass == '')) ? 0 : 1),
-                serverDnsName: obj.getWebServerName(domain),
+                newAccount: newAccountsAllowed, // True if new accounts are allowed from the login page
+                newAccountPass: (((domain.newaccountspass == null) || (domain.newaccountspass == '')) ? 0 : 1), // 1 if new account creation requires password
+                newAccountCaptcha: newAccountCaptcha, // If new account creation requires a CAPTCHA, this string will not be empty
+                newAccountCaptchaImage: newAccountCaptchaImage, // Set to the URL of the CAPTCHA image
+                serverDnsName: obj.getWebServerName(domain, req),
                 serverPublicPort: httpsPort,
                 passlogin: (typeof domain.showpasswordlogin == 'boolean') ? domain.showpasswordlogin : true,
                 emailcheck: emailcheck,
                 features: features,
-                sessiontime: (args.sessiontime) ? args.sessiontime : 60,
+                sessiontime: (args.sessiontime) ? args.sessiontime : 60, // Session time in minutes, 60 minutes is the default
                 passRequirements: passRequirements,
                 customui: customui,
                 footer: (domain.loginfooter == null) ? '' : domain.loginfooter,
                 hkey: encodeURIComponent(hardwareKeyChallenge).replace(/'/g, '%27'),
                 messageid: msgid,
+                flashErrors: JSON.stringify(flashErrors),
                 passhint: passhint,
                 welcometext: domain.welcometext ? encodeURIComponent(domain.welcometext).split('\'').join('\\\'') : null,
                 welcomePictureFullScreen: ((typeof domain.welcomepicturefullscreen == 'boolean') ? domain.welcomepicturefullscreen : false),
                 hwstate: hwstate,
                 otpemail: otpemail,
+                otpduo: otpduo,
                 otpsms: otpsms,
+                otpmsg: otpmsg,
                 otppush: otppush,
                 autofido: autofido,
                 twoFactorCookieDays: twoFactorCookieDays,
                 authStrategies: authStrategies.join(','),
                 loginpicture: (typeof domain.loginpicture == 'string'),
-                tokenTimeout: twoFactorTimeout // Two-factor authentication screen timeout in milliseconds
-            }, req, domain, (domain.sitestyle == 2) ? 'login2' : 'login'));
+                tokenTimeout: twoFactorTimeout, // Two-factor authentication screen timeout in milliseconds,
+                renderLanguages: obj.renderLanguages,
+                showLanguageSelect: domain.showlanguageselect ? domain.showlanguageselect : false,
+            }, req, domain, (domain.sitestyle >= 2) ? 'login2' : 'login'));
     }
 
     // Handle a post request on the root
@@ -2989,14 +3444,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
         if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.end("Not Found"); return; } // Check 3FA URL key
+        if (req.body == null) { req.body = {}; }
         parent.debug('web', 'handleRootPostRequest, action: ' + req.body.action);
+
+        // If a HTTP header is required, check new UserRequiredHttpHeader
+        if (domain.userrequiredhttpheader && (typeof domain.userrequiredhttpheader == 'object')) { var ok = false; for (var i in req.headers) { if (domain.userrequiredhttpheader[i.toLowerCase()] == req.headers[i]) { ok = true; } } if (ok == false) { res.sendStatus(404); return; } }
 
         switch (req.body.action) {
             case 'login': { handleLoginRequest(req, res, true); break; }
             case 'tokenlogin': {
                 if (req.body.hwstate) {
                     var cookie = obj.parent.decodeCookie(req.body.hwstate, obj.parent.loginCookieEncryptionKey, 10);
-                    if (cookie != null) { req.session.tuser = cookie.u; req.session.tpass = cookie.p; req.session.u2f = cookie.c; }
+                    if (cookie != null) { req.session.e = parent.encryptSessionData({ tuser: cookie.u, tpass: cookie.p, u2f: cookie.c }); }
                 }
                 handleLoginRequest(req, res, true); break;
             }
@@ -3012,7 +3471,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             var maxCookieAge = domain.twofactorcookiedurationdays;
                             if (typeof maxCookieAge != 'number') { maxCookieAge = 30; }
                             const twoFactorCookie = obj.parent.encodeCookie({ userid: cookie.u, expire: maxCookieAge * 24 * 60 /*, ip: req.clientIp*/ }, obj.parent.loginCookieEncryptionKey);
-                            res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: 'strict', secure: true });
+                            res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: parent.config.settings.sessionsamesite, secure: true });
                         }
 
                         handleRootRequestEx(req, res, domain);
@@ -3037,7 +3496,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (typeof obj.args.trustedcert == 'boolean') return obj.args.trustedcert; // If the status of the cert specified, use that.
         if (obj.args.tlsoffload != null) return true; // We are using TLS offload, a real cert is likely used.
         if (obj.parent.config.letsencrypt != null) return (obj.parent.config.letsencrypt.production === true); // We are using Let's Encrypt, real cert in use if production is set to true.
-        if (obj.certificates.WebIssuer.indexOf('MeshCentralRoot-') == 0) return false; // Our cert is issued by self-signed cert.
+        if ((typeof obj.certificates.WebIssuer == 'string') && (obj.certificates.WebIssuer.indexOf('MeshCentralRoot-') == 0)) return false; // Our cert is issued by self-signed cert.
         if (obj.certificates.CommonName.indexOf('.') == -1) return false; // Our cert is named with a fake name
         return true; // This is a guess
     }
@@ -3072,19 +3531,47 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if ((node == null) || ((rights & 8) == 0) || ((rights != 0xFFFFFFFF) && ((rights & 512) != 0))) { res.redirect(domain.url + getQueryPortion(req)); return; }
 
                 var logoutcontrols = { name: user.name };
-                var extras = (req.query.key != null) ? ('&key=' + req.query.key) : '';
+                var extras = (req.query.key != null) ? ('&key=' + encodeURIComponent(req.query.key)) : '';
                 if ((domain.ldap == null) && (domain.sspi == null) && (obj.args.user == null) && (obj.args.nousers != true)) { logoutcontrols.logoutUrl = (domain.url + 'logout?' + Math.random() + extras); } // If a default user is in use or no user mode, don't display the logout button
 
                 // Create a authentication cookie
                 const authCookie = obj.parent.encodeCookie({ userid: user._id, domainid: domain.id, ip: req.clientIp }, obj.parent.loginCookieEncryptionKey);
                 const authRelayCookie = obj.parent.encodeCookie({ ruserid: user._id, domainid: domain.id }, obj.parent.loginCookieEncryptionKey);
                 var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
-                render(req, res, getRenderPage('xterm', req, domain), getRenderArgs({ serverDnsName: obj.getWebServerName(domain), serverRedirPort: args.redirport, serverPublicPort: httpsPort, authCookie: authCookie, authRelayCookie: authRelayCookie, logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27'), name: EscapeHtml(node.name) }, req, domain));
+                render(req, res, getRenderPage('xterm', req, domain), getRenderArgs({ serverDnsName: obj.getWebServerName(domain, req), serverRedirPort: args.redirport, serverPublicPort: httpsPort, authCookie: authCookie, authRelayCookie: authRelayCookie, logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27'), name: EscapeHtml(node.name) }, req, domain));
             });
         } else {
             res.redirect(domain.url + getQueryPortion(req));
             return;
         }
+    }
+
+    // Handle new account Captcha GET
+    function handleNewAccountCaptchaRequest(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if ((domain.newaccountscaptcha == null) || (domain.newaccountscaptcha === false) || (req.query.x == null)) { res.sendStatus(404); return; }
+        const c = obj.parent.decodeCookie(req.query.x, obj.parent.loginCookieEncryptionKey);
+        if ((c == null) || (c.type !== 'newAccount') || (typeof c.captcha != 'string')) { res.sendStatus(404); return; }
+        res.type('svg');
+        res.status(200).end(require('svg-captcha')(c.captcha, {}));
+    }
+
+    // Handle Captcha GET
+    function handleCaptchaGetRequest(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if (parent.crowdSecBounser == null) { res.sendStatus(404); return; }
+        parent.crowdSecBounser.applyCaptcha(req, res, function () { res.redirect((((domain.id == '') && (domain.dns == null)) ? '/' : ('/' + domain.id))); });
+    }
+
+    // Handle Captcha POST
+    function handleCaptchaPostRequest(req, res) {
+        if (parent.crowdSecBounser == null) { res.sendStatus(404); return; }
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        req.originalUrl = (((domain.id == '') && (domain.dns == null)) ? '/' : ('/' + domain.id));
+        parent.crowdSecBounser.applyCaptcha(req, res, function () { res.redirect(req.originalUrl); });
     }
 
     // Render the terms of service.
@@ -3101,7 +3588,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if (req.session.userid.split('/')[1] != domain.id) { req.session = null; res.redirect(domain.url + getQueryPortion(req)); return; } // Check if the session is for the correct domain
                 var user = obj.users[req.session.userid];
                 var logoutcontrols = { name: user.name };
-                var extras = (req.query.key != null) ? ('&key=' + req.query.key) : '';
+                var extras = (req.query.key != null) ? ('&key=' + encodeURIComponent(req.query.key)) : '';
                 if ((domain.ldap == null) && (domain.sspi == null) && (obj.args.user == null) && (obj.args.nousers != true)) { logoutcontrols.logoutUrl = (domain.url + 'logout?' + Math.random() + extras); } // If a default user is in use or no user mode, don't display the logout button
                 render(req, res, getRenderPage('terms', req, domain), getRenderArgs({ terms: encodeURIComponent(parent.configurationFiles['terms.txt'].toString()).split('\'').join('\\\''), logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27') }, req, domain));
             } else {
@@ -3120,7 +3607,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         if (req.session.userid.split('/')[1] != domain.id) { req.session = null; res.redirect(domain.url + getQueryPortion(req)); return; } // Check if the session is for the correct domain
                         var user = obj.users[req.session.userid];
                         var logoutcontrols = { name: user.name };
-                        var extras = (req.query.key != null) ? ('&key=' + req.query.key) : '';
+                        var extras = (req.query.key != null) ? ('&key=' + encodeURIComponent(req.query.key)) : '';
                         if ((domain.ldap == null) && (domain.sspi == null) && (obj.args.user == null) && (obj.args.nousers != true)) { logoutcontrols.logoutUrl = (domain.url + 'logout?' + Math.random() + extras); } // If a default user is in use or no user mode, don't display the logout button
                         render(req, res, getRenderPage('terms', req, domain), getRenderArgs({ terms: encodeURIComponent(data).split('\'').join('\\\''), logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27') }, req, domain));
                     } else {
@@ -3135,7 +3622,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     if (req.session.userid.split('/')[1] != domain.id) { req.session = null; res.redirect(domain.url + getQueryPortion(req)); return; } // Check if the session is for the correct domain
                     var user = obj.users[req.session.userid];
                     var logoutcontrols = { name: user.name };
-                    var extras = (req.query.key != null) ? ('&key=' + req.query.key) : '';
+                    var extras = (req.query.key != null) ? ('&key=' + encodeURIComponent(req.query.key)) : '';
                     if ((domain.ldap == null) && (domain.sspi == null) && (obj.args.user == null) && (obj.args.nousers != true)) { logoutcontrols.logoutUrl = (domain.url + 'logout?' + Math.random() + extras); } // If a default user is in use or no user mode, don't display the logout button
                     render(req, res, getRenderPage('terms', req, domain), getRenderArgs({ logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27') }, req, domain));
                 } else {
@@ -3153,7 +3640,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Check if we are in maintenance mode
         if (parent.config.settings.maintenancemode != null) {
-            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
+            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 3, msgid: 13, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain));
             return;
         }
 
@@ -3167,7 +3654,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             var user2 = idSplit[4] + '/' + idSplit[5] + '/' + idSplit[6]
             if (!req.session || !req.session.userid) {
                 // Redirect to login page
-                if (req.query.key != null) { res.redirect(domain.url + '?key=' + req.query.key + '&meshmessengerid=' + req.query.id); } else { res.redirect(domain.url + '?meshmessengerid=' + req.query.id); }
+                if (req.query.key != null) { res.redirect(domain.url + '?key=' + encodeURIComponent(req.query.key) + '&meshmessengerid=' + encodeURIComponent(req.query.id)); } else { res.redirect(domain.url + '?meshmessengerid=' + encodeURIComponent(req.query.id)); }
                 return;
             }
             if ((req.session.userid != user1) && (req.session.userid != user2)) { res.sendStatus(404); return; }
@@ -3175,11 +3662,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Get WebRTC configuration
         var webRtcConfig = null;
-        if (obj.parent.config.settings && obj.parent.config.settings.webrtconfig && (typeof obj.parent.config.settings.webrtconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(obj.parent.config.settings.webrtconfig)).replace(/'/g, '%27'); }
-        else if (args.webrtconfig && (typeof args.webrtconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(args.webrtconfig)).replace(/'/g, '%27'); }
+        if (obj.parent.config.settings && obj.parent.config.settings.webrtcconfig && (typeof obj.parent.config.settings.webrtcconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(obj.parent.config.settings.webrtcconfig)).replace(/'/g, '%27'); }
+        else if (args.webrtcconfig && (typeof args.webrtcconfig == 'object')) { webRtcConfig = encodeURIComponent(JSON.stringify(args.webrtcconfig)).replace(/'/g, '%27'); }
 
         // Setup other options
-        var options = { webrtconfig: webRtcConfig };
+        var options = { webrtcconfig: webRtcConfig };
         if (typeof domain.meshmessengertitle == 'string') { options.meshMessengerTitle = domain.meshmessengertitle; } else { options.meshMessengerTitle = '!'; }
 
         // Get the userid and name
@@ -3261,6 +3748,31 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         res.send(Buffer.from(getRootCertBase64(), 'base64'));
     }
 
+    // Return a customised mainifest.json for PWA
+    function handleManifestRequest(req, res){
+        const domain = getDomain(req);
+        if (domain == null) { parent.debug('web', 'handleManifestRequest: no domain'); res.sendStatus(404); return; }
+        if ((obj.userAllowedIp != null) && (checkIpAddressEx(req, res, obj.userAllowedIp, false) === false)) { parent.debug('web', 'handleManifestRequest: invalid ip'); return; } // Check server-wide IP filter only.
+        parent.debug('web', 'handleManifestRequest()');
+        var manifest = {
+            "name": (domain.title != null) ? domain.title : 'MeshCentral',
+            "short_name": (domain.title != null) ? domain.title : 'MeshCentral',
+            "description": "Open source web based, remote computer management.",
+            "scope": ".",
+            "start_url": "/",
+            "display": "fullscreen",
+            "orientation": "any",
+            "theme_color": "#ffffff",
+            "background_color": "#ffffff",
+            "icons": [{
+                "src": "pwalogo.png",
+                "sizes": "512x512",
+                "type": "image/png"
+            }]
+        };
+        res.json(manifest);
+    }
+
     // Handle user public file downloads
     function handleDownloadUserFiles(req, res) {
         const domain = checkUserIpAddress(req, res);
@@ -3269,6 +3781,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         if (obj.common.validateString(req.path, 1, 4096) == false) { res.sendStatus(404); return; }
         var domainname = 'domain', spliturl = decodeURIComponent(req.path).split('/'), filename = '';
+        if (spliturl[1] != 'userfiles') { spliturl.splice(1,1); } // remove domain.id from url for domains without dns
         if ((spliturl.length < 3) || (obj.common.IsFilenameValid(spliturl[2]) == false) || (domain.userQuota == -1)) { res.sendStatus(404); return; }
         if (domain.id != '') { domainname = 'domain-' + domain.id; }
         var path = obj.path.join(obj.filespath, domainname + '/user-' + spliturl[2] + '/Public');
@@ -3281,10 +3794,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 setContentDispositionHeader(res, 'application/octet-stream', filename, null, 'file.bin');
                 try { res.sendFile(obj.path.resolve(__dirname, path)); } catch (e) { res.sendStatus(404); }
             } else {
-                render(req, res, getRenderPage((domain.sitestyle == 2) ? 'download2' : 'download', req, domain), getRenderArgs({ rootCertLink: getRootCertLink(domain), messageid: 1, fileurl: req.path + '?download=1', filename: filename, filesize: stat.size }, req, domain));
+                render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'download2' : 'download', req, domain), getRenderArgs({ rootCertLink: getRootCertLink(domain), messageid: 1, fileurl: req.path + '?download=1', filename: filename, filesize: stat.size }, req, domain));
             }
         } else {
-            render(req, res, getRenderPage((domain.sitestyle == 2) ? 'download2' : 'download', req, domain), getRenderArgs({ rootCertLink: getRootCertLink(domain), messageid: 2 }, req, domain));
+            render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'download2' : 'download', req, domain), getRenderArgs({ rootCertLink: getRootCertLink(domain), messageid: 2 }, req, domain));
         }
     }
 
@@ -3320,7 +3833,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
     // Handle download of a server file by an agent
     function handleAgentDownloadFile(req, res) {
-        const domain = checkUserIpAddress(req, res);
+        const domain = checkAgentIpAddress(req, res);
         if (domain == null) { return; }
         if (req.query.c == null) { res.sendStatus(404); return; }
 
@@ -3341,7 +3854,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain.titlepicture) {
             if ((parent.configurationFiles != null) && (parent.configurationFiles[domain.titlepicture] != null)) {
                 // Use the logo in the database
-                res.set({ 'Content-Type': domain.titlepicture.toLowerCase().endsWith('.png')?'image/png':'image/jpeg' });
+                res.set({ 'Content-Type': domain.titlepicture.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg' });
                 res.send(parent.configurationFiles[domain.titlepicture]);
                 return;
             } else {
@@ -3380,6 +3893,36 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
         } else {
             res.sendStatus(404);
+        }
+    }
+
+    // Handle PWA logo request
+    function handlePWALogoRequest(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+
+        //res.set({ 'Cache-Control': 'max-age=86400' }); // 1 day
+        if (domain.pwalogo) {
+            if ((parent.configurationFiles != null) && (parent.configurationFiles[domain.pwalogo] != null)) {
+                // Use the logo in the database
+                res.set({ 'Content-Type': domain.pwalogo.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg' });
+                res.send(parent.configurationFiles[domain.pwalogo]);
+                return;
+            } else {
+                // Use the logo on file
+                try { res.sendFile(obj.common.joinPath(obj.parent.datapath, domain.pwalogo)); return; } catch (ex) { }
+            }
+        }
+
+        if ((domain.webpublicpath != null) && (obj.fs.existsSync(obj.path.join(domain.webpublicpath, 'android-chrome-512x512.png')))) {
+            // Use the domain logo picture
+            try { res.sendFile(obj.path.join(domain.webpublicpath, 'android-chrome-512x512.png')); } catch (ex) { res.sendStatus(404); }
+        } else if (parent.webPublicOverridePath && obj.fs.existsSync(obj.path.join(obj.parent.webPublicOverridePath, 'android-chrome-512x512.png'))) {
+            // Use the override logo picture
+            try { res.sendFile(obj.path.join(obj.parent.webPublicOverridePath, 'android-chrome-512x512.png')); } catch (ex) { res.sendStatus(404); }
+        } else {
+            // Use the default logo picture
+            try { res.sendFile(obj.path.join(obj.parent.webPublicPath, 'android-chrome-512x512.png')); } catch (ex) { res.sendStatus(404); }
         }
     }
 
@@ -3456,7 +3999,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (domain.welcomepicture) {
             if ((parent.configurationFiles != null) && (parent.configurationFiles[domain.welcomepicture] != null)) {
                 // Use the welcome image in the database
-                res.set({ 'Content-Type': domain.welcomepicture.toLowerCase().endsWith('.png')?'image/png':'image/jpeg' });
+                res.set({ 'Content-Type': domain.welcomepicture.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg' });
                 res.send(parent.configurationFiles[domain.welcomepicture]);
                 return;
             }
@@ -3466,7 +4009,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
 
         var imagefile = 'images/mainwelcome.jpg';
-        if (domain.sitestyle == 2) { imagefile = 'images/login/back.png'; }
+        if (domain.sitestyle >= 2) { imagefile = 'images/login/back.png'; }
         if (domain.webpublicpath != null) {
             obj.fs.exists(obj.path.join(domain.webpublicpath, imagefile), function (exists) {
                 if (exists) {
@@ -3541,7 +4084,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((user.siteadmin & 512) == 0) { try { ws.close(); } catch (ex) { } return; } // Check if we have right to get recordings
         const filefullpath = obj.path.join(recordingsPath, req.query.file);
 
-        obj.fs.stat(filefullpath, function(err, stats) {
+        obj.fs.stat(filefullpath, function (err, stats) {
             if (err) {
                 try { ws.close(); } catch (ex) { } // File does not exist
             } else {
@@ -3613,13 +4156,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (typeof c.pid != 'string') { res.sendStatus(404); return; }
 
             // Check the expired time, expire message.
-            if ((c.e != null) && (c.e <= Date.now())) { render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
+            if ((c.e != null) && (c.e <= Date.now())) { render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
 
             obj.db.Get('deviceshare-' + c.pid, function (err, docs) {
                 if ((err != null) || (docs == null) || (docs.length != 1)) { res.sendStatus(404); return; }
                 const doc = docs[0];
 
-                // If this is a recurrent share, check if we are at the currect time to make use of it
+                // If this is a recurrent share, check if we are at the correct time to make use of it
                 if (typeof doc.recurring == 'number') {
                     const now = Date.now();
                     if (now >= doc.startTime) { // We don't want to move the validity window before the start time
@@ -3641,7 +4184,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
 
                 // Generate an old style cookie from the information in the database
-                var cookie = { a: 5, p: doc.p, gn: doc.guestName, nid: doc.nodeid, cf: doc.consent, pid: doc.publicid, k: doc.extrakey };
+                var cookie = { a: 5, p: doc.p, gn: doc.guestName, nid: doc.nodeid, cf: doc.consent, pid: doc.publicid, k: doc.extrakey ? doc.extrakey : null, port: doc.port };
                 if (doc.userid) { cookie.uid = doc.userid; }
                 if ((cookie.userid == null) && (cookie.pid.startsWith('AS:node/'))) { cookie.nouser = 1; }
                 if (doc.startTime != null) {
@@ -3659,17 +4202,17 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     // Serve the guest sharing page
     function handleSharingRequestEx(req, res, domain, c) {
         // Check the expired time, expire message.
-        if ((c.expire != null) && (c.expire <= Date.now())) { render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
+        if ((c.expire != null) && (c.expire <= Date.now())) { render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
 
         // Check the public id
         obj.db.GetAllTypeNodeFiltered([c.nid], domain.id, 'deviceshare', null, function (err, docs) {
-            // Check if any desktop sharing links are present, expire message.
-            if ((err != null) || (docs.length == 0)) { render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
+            // Check if any sharing links are present, expire message.
+            if ((err != null) || (docs.length == 0)) { render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
 
             // Search for the device share public identifier, expire message.
             var found = false;
             for (var i = 0; i < docs.length; i++) { if ((docs[i].publicid == c.pid) && ((docs[i].extrakey == null) || (docs[i].extrakey === c.k))) { found = true; } }
-            if (found == false) { render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
+            if (found == false) { render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 12, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
 
             // Get information about this node
             obj.db.Get(c.nid, function (err, nodes) {
@@ -3677,24 +4220,45 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 var node = nodes[0];
 
                 // Check the start time, not yet valid message.
-                if ((c.start != null) && (c.expire != null) && ((c.start > Date.now()) || (c.start > c.expire))) { render(req, res, getRenderPage((domain.sitestyle == 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 11, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
+                if ((c.start != null) && (c.expire != null) && ((c.start > Date.now()) || (c.start > c.expire))) { render(req, res, getRenderPage((domain.sitestyle >= 2) ? 'message2' : 'message', req, domain), getRenderArgs({ titleid: 2, msgid: 11, domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27') }, req, domain)); return; }
 
-                // Looks good, let's create the outbound session cookies.
-                // Consent flags are 1 = Notify, 8 = Prompt, 64 = Privacy Bar.
-                const authCookieData = { userid: c.uid, domainid: domain.id, nid: c.nid, ip: req.clientIp, p: c.p, gn: c.gn, cf: c.cf, r: 8, expire: c.expire, pid: c.pid, vo: c.vo };
-                if ((authCookieData.userid == null) && (authCookieData.pid.startsWith('AS:node/'))) { authCookieData.nouser = 1; }
-                if (c.k != null) { authCookieData.k = c.k; }
-                const authCookie = obj.parent.encodeCookie(authCookieData, obj.parent.loginCookieEncryptionKey);
+                // If this is a web relay share, check if this feature is active
+                if ((c.p == 8) || (c.p == 16)) {
+                    // This is a HTTP or HTTPS share
+                    var webRelayPort = ((args.relaydns != null) ? ((typeof args.aliasport == 'number') ? args.aliasport : args.port) : ((parent.webrelayserver != null) ? ((typeof args.relayaliasport == 'number') ? args.relayaliasport : parent.webrelayserver.port) : 0));
+                    if (webRelayPort == 0) { res.sendStatus(404); return; }
 
-                // Server features
-                var features2 = 0;
-                if (obj.args.allowhighqualitydesktop !== false) { features2 += 1; } // Enable AllowHighQualityDesktop (Default true)
+                    // Create the authentication cookie
+                    const authCookieData = { userid: c.uid, domainid: domain.id, nid: c.nid, ip: req.clientIp, p: c.p, gn: c.gn, r: 8, expire: c.expire, pid: c.pid, port: c.port };
+                    if ((authCookieData.userid == null) && (authCookieData.pid.startsWith('AS:node/'))) { authCookieData.nouser = 1; }
+                    const authCookie = obj.parent.encodeCookie(authCookieData, obj.parent.loginCookieEncryptionKey);
 
-                // Lets respond by sending out the desktop viewer.
-                var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
-                parent.debug('web', 'handleSharingRequest: Sending guest sharing page for \"' + c.uid + '\", guest \"' + c.gn + '\".');
-                res.set({ 'Cache-Control': 'no-store' });
-                render(req, res, getRenderPage('sharing', req, domain), getRenderArgs({ authCookie: authCookie, authRelayCookie: '', domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), nodeid: c.nid, serverDnsName: obj.getWebServerName(domain), serverRedirPort: args.redirport, serverPublicPort: httpsPort, expire: c.expire, viewOnly: (c.vo == 1) ? 1 : 0, nodeName: encodeURIComponent(node.name).replace(/'/g, '%27'), features: c.p, features2: features2 }, req, domain));
+                    // Redirect to a URL
+                    var webRelayDns = (args.relaydns != null) ? args.relaydns[0] : obj.getWebServerName(domain, req);
+                    var url = 'https://' + webRelayDns + ':' + webRelayPort + '/control-redirect.ashx?n=' + c.nid + '&p=' + c.port + '&appid=' + c.p + '&c=' + authCookie;
+                    if (c.addr != null) { url += '&addr=' + c.addr; }
+                    if (c.pid != null) { url += '&relayid=' + c.pid; }
+                    parent.debug('web', 'handleSharingRequest: Redirecting guest to HTTP relay page for \"' + c.uid + '\", guest \"' + c.gn + '\".');
+                    res.redirect(url);
+                } else {
+                    // Looks good, let's create the outbound session cookies.
+                    // This is a desktop, terminal or files share. We need to display the sharing page.
+                    // Consent flags are 1 = Notify, 8 = Prompt, 64 = Privacy Bar.
+                    const authCookieData = { userid: c.uid, domainid: domain.id, nid: c.nid, ip: req.clientIp, p: c.p, gn: c.gn, cf: c.cf, r: 8, expire: c.expire, pid: c.pid, vo: c.vo };
+                    if ((authCookieData.userid == null) && (authCookieData.pid.startsWith('AS:node/'))) { authCookieData.nouser = 1; }
+                    if (c.k != null) { authCookieData.k = c.k; }
+                    const authCookie = obj.parent.encodeCookie(authCookieData, obj.parent.loginCookieEncryptionKey);
+
+                    // Server features
+                    var features2 = 0;
+                    if (obj.args.allowhighqualitydesktop !== false) { features2 += 1; } // Enable AllowHighQualityDesktop (Default true)
+
+                    // Lets respond by sending out the desktop viewer.
+                    var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
+                    parent.debug('web', 'handleSharingRequest: Sending guest sharing page for \"' + c.uid + '\", guest \"' + c.gn + '\".');
+                    res.set({ 'Cache-Control': 'no-store' });
+                    render(req, res, getRenderPage('sharing', req, domain), getRenderArgs({ authCookie: authCookie, authRelayCookie: '', domainurl: encodeURIComponent(domain.url).replace(/'/g, '%27'), nodeid: c.nid, serverDnsName: obj.getWebServerName(domain, req), serverRedirPort: args.redirport, serverPublicPort: httpsPort, expire: c.expire, viewOnly: (c.vo == 1) ? 1 : 0, nodeName: encodeURIComponent(node.name).replace(/'/g, '%27'), features: c.p, features2: features2 }, req, domain));
+                }
             });
         });
     }
@@ -3763,6 +4327,27 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         obj.fs.exists(file.fullpath, function (exists) { if (exists == true) { res.sendFile(file.fullpath); } else { res.sendStatus(404); } });
     }
 
+    // Download the MeshCommander web page
+    function handleMeshCommander(req, res) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if ((req.session == null) || (req.session.userid == null)) { res.sendStatus(404); return; }
+
+        // Find the correct MeshCommander language to send
+        const acceptableLanguages = obj.getLanguageCodes(req);
+        const commandLanguageTranslations = { 'en': '', 'de': '-de', 'es': '-es', 'fr': '-fr', 'it': '-it', 'ja': '-ja', 'ko': '-ko', 'nl': '-nl', 'pt': '-pt', 'ru': '-ru', 'zh-chs': '-zh-chs', 'zh-cht': '-zh-chs' };
+        for (var i in acceptableLanguages) {
+            const meshCommanderLanguage = commandLanguageTranslations[acceptableLanguages[i]];
+            if (meshCommanderLanguage != null) {
+                try { res.sendFile(obj.parent.path.join(parent.webPublicPath, 'commander' + meshCommanderLanguage + '.htm')); } catch (ex) { }
+                return;
+            }
+        }
+
+        // Send out the default english MeshCommander
+        try { res.sendFile(obj.parent.path.join(parent.webPublicPath, 'commander.htm')); } catch (ex) { }
+    }
+
     // Upload a MeshCore.js file to the server
     function handleUploadMeshCoreFile(req, res) {
         const domain = checkUserIpAddress(req, res);
@@ -3778,7 +4363,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If an authentication cookie is embedded in the form, use that.
             if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
                 var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
                 if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
             }
             if (authUserid == null) { res.sendStatus(401); return; }
@@ -3821,7 +4406,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If an authentication cookie is embedded in the form, use that.
             if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
                 var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
                 if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
             }
             if (authUserid == null) { res.sendStatus(401); return; }
@@ -3861,7 +4446,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If an authentication cookie is embedded in the form, use that.
             if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
                 var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
                 if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
             }
             if (authUserid == null) { res.sendStatus(401); return; }
@@ -3961,7 +4546,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If an authentication cookie is embedded in the form, use that.
             if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
                 var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
                 if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
             }
             if (authUserid == null) { res.sendStatus(401); return; }
@@ -4059,7 +4644,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     // Subscribe to all events we are allowed to receive
     obj.subscribe = function (userid, target) {
         const user = obj.users[userid];
-        const subscriptions = [userid, 'server-global'];
+        if (user == null) return;
+        const subscriptions = [userid, 'server-allusers'];
         if (user.siteadmin != null) {
             // Allow full site administrators of users with all events rights to see all events.
             if ((user.siteadmin == 0xFFFFFFFF) || ((user.siteadmin & 2048) != 0)) { subscriptions.push('*'); }
@@ -4202,7 +4788,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             tlsock.setEncoding('binary');
                             tlsock.on('error', function (err) { parent.debug('webrelay', "CIRA TLS Connection Error", err); });
 
-                            // Decrypted tunnel from TLS communcation to be forwarded to websocket
+                            // Decrypted tunnel from TLS communication to be forwarded to websocket
                             tlsock.on('data', function (data) {
                                 // AMT/TLS ---> WS
                                 if (ws.interceptor) { data = ws.interceptor.processAmtData(data); } // Run data thru interceptor
@@ -4250,7 +4836,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     ws.forwardclient.onData = function (ciraconn, data) {
                         //parent.debug('webrelaydata', 'Relay CIRA data to WS', data.length);
 
-                        // Run data thru interceptorp
+                        // Run data thru interceptor
                         if (ws.interceptor) { data = ws.interceptor.processAmtData(data); }
 
                         //console.log('AMT --> WS', Buffer.from(data, 'binary').toString('hex'));
@@ -4268,7 +4854,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     ws.forwardclient.onSendOk = function (ciraconn) { };
                 }
 
-                // When data is received from the web socket, forward the data into the associated CIRA cahnnel.
+                // When data is received from the web socket, forward the data into the associated CIRA channel.
                 // If the CIRA connection is pending, the CIRA channel has built-in buffering, so we are ok sending anyway.
                 ws.on('message', function (data) {
                     //parent.debug('webrelaydata', 'Relay WS data to CIRA', data.length);
@@ -4400,7 +4986,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     ws._socket.resume();
                 } else {
                     // If TLS is going to be used, setup a TLS socket
-                    var tlsoptions = { ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE, rejectUnauthorized: false };
+                    var tlsoptions = { ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION, rejectUnauthorized: false };
                     if (req.query.tls1only == 1) { tlsoptions.secureProtocol = 'TLSv1_method'; }
                     ws.forwardclient = obj.tls.connect(port, node.host, tlsoptions, function () {
                         // The TLS connection method is the same as TCP, but located a bit differently.
@@ -4458,7 +5044,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
 
         });
-    }    
+    }
 
     // Setup agent to/from server file transfer handler
     function handleAgentFileTransfer(ws, req) {
@@ -4784,7 +5370,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // If an authentication cookie is embedded in the form, use that.
             if ((fields != null) && (fields.auth != null) && (fields.auth.length == 1) && (typeof fields.auth[0] == 'string')) {
                 var loginCookie = obj.parent.decodeCookie(fields.auth[0], obj.parent.loginCookieEncryptionKey, 60); // 60 minute timeout
-                if ((loginCookie != null) && (obj.args.cookieipcheck !== false) && (loginCookie.ip != null) && (loginCookie.ip != req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
+                if ((loginCookie != null) && (loginCookie.ip != null) && !checkCookieIp(loginCookie.ip, req.clientIp)) { loginCookie = null; } // Check cookie IP binding.
                 if ((loginCookie != null) && (domain.id == loginCookie.domainid)) { authUserid = loginCookie.userid; } // Use cookie authentication
             }
             if (authUserid == null) { res.sendStatus(401); return; }
@@ -4818,6 +5404,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // Get the interactive install script, this only works for non-Windows agents
             var agentid = parseInt(req.query.meshinstall);
             var argentInfo = obj.parent.meshAgentBinaries[agentid];
+            if (domain.meshAgentBinaries && domain.meshAgentBinaries[agentid]) { argentInfo = domain.meshAgentBinaries[agentid]; }
             var scriptInfo = obj.parent.meshAgentInstallScripts[6];
             if ((argentInfo == null) || (scriptInfo == null) || (argentInfo.platform == 'win32')) { try { res.sendStatus(404); } catch (ex) { } return; }
 
@@ -4837,6 +5424,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         } else if (req.query.id != null) {
             // Send a specific mesh agent back
             var argentInfo = obj.parent.meshAgentBinaries[req.query.id];
+            if (domain.meshAgentBinaries && domain.meshAgentBinaries[req.query.id]) { argentInfo = domain.meshAgentBinaries[req.query.id]; }
             if (argentInfo == null) { try { res.sendStatus(404); } catch (ex) { } return; }
 
             // Download PDB debug files, only allowed for administrator or accounts with agent dump access
@@ -4866,6 +5454,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 // Get the agent filename
                 var meshagentFilename = argentInfo.rname;
                 if ((domain.agentcustomization != null) && (typeof domain.agentcustomization.filename == 'string')) { meshagentFilename = domain.agentcustomization.filename; }
+                if (argentInfo.rname.endsWith('.apk') && !meshagentFilename.endsWith('.apk')) { meshagentFilename = meshagentFilename + '.apk'; }
                 if (argentInfo.mtime != null) { res.setHeader('Last-Modified', argentInfo.mtime.toUTCString()); }
                 if (req.query.zip == 1) { if (argentInfo.zdata != null) { setContentDispositionHeader(res, 'application/octet-stream', meshagentFilename + '.zip', null, 'meshagent.zip'); res.send(argentInfo.zdata); } else { try { res.sendStatus(404); } catch (ex) { } } return; } // Send compressed agent
                 setContentDispositionHeader(res, 'application/octet-stream', meshagentFilename, null, 'meshagent');
@@ -4903,27 +5492,27 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
 
                 // Get the agent connection server name
-                var serverName = obj.getWebServerName(domain);
+                var serverName = obj.getWebServerName(domain, req);
                 if (typeof obj.args.agentaliasdns == 'string') { serverName = obj.args.agentaliasdns; }
 
                 // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
                 var xdomain = (domain.dns == null) ? domain.id : '';
                 if (xdomain != '') xdomain += '/';
-                var meshsettings = '\r\n';
-                if ((req.query.id != '10006') || (req.query.ac != '4')) {
-                    meshsettings += 'MeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
+                var meshsettings = '';
+                if (req.query.ac != '4') { // If MeshCentral Assistant Monitor Mode, DONT INCLUDE SERVER DETAILS!
+                    meshsettings += '\r\nMeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
                     if (obj.args.lanonly != true) { meshsettings += 'MeshServer=wss://' + serverName + ':' + httpsPort + '/' + xdomain + 'agent.ashx\r\n'; } else {
                         meshsettings += 'MeshServer=local\r\n';
                         if ((obj.args.localdiscovery != null) && (typeof obj.args.localdiscovery.key == 'string') && (obj.args.localdiscovery.key.length > 0)) { meshsettings += 'DiscoveryKey=' + obj.args.localdiscovery.key + '\r\n'; }
                     }
-                    if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + req.query.tag + '\r\n'; }
+                    if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + encodeURIComponent(req.query.tag) + '\r\n'; }
                     if ((req.query.installflags != null) && (req.query.installflags != 0) && (parseInt(req.query.installflags) == req.query.installflags)) { meshsettings += 'InstallFlags=' + parseInt(req.query.installflags) + '\r\n'; }
-                    if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
-                    if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
-                    if (domain.agentconfig) { for (var i in domain.agentconfig) { meshsettings += domain.agentconfig[i] + '\r\n'; } }
                 }
                 if (req.query.id == '10006') { // Assistant settings and customizations
                     if ((req.query.ac != null)) { meshsettings += 'AutoConnect=' + req.query.ac + '\r\n'; } // Set MeshCentral Assistant flags if needed. 0x01 = Always Connected, 0x02 = Not System Tray
+                    if (obj.args.assistantconfig) { for (var i in obj.args.assistantconfig) { meshsettings += obj.args.assistantconfig[i] + '\r\n'; } }
+                    if (domain.assistantconfig) { for (var i in domain.assistantconfig) { meshsettings += domain.assistantconfig[i] + '\r\n'; } }
+                    if ((domain.assistantnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
                     if ((domain.assistantcustomization != null) && (typeof domain.assistantcustomization == 'object')) {
                         if (typeof domain.assistantcustomization.title == 'string') { meshsettings += 'Title=' + domain.assistantcustomization.title + '\r\n'; }
                         if (typeof domain.assistantcustomization.image == 'string') {
@@ -4938,6 +5527,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         }
                     }
                 } else { // Add agent customization, not for Assistant
+                    if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
+                    if (domain.agentconfig) { for (var i in domain.agentconfig) { meshsettings += domain.agentconfig[i] + '\r\n'; } }
+                    if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
                     if (domain.agentcustomization != null) {
                         if (domain.agentcustomization.displayname != null) { meshsettings += 'displayName=' + domain.agentcustomization.displayname + '\r\n'; }
                         if (domain.agentcustomization.description != null) { meshsettings += 'description=' + domain.agentcustomization.description + '\r\n'; }
@@ -4945,12 +5537,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
                         if (domain.agentcustomization.filename != null) { meshsettings += 'fileName=' + domain.agentcustomization.filename + '\r\n'; }
                         if (domain.agentcustomization.image != null) { meshsettings += 'image=' + domain.agentcustomization.image + '\r\n'; }
+                        if (domain.agentcustomization.foregroundcolor != null) { meshsettings += checkAgentColorString('foreground=', domain.agentcustomization.foregroundcolor); }
+                        if (domain.agentcustomization.backgroundcolor != null) { meshsettings += checkAgentColorString('background=', domain.agentcustomization.backgroundcolor); }
                     }
-                    if (parent.agentTranslations != null) { meshsettings += 'translation=' + parent.agentTranslations + '\r\n'; } // Translation strings, not for MeshCentral Assistant
+                    if (domain.agentTranslations != null) { meshsettings += 'translation=' + domain.agentTranslations + '\r\n'; } // Translation strings, not for MeshCentral Assistant
                 }
                 setContentDispositionHeader(res, 'application/octet-stream', meshfilename, null, argentInfo.rname);
                 if (argentInfo.mtime != null) { res.setHeader('Last-Modified', argentInfo.mtime.toUTCString()); }
-                obj.parent.exeHandler.streamExeWithMeshPolicy({ platform: 'win32', sourceFileName: obj.parent.meshAgentBinaries[req.query.id].path, destinationStream: res, msh: meshsettings, peinfo: obj.parent.meshAgentBinaries[req.query.id].pe });
+                if (domain.meshAgentBinaries && domain.meshAgentBinaries[req.query.id]) {
+                    obj.parent.exeHandler.streamExeWithMeshPolicy({ platform: 'win32', sourceFileName: domain.meshAgentBinaries[req.query.id].path, destinationStream: res, msh: meshsettings, peinfo: domain.meshAgentBinaries[req.query.id].pe });
+                } else {
+                    obj.parent.exeHandler.streamExeWithMeshPolicy({ platform: 'win32', sourceFileName: obj.parent.meshAgentBinaries[req.query.id].path, destinationStream: res, msh: meshsettings, peinfo: obj.parent.meshAgentBinaries[req.query.id].pe });
+                }
                 return;
             }
         } else if (req.query.script != null) {
@@ -4980,26 +5578,35 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
             // Send meshcmd for a specific platform back
             var agentid = parseInt(req.query.meshcmd);
+
             // If the agentid is 3 or 4, check if we have a signed MeshCmd.exe
-            if ((agentid == 3)) { // Signed Windows MeshCmd.exe x86
-                var stats = null, meshCmdPath = obj.path.join(__dirname, 'agents', 'MeshCmd-signed.exe');
+            if ((agentid == 3) && (obj.parent.meshAgentBinaries[11000] != null)) { // Signed Windows MeshCmd.exe x86-32
+                var stats = null, meshCmdPath = obj.parent.meshAgentBinaries[11000].path;
                 try { stats = obj.fs.statSync(meshCmdPath); } catch (e) { }
                 if ((stats != null)) {
-                    setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd' + ((req.query.meshcmd <= 3) ? '.exe' : ''), null, 'meshcmd');
+                    setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd.exe', null, 'meshcmd');
                     res.sendFile(meshCmdPath); return;
                 }
-            } else if ((agentid == 4)) { // Signed Windows MeshCmd64.exe x64
-                var stats = null, meshCmd64Path = obj.path.join(__dirname, 'agents', 'MeshCmd64-signed.exe');
+            } else if ((agentid == 4) && (obj.parent.meshAgentBinaries[11001] != null)) { // Signed Windows MeshCmd64.exe x86-64
+                var stats = null, meshCmd64Path = obj.parent.meshAgentBinaries[11001].path;
                 try { stats = obj.fs.statSync(meshCmd64Path); } catch (e) { }
                 if ((stats != null)) {
-                    setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd' + ((req.query.meshcmd <= 4) ? '.exe' : ''), null, 'meshcmd');
+                    setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd.exe', null, 'meshcmd');
                     res.sendFile(meshCmd64Path); return;
+                }
+            } else if ((agentid == 43) && (obj.parent.meshAgentBinaries[11002] != null)) { // Signed Windows MeshCmd64.exe ARM-64
+                var stats = null, meshCmdAMR64Path = obj.parent.meshAgentBinaries[11002].path;
+                try { stats = obj.fs.statSync(meshCmdAMR64Path); } catch (e) { }
+                if ((stats != null)) {
+                    setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd-arm64.exe', null, 'meshcmd');
+                    res.sendFile(meshCmdAMR64Path); return;
                 }
             }
 
             // No signed agents, we are going to merge a new MeshCmd.
             if (((agentid == 3) || (agentid == 4)) && (obj.parent.meshAgentBinaries[agentid + 10000] != null)) { agentid += 10000; } // Avoid merging javascript to a signed mesh agent.
             var argentInfo = obj.parent.meshAgentBinaries[agentid];
+            if (domain.meshAgentBinaries && domain.meshAgentBinaries[agentid]) { argentInfo = domain.meshAgentBinaries[agentid]; }
             if ((argentInfo == null) || (obj.parent.defaultMeshCmd == null)) { try { res.sendStatus(404); } catch (ex) { } return; }
             setContentDispositionHeader(res, 'application/octet-stream', 'meshcmd' + ((req.query.meshcmd <= 4) ? '.exe' : ''), null, 'meshcmd');
             res.statusCode = 200;
@@ -5023,21 +5630,27 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 // Download tools using a cookie
                 if (c.download == req.query.meshaction) {
                     if (req.query.meshaction == 'winrouter') {
-                        var p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.exe');
+                        var p = null;
+                        if (obj.meshToolsBinaries['MeshCentralRouter']) { p = obj.meshToolsBinaries['MeshCentralRouter'].path; }
+                        if ((p == null) || (!obj.fs.existsSync(p))) { p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.exe'); }
                         if (obj.fs.existsSync(p)) {
                             setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralRouter.exe', null, 'MeshCentralRouter.exe');
                             try { res.sendFile(p); } catch (ex) { }
                         } else { try { res.sendStatus(404); } catch (ex) { } }
                         return;
                     } else if (req.query.meshaction == 'winassistant') {
-                        var p = obj.path.join(__dirname, 'agents', 'MeshCentralAssistant.exe');
+                        var p = null;
+                        if (obj.meshToolsBinaries['MeshCentralAssistant']) { p = obj.meshToolsBinaries['MeshCentralAssistant'].path; }
+                        if ((p == null) || (!obj.fs.existsSync(p))) { p = obj.path.join(__dirname, 'agents', 'MeshCentralAssistant.exe'); }
                         if (obj.fs.existsSync(p)) {
                             setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralAssistant.exe', null, 'MeshCentralAssistant.exe');
                             try { res.sendFile(p); } catch (ex) { }
                         } else { try { res.sendStatus(404); } catch (ex) { } }
                         return;
                     } else if (req.query.meshaction == 'macrouter') {
-                        var p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.dmg');
+                        var p = null;
+                        if (obj.meshToolsBinaries['MeshCentralRouterMacOS']) { p = obj.meshToolsBinaries['MeshCentralRouterMacOS'].path; }
+                        if ((p == null) || (!obj.fs.existsSync(p))) { p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.dmg'); }
                         if (obj.fs.existsSync(p)) {
                             setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralRouter.dmg', null, 'MeshCentralRouter.dmg');
                             try { res.sendFile(p); } catch (ex) { }
@@ -5076,7 +5689,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     if (user != null) { meshaction.username = user.name; }
                     if (req.query.key != null) { meshaction.loginKey = req.query.key; }
                     var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
-                    if (obj.args.lanonly != true) { meshaction.serverUrl = 'wss://' + obj.getWebServerName(domain) + ':' + httpsPort + '/' + ((domain.id == '') ? '' : ('/' + domain.id)) + 'meshrelay.ashx'; }
+                    if (obj.args.lanonly != true) { meshaction.serverUrl = 'wss://' + obj.getWebServerName(domain, req) + ':' + httpsPort + '/' + ((domain.id == '') ? '' : (domain.id + '/')) + 'meshrelay.ashx'; }
 
                     setContentDispositionHeader(res, 'application/octet-stream', 'meshaction.txt', null, 'meshaction.txt');
                     res.send(JSON.stringify(meshaction, null, ' '));
@@ -5093,26 +5706,32 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if (user != null) { meshaction.username = user.name; }
                 if (req.query.key != null) { meshaction.loginKey = req.query.key; }
                 var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
-                if (obj.args.lanonly != true) { meshaction.serverUrl = 'wss://' + obj.getWebServerName(domain) + ':' + httpsPort + '/' + ((domain.id == '') ? '' : ('/' + domain.id)) + 'meshrelay.ashx'; }
+                if (obj.args.lanonly != true) { meshaction.serverUrl = 'wss://' + obj.getWebServerName(domain, req) + ':' + httpsPort + '/' + ((domain.id == '') ? '' : ('/' + domain.id)) + 'meshrelay.ashx'; }
                 setContentDispositionHeader(res, 'application/octet-stream', 'meshaction.txt', null, 'meshaction.txt');
                 res.send(JSON.stringify(meshaction, null, ' '));
                 return;
             } else if (req.query.meshaction == 'winrouter') {
-                var p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.exe');
+                var p = null;
+                if (parent.meshToolsBinaries['MeshCentralRouter']) { p = parent.meshToolsBinaries['MeshCentralRouter'].path; }
+                if ((p == null) || !obj.fs.existsSync(p)) { p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.exe'); }
                 if (obj.fs.existsSync(p)) {
                     setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralRouter.exe', null, 'MeshCentralRouter.exe');
                     try { res.sendFile(p); } catch (ex) { }
                 } else { try { res.sendStatus(404); } catch (ex) { } }
                 return;
             } else if (req.query.meshaction == 'winassistant') {
-                var p = obj.path.join(__dirname, 'agents', 'MeshCentralAssistant.exe');
+                var p = null;
+                if (parent.meshToolsBinaries['MeshCentralAssistant']) { p = parent.meshToolsBinaries['MeshCentralAssistant'].path; }
+                if ((p == null) || !obj.fs.existsSync(p)) { p = obj.path.join(__dirname, 'agents', 'MeshCentralAssistant.exe'); }
                 if (obj.fs.existsSync(p)) {
                     setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralAssistant.exe', null, 'MeshCentralAssistant.exe');
                     try { res.sendFile(p); } catch (ex) { }
                 } else { try { res.sendStatus(404); } catch (ex) { } }
                 return;
             } else if (req.query.meshaction == 'macrouter') {
-                var p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.dmg');
+                var p = null;
+                if (parent.meshToolsBinaries['MeshCentralRouterMacOS']) { p = parent.meshToolsBinaries['MeshCentralRouterMacOS'].path; }
+                if ((p == null) || !obj.fs.existsSync(p)) { p = obj.path.join(__dirname, 'agents', 'MeshCentralRouter.dmg'); }
                 if (obj.fs.existsSync(p)) {
                     setContentDispositionHeader(res, 'application/octet-stream', 'MeshCentralRouter.dmg', null, 'MeshCentralRouter.dmg');
                     try { res.sendFile(p); } catch (ex) { }
@@ -5168,15 +5787,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                     var agentid = parseInt(fileSplit[0]);
                                     if ((isNaN(agentid) == false) && (obj.parent.meshAgentBinaries[agentid] != null)) {
                                         var agentinfo = obj.parent.meshAgentBinaries[agentid];
+                                        if (domain.meshAgentBinaries && domain.meshAgentBinaries[agentid]) { argentInfo = domain.meshAgentBinaries[agentid]; }
                                         var filestats = obj.fs.statSync(obj.path.join(parent.datapath, '..', 'meshcentral-coredumps', file));
                                         coredumps.push({
                                             fileSplit: fileSplit,
                                             agentinfo: agentinfo,
                                             filestats: filestats,
                                             currentAgent: agentinfo.hashhex.startsWith(fileSplit[1].toLowerCase()),
-                                            downloadUrl: req.originalUrl.split('?')[0] + '?dldump=' + file + (req.query.key ? ('&key=' + req.query.key) : ''),
-                                            deleteUrl: req.originalUrl.split('?')[0] + '?deldump=' + file + (req.query.key ? ('&key=' + req.query.key) : ''),
-                                            agentUrl: req.originalUrl.split('?')[0] + '?id=' + agentinfo.id + (req.query.key ? ('&key=' + req.query.key) : ''),
+                                            downloadUrl: req.originalUrl.split('?')[0] + '?dldump=' + file + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : ''),
+                                            deleteUrl: req.originalUrl.split('?')[0] + '?deldump=' + file + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : ''),
+                                            agentUrl: req.originalUrl.split('?')[0] + '?id=' + agentinfo.id + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : ''),
                                             time: new Date(filestats.ctime)
                                         });
                                     }
@@ -5192,7 +5812,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             response += '<td>' + d.fileSplit[1].toLowerCase() + '</td><td>' + d.fileSplit[2] + '</td><td><a href="' + d.deleteUrl + '">Delete</a></td></tr>';
                         }
                     }
-                    response += '</table><a href="' + req.originalUrl.split('?')[0] + (req.query.key ? ('?key=' + req.query.key) : '') + '">Mesh Agents</a></body></html>';
+                    response += '</table><a href="' + req.originalUrl.split('?')[0] + (req.query.key ? ('?key=' + encodeURIComponent(req.query.key)) : '') + '">Mesh Agents</a></body></html>';
                     res.send(response);
                     return;
                 }
@@ -5203,9 +5823,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 var response = '<html><head><title>Mesh Agents Cores</title><style>table,th,td { border:1px solid black;border-collapse:collapse;padding:3px; }</style></head><body style=overflow:auto><table>';
                 response += '<tr style="background-color:lightgray"><th>Name</th><th>Size</th><th>Comp</th><th>Decompressed Hash SHA384</th></tr>';
                 for (var i in parent.defaultMeshCores) {
-                    response += '<tr><td>' + i.split(' ').join('&nbsp;') + '</td><td style="text-align:right"><a download href="/meshagents?dlcore=' + i + '">' + parent.defaultMeshCores[i].length + (req.query.key ? ('?key=' + req.query.key) : '') + '</a></td><td style="text-align:right"><a download href="/meshagents?dlccore=' + i + (req.query.key ? ('?key=' + req.query.key) : '') + '">' + parent.defaultMeshCoresDeflate[i].length + '</a></td><td>' + Buffer.from(parent.defaultMeshCoresHash[i], 'binary').toString('hex') + '</td></tr>';
+                    response += '<tr><td>' + i.split(' ').join('&nbsp;') + '</td><td style="text-align:right"><a download href="/meshagents?dlcore=' + i + '">' + parent.defaultMeshCores[i].length + (req.query.key ? ('?key=' + encodeURIComponent(req.query.key)) : '') + '</a></td><td style="text-align:right"><a download href="/meshagents?dlccore=' + i + (req.query.key ? ('?key=' + encodeURIComponent(req.query.key)) : '') + '">' + parent.defaultMeshCoresDeflate[i].length + '</a></td><td>' + Buffer.from(parent.defaultMeshCoresHash[i], 'binary').toString('hex') + '</td></tr>';
                 }
-                response += '</table><a href="' + req.originalUrl.split('?')[0] + (req.query.key ? ('?key=' + req.query.key) : '') + '">Mesh Agents</a></body></html>';
+                response += '</table><a href="' + req.originalUrl.split('?')[0] + (req.query.key ? ('?key=' + encodeURIComponent(req.query.key)) : '') + '">Mesh Agents</a></body></html>';
                 res.send(response);
                 return;
             }
@@ -5214,7 +5834,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 // Download mesh core
                 var bin = parent.defaultMeshCores[req.query.dlcore];
                 if ((bin == null) || (bin.length < 5)) { try { res.sendStatus(404); } catch (ex) { } return; }
-                setContentDispositionHeader(res, 'application/octet-stream', req.query.dlcore + '.js', null, 'meshcore.js');
+                setContentDispositionHeader(res, 'application/octet-stream', encodeURIComponent(req.query.dlcore) + '.js', null, 'meshcore.js');
                 res.send(bin.slice(4));
                 return;
             }
@@ -5235,29 +5855,52 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             for (var agentid in obj.parent.meshAgentBinaries) {
                 if ((agentid >= 10000) && (agentid != 10005)) continue;
                 var agentinfo = obj.parent.meshAgentBinaries[agentid];
+                if (domain.meshAgentBinaries && domain.meshAgentBinaries[agentid]) { argentInfo = domain.meshAgentBinaries[agentid]; }
                 response += '<tr><td>' + agentinfo.id + '</td><td>' + agentinfo.desc.split(' ').join('&nbsp;') + '</td>';
-                response += '<td><a download href="' + originalUrl + '?id=' + agentinfo.id + (req.query.key ? ('&key=' + req.query.key) : '') + '">' + agentinfo.rname + '</a>';
+                response += '<td><a download href="' + originalUrl + '?id=' + agentinfo.id + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">' + agentinfo.rname + '</a>';
                 if ((user.siteadmin == 0xFFFFFFFF) || ((Array.isArray(obj.parent.config.settings.agentcoredumpusers)) && (obj.parent.config.settings.agentcoredumpusers.indexOf(user._id) >= 0))) {
-                    if ((agentid == 3) || (agentid == 4)) { response += ', <a download href="' + originalUrl + '?id=' + agentinfo.id + '&pdb=1' + (req.query.key ? ('&key=' + req.query.key) : '') + '">PDB</a>'; }
+                    if ((agentid == 3) || (agentid == 4)) { response += ', <a download href="' + originalUrl + '?id=' + agentinfo.id + '&pdb=1' + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">PDB</a>'; }
                 }
-                if (agentinfo.zdata != null) { response += ', <a download href="' + originalUrl + '?id=' + agentinfo.id + '&zip=1' + (req.query.key ? ('&key=' + req.query.key) : '') + '">ZIP</a>'; }
+                if (agentinfo.zdata != null) { response += ', <a download href="' + originalUrl + '?id=' + agentinfo.id + '&zip=1' + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">ZIP</a>'; }
                 response += '</td>';
                 response += '<td>' + agentinfo.size + '</td><td>' + agentinfo.hashhex + '</td>';
-                response += '<td><a download href="' + originalUrl + '?meshcmd=' + agentinfo.id + (req.query.key ? ('&key=' + req.query.key) : '') + '">' + agentinfo.rname.replace('agent', 'cmd') + '</a></td></tr>';
+                response += '<td><a download href="' + originalUrl + '?meshcmd=' + agentinfo.id + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">' + agentinfo.rname.replace('agent', 'cmd') + '</a></td></tr>';
             }
             response += '</table>';
-            response += '<a href="' + originalUrl + '?cores=1' + (req.query.key ? ('&key=' + req.query.key) : '') + '">MeshCores</a> ';
-            if (coreDumpsAllowed) { response += '<a href="' + originalUrl + '?dumps=1' + (req.query.key ? ('&key=' + req.query.key) : '') + '">MeshAgent Crash Dumps</a>'; }
+            response += '<a href="' + originalUrl + '?cores=1' + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">MeshCores</a> ';
+            if (coreDumpsAllowed) { response += '<a href="' + originalUrl + '?dumps=1' + (req.query.key ? ('&key=' + encodeURIComponent(req.query.key)) : '') + '">MeshAgent Crash Dumps</a>'; }
             response += '</body></html>';
             res.send(response);
             return;
         }
     };
 
+    // generate the server url
+    obj.generateBaseURL = function (domain, req) {
+        var serverName = obj.getWebServerName(domain, req);
+        var httpsPort = ((args.aliasport == null) ? args.port : args.aliasport); // Use HTTPS alias port is specified
+        var xdomain = (domain.dns == null) ? domain.id : '';
+        if (xdomain != '') xdomain += '/';
+        return ('https://' + serverName + ':' + httpsPort + '/' + xdomain);
+    }
+
     // Get the web server hostname. This may change if using a domain with a DNS name.
-    obj.getWebServerName = function (domain) {
+    obj.getWebServerName = function (domain, req) {
         if (domain.dns != null) return domain.dns;
+        if ((obj.certificates.CommonName == 'un-configured') && (req != null) && (req.headers != null) && (typeof req.headers.host == 'string')) { return req.headers.host.split(':')[0]; }
         return obj.certificates.CommonName;
+    }
+
+    // Return true if this is an allowed HTTP request origin hostname.
+    obj.CheckWebServerOriginName = function (domain, req) {
+        if (domain.allowedorigin === true) return true; // Ignore origin
+        if (typeof req.headers.origin != 'string') return true; // No origin in the header, this is a desktop app
+        const originUrl = require('url').parse(req.headers.origin, true);
+        if (typeof originUrl.hostname != 'string') return false; // Origin hostname is not valid
+        if (Array.isArray(domain.allowedorigin)) return (domain.allowedorigin.indexOf(originUrl.hostname) >= 0); // Check if this is an allowed origin from an explicit list
+        if (obj.isTrustedCert(domain) === false) return true; // This server does not have a trusted certificate.
+        if (domain.dns != null) return (domain.dns == originUrl.hostname); // Match the domain DNS
+        return (obj.certificates.CommonName == originUrl.hostname); // Match the default server name
     }
 
     // Create a OSX mesh agent installer
@@ -5271,6 +5914,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Send a specific mesh agent back
         var argentInfo = obj.parent.meshAgentBinaries[req.query.id];
+        if (domain.meshAgentBinaries && domain.meshAgentBinaries[req.query.id]) { argentInfo = domain.meshAgentBinaries[req.query.id]; }
         if ((argentInfo == null) || (req.query.meshid == null)) { res.sendStatus(404); return; }
 
         // Check if the meshid is a time limited, encrypted cookie
@@ -5291,7 +5935,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         var serveridhex = Buffer.from(obj.agentCertificateHashBase64.replace(/\@/g, '+').replace(/\$/g, '/'), 'base64').toString('hex').toUpperCase();
 
         // Get the agent connection server name
-        var serverName = obj.getWebServerName(domain);
+        var serverName = obj.getWebServerName(domain, req);
         if (typeof obj.args.agentaliasdns == 'string') { serverName = obj.args.agentaliasdns; }
 
         // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
@@ -5305,7 +5949,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             meshsettings += 'MeshServer=local\r\n';
             if ((obj.args.localdiscovery != null) && (typeof obj.args.localdiscovery.key == 'string') && (obj.args.localdiscovery.key.length > 0)) { meshsettings += 'DiscoveryKey=' + obj.args.localdiscovery.key + '\r\n'; }
         }
-        if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + req.query.tag + '\r\n'; }
+        if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + encodeURIComponent(req.query.tag) + '\r\n'; }
         if ((req.query.installflags != null) && (req.query.installflags != 0) && (parseInt(req.query.installflags) == req.query.installflags)) { meshsettings += 'InstallFlags=' + parseInt(req.query.installflags) + '\r\n'; }
         if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
         if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
@@ -5317,15 +5961,45 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
             if (domain.agentcustomization.filename != null) { meshsettings += 'fileName=' + domain.agentcustomization.filename + '\r\n'; }
             if (domain.agentcustomization.image != null) { meshsettings += 'image=' + domain.agentcustomization.image + '\r\n'; }
+            if (domain.agentcustomization.foregroundcolor != null) { meshsettings += checkAgentColorString('foreground=', domain.agentcustomization.foregroundcolor); }
+            if (domain.agentcustomization.backgroundcolor != null) { meshsettings += checkAgentColorString('background=', domain.agentcustomization.backgroundcolor); }
         }
-        if (parent.agentTranslations != null) { meshsettings += 'translation=' + parent.agentTranslations + '\r\n'; }
+        if (domain.agentTranslations != null) { meshsettings += 'translation=' + domain.agentTranslations + '\r\n'; }
 
         // Setup the response output
         var archive = require('archiver')('zip', { level: 5 }); // Sets the compression method.
         archive.on('error', function (err) { throw err; });
 
+        // Customize the mesh agent file name
+        var meshfilename = 'MeshAgent-' + mesh.name + '.zip';
+        var meshexecutablename = 'meshagent';
+        var meshmpkgname = 'MeshAgent.mpkg';
+        if ((domain.agentcustomization != null) && (typeof domain.agentcustomization.filename == 'string')) {
+            meshfilename = meshfilename.split('MeshAgent').join(domain.agentcustomization.filename);
+            meshexecutablename = meshexecutablename.split('meshagent').join(domain.agentcustomization.filename);
+            meshmpkgname = meshmpkgname.split('MeshAgent').join(domain.agentcustomization.filename);
+        }
+
+        // Customise the mesh agent display name
+        var meshdisplayname = 'Mesh Agent';
+        if ((domain.agentcustomization != null) && (typeof domain.agentcustomization.displayname == 'string')) {
+            meshdisplayname = meshdisplayname.split('Mesh Agent').join(domain.agentcustomization.displayname);
+        }
+
+        // Customise the mesh agent service name
+        var meshservicename = 'meshagent';
+        if ((domain.agentcustomization != null) && (typeof domain.agentcustomization.servicename == 'string')) {
+            meshservicename = meshservicename.split('meshagent').join(domain.agentcustomization.servicename);
+        }
+
+        // Customise the mesh agent company name
+        var meshcompanyname = 'meshagent';
+        if ((domain.agentcustomization != null) && (typeof domain.agentcustomization.companyname == 'string')) {
+            meshcompanyname = meshcompanyname.split('meshagent').join(domain.agentcustomization.companyname);
+        }
+
         // Set the agent download including the mesh name.
-        setContentDispositionHeader(res, 'application/octet-stream', 'MeshAgent-' + mesh.name + '.zip', null, 'MeshAgent.zip');
+        setContentDispositionHeader(res, 'application/octet-stream', meshfilename, null, 'MeshAgent.zip');
         archive.pipe(res);
 
         // Opens the "MeshAgentOSXPackager.zip"
@@ -5344,17 +6018,34 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             readStream.on('data', function (data) { if (readStream.xxdata) { readStream.xxdata += data; } else { readStream.xxdata = data; } });
                             readStream.on('end', function () {
                                 var meshname = mesh.name.split(']').join('').split('[').join(''); // We can't have ']]' in the string since it will terminate the CDATA.
-                                var welcomemsg = 'Welcome to the MeshCentral agent for MacOS\n\nThis installer will install the mesh agent for "' + meshname + '" and allow the administrator to remotely monitor and control this computer over the internet. For more information, go to https://www.meshcommander.com/meshcentral2.\n\nThis software is provided under Apache 2.0 license.\n';
+                                var welcomemsg = 'Welcome to the MeshCentral agent for MacOS\n\nThis installer will install the mesh agent for "' + meshname + '" and allow the administrator to remotely monitor and control this computer over the internet. For more information, go to https://meshcentral.com.\n\nThis software is provided under Apache 2.0 license.\n';
                                 var installsize = Math.floor((argentInfo.size + meshsettings.length) / 1024);
-                                archive.append(readStream.xxdata.toString().split('###WELCOMEMSG###').join(welcomemsg).split('###INSTALLSIZE###').join(installsize), { name: entry.fileName });
+                                archive.append(readStream.xxdata.toString().split('###DISPLAYNAME###').join(meshdisplayname).split('###WELCOMEMSG###').join(welcomemsg).split('###INSTALLSIZE###').join(installsize), { name: entry.fileName.replace('MeshAgent.mpkg',meshmpkgname) });
                                 zipfile.readEntry();
                             });
                         });
+                    } else if (entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64_LaunchAgent.plist' ||
+                        entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64_LaunchDaemon.plist' ||
+                        entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/Info.plist' ||
+                        entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/Resources/postflight' ||
+                        entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/Resources/Postflight.sh' ||
+                        entry.fileName == 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/Uninstall.command' ||
+                        entry.fileName == 'MeshAgent.mpkg/Uninstall.command') {
+                            // This is a special file entry, we need to fix it.
+                            zipfile.openReadStream(entry, function (err, readStream) {
+                                readStream.on('data', function (data) { if (readStream.xxdata) { readStream.xxdata += data; } else { readStream.xxdata = data; } });
+                                readStream.on('end', function () {
+                                    var options = { name: entry.fileName.replace('MeshAgent.mpkg',meshmpkgname) };
+                                    if (entry.fileName.endsWith('postflight') || entry.fileName.endsWith('Uninstall.command')) { options.mode = 493; }
+                                    archive.append(readStream.xxdata.toString().split('###SERVICENAME###').join(meshservicename).split('###COMPANYNAME###').join(meshcompanyname).split('###EXECUTABLENAME###').join(meshexecutablename), options);
+                                    zipfile.readEntry();
+                                });
+                            });
                     } else {
                         // Normal file entry
                         zipfile.openReadStream(entry, function (err, readStream) {
                             if (err) { throw err; }
-                            var options = { name: entry.fileName };
+                            var options = { name: entry.fileName.replace('MeshAgent.mpkg',meshmpkgname) };
                             if (entry.fileName.endsWith('postflight') || entry.fileName.endsWith('Uninstall.command')) { options.mode = 493; }
                             archive.append(readStream, options);
                             readStream.on('end', function () { zipfile.readEntry(); });
@@ -5363,8 +6054,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
             });
             zipfile.on('end', function () {
-                archive.file(argentInfo.path, { name: 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64.bin' });
-                archive.append(meshsettings, { name: 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64.msh' });
+                archive.file(argentInfo.path, { name: 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64.bin'.replace('MeshAgent.mpkg',meshmpkgname) });
+                archive.append(meshsettings, { name: 'MeshAgent.mpkg/Contents/Packages/internal.pkg/Contents/meshagent_osx64.msh'.replace('MeshAgent.mpkg',meshmpkgname) });
                 archive.finalize();
             });
         });
@@ -5392,7 +6083,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         var serveridhex = Buffer.from(obj.agentCertificateHashBase64.replace(/\@/g, '+').replace(/\$/g, '/'), 'base64').toString('hex').toUpperCase();
 
         // Get the agent connection server name
-        var serverName = obj.getWebServerName(domain);
+        var serverName = obj.getWebServerName(domain, req);
         if (typeof obj.args.agentaliasdns == 'string') { serverName = obj.args.agentaliasdns; }
 
         // Build the agent connection URL. If we are using a sub-domain or one with a DNS, we need to craft the URL correctly.
@@ -5406,7 +6097,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             meshsettings += 'MeshServer=local\r\n';
             if ((obj.args.localdiscovery != null) && (typeof obj.args.localdiscovery.key == 'string') && (obj.args.localdiscovery.key.length > 0)) { meshsettings += 'DiscoveryKey=' + obj.args.localdiscovery.key + '\r\n'; }
         }
-        if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + req.query.tag + '\r\n'; }
+        if ((req.query.tag != null) && (typeof req.query.tag == 'string') && (obj.common.isAlphaNumeric(req.query.tag) == true)) { meshsettings += 'Tag=' + encodeURIComponent(req.query.tag) + '\r\n'; }
         if ((req.query.installflags != null) && (req.query.installflags != 0) && (parseInt(req.query.installflags) == req.query.installflags)) { meshsettings += 'InstallFlags=' + parseInt(req.query.installflags) + '\r\n'; }
         if ((domain.agentnoproxy === true) || (obj.args.lanonly == true)) { meshsettings += 'ignoreProxyFile=1\r\n'; }
         if (obj.args.agentconfig) { for (var i in obj.args.agentconfig) { meshsettings += obj.args.agentconfig[i] + '\r\n'; } }
@@ -5418,8 +6109,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (domain.agentcustomization.servicename != null) { meshsettings += 'meshServiceName=' + domain.agentcustomization.servicename + '\r\n'; }
             if (domain.agentcustomization.filename != null) { meshsettings += 'fileName=' + domain.agentcustomization.filename + '\r\n'; }
             if (domain.agentcustomization.image != null) { meshsettings += 'image=' + domain.agentcustomization.image + '\r\n'; }
+            if (domain.agentcustomization.foregroundcolor != null) { meshsettings += checkAgentColorString('foreground=', domain.agentcustomization.foregroundcolor); }
+            if (domain.agentcustomization.backgroundcolor != null) { meshsettings += checkAgentColorString('background=', domain.agentcustomization.backgroundcolor); }
         }
-        if (parent.agentTranslations != null) { meshsettings += 'translation=' + parent.agentTranslations + '\r\n'; }
+        if (domain.agentTranslations != null) { meshsettings += 'translation=' + domain.agentTranslations + '\r\n'; }
         return meshsettings;
     }
 
@@ -5542,9 +6235,47 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // Setup the HTTP server without TLS
             obj.expressWs = require('express-ws')(obj.app, null, { wsOptions: { perMessageDeflate: (args.wscompression === true) } });
         } else {
+            var ciphers = [
+                'TLS_AES_256_GCM_SHA384',
+                'TLS_AES_128_GCM_SHA256',
+                'TLS_AES_128_CCM_8_SHA256',
+                'TLS_AES_128_CCM_SHA256',
+                'TLS_CHACHA20_POLY1305_SHA256',
+                'ECDHE-RSA-AES256-GCM-SHA384',
+                'ECDHE-ECDSA-AES256-GCM-SHA384',
+                'ECDHE-RSA-AES128-GCM-SHA256',
+                'ECDHE-ECDSA-AES128-GCM-SHA256',
+                'DHE-RSA-AES128-GCM-SHA256',
+                'ECDHE-RSA-CHACHA20-POLY1305',      // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca8)
+                'ECDHE-ARIA128-GCM-SHA256',
+                'ECDHE-ARIA256-GCM-SHA384',
+                'ECDHE-RSA-AES128-SHA256',          // SSLlabs considers this cipher suite weak, but it's needed for older browers.
+                'ECDHE-RSA-AES256-SHA384',          // SSLlabs considers this cipher suite weak, but it's needed for older browers.
+                '!aNULL',
+                '!eNULL',
+                '!EXPORT',
+                '!DES',
+                '!RC4',
+                '!MD5',
+                '!PSK',
+                '!SRP',
+                '!CAMELLIA'
+            ].join(':');
+
+            if (obj.useNodeDefaultTLSCiphers) {
+                ciphers = require("tls").DEFAULT_CIPHERS;
+            }
+
+            if (obj.tlsCiphers) {
+                ciphers = obj.tlsCiphers;
+                if (Array.isArray(obj.tlsCiphers)) {
+                    ciphers = obj.tlsCiphers.join(":");
+                }
+            }
+
             // Setup the HTTP server with TLS, use only TLS 1.2 and higher with perfect forward secrecy (PFS).
             //const tlsOptions = { cert: obj.certificates.web.cert, key: obj.certificates.web.key, ca: obj.certificates.web.ca, rejectUnauthorized: true, ciphers: "HIGH:!aNULL:!eNULL:!EXPORT:!RSA:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA", secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_NO_TLSv1 | constants.SSL_OP_NO_TLSv1_1 }; // This does not work with TLS 1.3
-            const tlsOptions = { cert: obj.certificates.web.cert, key: obj.certificates.web.key, ca: obj.certificates.web.ca, rejectUnauthorized: true, ciphers: "HIGH:TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_CCM_SHA256:TLS_CHACHA20_POLY1305_SHA256", secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_NO_TLSv1 | constants.SSL_OP_NO_TLSv1_1 };
+            const tlsOptions = { cert: obj.certificates.web.cert, key: obj.certificates.web.key, ca: obj.certificates.web.ca, rejectUnauthorized: true, ciphers: ciphers, secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_NO_TLSv1 | constants.SSL_OP_NO_TLSv1_1 };
             if (obj.tlsSniCredentials != null) { tlsOptions.SNICallback = TlsSniCallback; } // We have multiple web server certificate used depending on the domain name
             obj.tlsServer = require('https').createServer(tlsOptions, obj.app);
             obj.tlsServer.on('secureConnection', function () { /*console.log('tlsServer secureConnection');*/ });
@@ -5580,7 +6311,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
 
         // Setup middleware
-        obj.app.engine('handlebars', obj.exphbs({ defaultLayout: null })); // defaultLayout: 'main'
+        obj.app.engine('handlebars', obj.exphbs.engine({ defaultLayout: false }));
         obj.app.set('view engine', 'handlebars');
         if (obj.args.trustedproxy) {
             // Reverse proxy should add the "X-Forwarded-*" headers
@@ -5592,7 +6323,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     require('dns').lookup(obj.args.trustedproxy[0], function (err, address, family) { if (err == null) { obj.app.set('trust proxy', address); obj.args.trustedproxy = [address]; } });
                 }
             }
-        } 
+        }
         else if (typeof obj.args.tlsoffload == 'object') {
             // Reverse proxy should add the "X-Forwarded-*" headers
             try {
@@ -5604,19 +6335,46 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 }
             }
         }
-        obj.app.use(obj.bodyParser.urlencoded({ extended: false }));
-        var sessionOptions = {
+
+        // Setup a keygrip instance with higher default security, default hash is SHA1, we want to bump that up with SHA384
+        // If multiple instances of this server are behind a load-balancer, this secret must be the same for all instances
+        // If args.sessionkey is a string, use it as a single key, but args.sessionkey can also be used as an array of keys.
+        const keygrip = require('keygrip')((typeof obj.args.sessionkey == 'string') ? [obj.args.sessionkey] : obj.args.sessionkey, 'sha384', 'base64');
+
+        // Setup the cookie session
+        const sessionOptions = {
             name: 'xid', // Recommended security practice to not use the default cookie name
             httpOnly: true,
-            keys: [obj.args.sessionkey], // If multiple instances of this server are behind a load-balancer, this secret must be the same for all instances
-            secure: (obj.args.tlsoffload == null) // Use this cookie only over TLS (Check this: https://expressjs.com/en/guide/behind-proxies.html)
+            keys: keygrip,
+            secure: (obj.args.tlsoffload == null), // Use this cookie only over TLS (Check this: https://expressjs.com/en/guide/behind-proxies.html)
+            sameSite: (obj.args.sessionsamesite ? obj.args.sessionsamesite : 'lax')
         }
-        if (obj.args.sessionsamesite != null) { sessionOptions.sameSite = obj.args.sessionsamesite; } else { sessionOptions.sameSite = 'strict'; }
-        if (obj.args.sessiontime != null) { sessionOptions.maxAge = (obj.args.sessiontime * 60 * 1000); }
-        obj.app.use(obj.session(sessionOptions));
+        if (obj.args.sessiontime != null) { sessionOptions.maxAge = (obj.args.sessiontime * 60000); } // sessiontime is minutes
+        obj.app.use(require('cookie-session')(sessionOptions));
+        obj.app.use(function (request, response, next) { // Patch for passport 0.6.0 - https://github.com/jaredhanson/passport/issues/904
+            if (request.session && !request.session.regenerate) {
+                request.session.regenerate = function (cb) {
+                    cb()
+                }
+            }
+            if (request.session && !request.session.save) {
+                request.session.save = function (cb) {
+                    cb()
+                }
+            }
+            next()
+        });
+
+        // Handle all incoming web sockets, see if some need to be handled as web relays
+        obj.app.ws('/*', function (ws, req, next) {
+            // Global error catcher
+            ws.on('error', function (err) { parent.debug('web', 'GENERAL WSERR: ' + err); console.log(err); });
+            if ((obj.webRelayRouter != null) && (obj.args.relaydns.indexOf(req.hostname) >= 0)) { handleWebRelayWebSocket(ws, req); return; }
+            return next();
+        });
 
         // Add HTTP security headers to all responses
-        obj.app.use(function (req, res, next) {
+        obj.app.use(async function (req, res, next) {
             // Check if a session is destroyed
             if (typeof req.session.userid == 'string') {
                 if (typeof req.session.x == 'string') {
@@ -5633,8 +6391,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
 
             // Remove legacy values from the session to keep the session as small as possible
+            delete req.session.u2f;
             delete req.session.domainid;
-            delete req.session.u2fchallenge
             delete req.session.nowInMinutes;
             delete req.session.tokenuserid;
             delete req.session.tokenusername;
@@ -5709,46 +6467,61 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 if (clientIpSplit.length == 2) { req.clientIp = clientIpSplit[0]; }
 
                 // Get server host
-                if (req.headers['x-forwarded-host']) { xforwardedhost = req.headers['x-forwarded-host']; }
+                if (req.headers['x-forwarded-host']) { xforwardedhost = req.headers['x-forwarded-host'].split(',')[0]; } // If multiple hosts are specified with a comma, take the first one.
             } else {
                 req.clientIp = ipex;
+            }
+
+            // If this is a web relay connection, handle it here.
+            if ((obj.webRelayRouter != null) && (obj.args.relaydns.indexOf(req.hostname) >= 0)) {
+                if (['GET', 'POST', 'PUT', 'HEAD', 'DELETE', 'OPTIONS'].indexOf(req.method) >= 0) { return obj.webRelayRouter(req, res); } else { res.sendStatus(404); return; }
             }
 
             // Get the domain for this request
             const domain = req.xdomain = getDomain(req);
             parent.debug('webrequest', '(' + req.clientIp + ') ' + req.url);
 
-            // Skip the rest is this is an agent connection
+            // Skip the rest if this is an agent connection
             if ((req.url.indexOf('/meshrelay.ashx/.websocket') >= 0) || (req.url.indexOf('/agent.ashx/.websocket') >= 0) || (req.url.indexOf('/localrelay.ashx/.websocket') >= 0)) { next(); return; }
 
-            // If this domain has configured headers, use them.
-            // Example headers: { 'Strict-Transport-Security': 'max-age=360000;includeSubDomains' };
-            //                  { 'Referrer-Policy': 'no-referrer', 'x-frame-options': 'SAMEORIGIN', 'X-XSS-Protection': '1; mode=block', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src http: ws: data: 'self';script-src http: 'unsafe-inline';style-src http: 'unsafe-inline'" };
-            if ((domain != null) && (domain.httpheaders != null) && (typeof domain.httpheaders == 'object')) {
-                res.set(domain.httpheaders);
-            } else {
-                // Use default security headers
-                const geourl = (domain.geolocation ? ' *.openstreetmap.org' : '');
-                var selfurl = ' wss://' + req.headers.host;
-                if ((xforwardedhost != null) && (xforwardedhost != req.headers.host)) { selfurl += ' wss://' + xforwardedhost; }
-                const extraScriptSrc = (parent.config.settings.extrascriptsrc != null) ? (' ' + parent.config.settings.extrascriptsrc) : '';
-                const headers = {
-                    'Referrer-Policy': 'no-referrer',
-                    'X-XSS-Protection': '1; mode=block',
-                    'X-Content-Type-Options': 'nosniff',
-                    'Permissions-Policy': 'interest-cohort=()', // Remove Google's FLoC Network
-                    'Content-Security-Policy': "default-src 'none'; font-src 'self'; script-src 'self' 'unsafe-inline'" + extraScriptSrc + "; connect-src 'self'" + geourl + selfurl + "; img-src 'self' blob: data:" + geourl + " data:; style-src 'self' 'unsafe-inline'; frame-src 'self' mcrouter:; media-src 'self'; form-action 'self'"
-                };
-                if ((parent.config.settings.allowframing !== true) && (typeof parent.config.settings.allowframing !== 'string')) { headers['X-Frame-Options'] = 'sameorigin'; }
-                if ((parent.config.settings.stricttransportsecurity === true) || ((parent.config.settings.stricttransportsecurity !== false) && (obj.isTrustedCert(domain)))) { if (typeof parent.config.settings.stricttransportsecurity == 'string') { headers['Strict-Transport-Security'] = parent.config.settings.stricttransportsecurity; } else { headers['Strict-Transport-Security'] = 'max-age=63072000'; } }
-                res.set(headers);
+            // Setup security headers
+            const geourl = (domain.geolocation ? ' *.openstreetmap.org' : '');
+            var selfurl = ' wss://' + req.headers.host;
+            if ((xforwardedhost != null) && (xforwardedhost != req.headers.host)) { selfurl += ' wss://' + xforwardedhost; }
+            const extraScriptSrc = (parent.config.settings.extrascriptsrc != null) ? (' ' + parent.config.settings.extrascriptsrc) : '';
+
+            // If the web relay port is enabled, allow the web page to redirect to it
+            var extraFrameSrc = '';
+            if ((parent.webrelayserver != null) && (parent.webrelayserver.port != 0)) {
+                extraFrameSrc = ' https://' + req.headers.host + ':' + parent.webrelayserver.port;
+                if ((xforwardedhost != null) && (xforwardedhost != req.headers.host)) { extraFrameSrc += ' https://' + xforwardedhost + ':' + parent.webrelayserver.port; }
             }
 
+            // Finish setup security headers
+            const headers = {
+                'Referrer-Policy': 'no-referrer',
+                'X-XSS-Protection': '1; mode=block',
+                'X-Content-Type-Options': 'nosniff',
+                'Content-Security-Policy': "default-src 'none'; font-src 'self' fonts.gstatic.com data:; script-src 'self' 'unsafe-inline' " + extraScriptSrc + "; connect-src 'self'" + geourl + selfurl + "; img-src 'self' blob: data:" + geourl + " data:; style-src 'self' 'unsafe-inline' fonts.googleapis.com; frame-src 'self' blob: mcrouter:" + extraFrameSrc + "; media-src 'self'; form-action 'self'; manifest-src 'self'"
+            };
+            if (req.headers['user-agent'] && (req.headers['user-agent'].indexOf('Chrome') >= 0)) { headers['Permissions-Policy'] = 'interest-cohort=()'; } // Remove Google's FLoC Network, only send this if Chrome browser
+            if ((parent.config.settings.allowframing !== true) && (typeof parent.config.settings.allowframing !== 'string')) { headers['X-Frame-Options'] = 'sameorigin'; }
+            if ((parent.config.settings.stricttransportsecurity === true) || ((parent.config.settings.stricttransportsecurity !== false) && (obj.isTrustedCert(domain)))) { if (typeof parent.config.settings.stricttransportsecurity == 'string') { headers['Strict-Transport-Security'] = parent.config.settings.stricttransportsecurity; } else { headers['Strict-Transport-Security'] = 'max-age=63072000'; } }
+
+            // If this domain has configured headers, add them. If a header is set to null, remove it.
+            if ((domain != null) && (domain.httpheaders != null) && (typeof domain.httpheaders == 'object')) {
+                for (var i in domain.httpheaders) { if (domain.httpheaders[i] === null) { delete headers[i]; } else { headers[i] = domain.httpheaders[i]; } }
+            }
+            res.set(headers);
+
             // Check the session if bound to the external IP address
-            if ((req.session.ip != null) && (req.clientIp != null) && (req.session.ip != req.clientIp)) { req.session = {}; }
+            if ((req.session.ip != null) && (req.clientIp != null) && !checkCookieIp(req.session.ip, req.clientIp)) { req.session = {}; }
 
             // Extend the session time by forcing a change to the session every minute.
             if (req.session.userid != null) { req.session.t = Math.floor(Date.now() / 60e3); } else { delete req.session.t; }
+
+            // Check CrowdSec Bounser if configured
+            if ((parent.crowdSecBounser != null) && (req.headers['upgrade'] != 'websocket') && (req.session.userid == null)) { if ((await parent.crowdSecBounser.process(domain, req, res, next)) == true) { return; } }
 
             // Debugging code, this will stop the agent from crashing if two responses are made to the same request.
             const render = res.render;
@@ -5766,7 +6539,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         var errlogpath = null;
                         if (typeof parent.args.mesherrorlogpath == 'string') { errlogpath = parent.path.join(parent.args.mesherrorlogpath, 'mesherrors.txt'); } else { errlogpath = parent.getConfigFilePath('mesherrors.txt'); }
                         parent.fs.appendFileSync(errlogpath, new Date().toLocaleString() + ': ' + `Error in res.send | ${err.code} | ${err.message} | ${res.stack}` + '\r\n');
-                    } catch (ex) { console.log('ERROR: Unable to write to mesherrors.txt.'); }
+                    } catch (ex) { parent.debug('error', 'Unable to write to mesherrors.txt.'); }
                 }
             };
 
@@ -5807,548 +6580,133 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             });
         }
 
-        // Setup all sharing domains
+        // Setup all sharing domains and check if auth strategies need setup
+        var setupSSO = false
         for (var i in parent.config.domains) {
             if ((parent.config.domains[i].dns == null) && (parent.config.domains[i].share != null)) { obj.app.use(parent.config.domains[i].url, obj.express.static(parent.config.domains[i].share)); }
+            if (typeof parent.config.domains[i].authstrategies == 'object') { setupSSO = true };
         }
 
-        // Setup all HTTP handlers
-        if (parent.multiServer != null) { obj.app.ws('/meshserver.ashx', function (ws, req) { parent.multiServer.CreatePeerInServer(parent.multiServer, ws, req, obj.args.tlsoffload == null); }); }
-        for (var i in parent.config.domains) {
-            if ((parent.config.domains[i].dns != null) || (parent.config.domains[i].share != null)) { continue; } // This is a subdomain with a DNS name, no added HTTP bindings needed.
-            var domain = parent.config.domains[i];
-            var url = domain.url;
-            if (typeof domain.rootredirect == 'string') {
-                // Root page redirects the user to a different URL
-                obj.app.get(url, handleRootRedirect);
-            } else {
-                // Present the login page as the root page
-                obj.app.get(url, handleRootRequest);
-                obj.app.post(url, handleRootPostRequest);
-            }
-            obj.app.get(url + 'refresh.ashx', function (req, res) { res.sendStatus(200); });
-            if ((domain.myserver !== false) && ((domain.myserver == null) || (domain.myserver.backup === true))) { obj.app.get(url + 'backup.zip', handleBackupRequest); }
-            if ((domain.myserver !== false) && ((domain.myserver == null) || (domain.myserver.restore === true))) { obj.app.post(url + 'restoreserver.ashx', handleRestoreRequest); }
-            obj.app.get(url + 'terms', handleTermsRequest);
-            obj.app.get(url + 'xterm', handleXTermRequest);
-            obj.app.get(url + 'login', handleRootRequest);
-            obj.app.post(url + 'login', handleRootPostRequest);
-            obj.app.post(url + 'tokenlogin', handleLoginRequest);
-            obj.app.get(url + 'logout', handleLogoutRequest);
-            obj.app.get(url + 'MeshServerRootCert.cer', handleRootCertRequest);
-            obj.app.post(url + 'changepassword', handlePasswordChangeRequest);
-            obj.app.post(url + 'deleteaccount', handleDeleteAccountRequest);
-            obj.app.post(url + 'createaccount', handleCreateAccountRequest);
-            obj.app.post(url + 'resetpassword', handleResetPasswordRequest);
-            obj.app.post(url + 'resetaccount', handleResetAccountRequest);
-            obj.app.get(url + 'checkmail', handleCheckMailRequest);
-            obj.app.get(url + 'agentinvite', handleAgentInviteRequest);
-            obj.app.get(url + 'userimage.ashx', handleUserImageRequest);
-            obj.app.post(url + 'amtevents.ashx', obj.handleAmtEventRequest);
-            obj.app.get(url + 'meshagents', obj.handleMeshAgentRequest);
-            obj.app.get(url + 'messenger', handleMessengerRequest);
-            obj.app.get(url + 'messenger.png', handleMessengerImageRequest);
-            obj.app.get(url + 'meshosxagent', obj.handleMeshOsxAgentRequest);
-            obj.app.get(url + 'meshsettings', obj.handleMeshSettingsRequest);
-            obj.app.get(url + 'devicepowerevents.ashx', obj.handleDevicePowerEvents);
-            obj.app.get(url + 'downloadfile.ashx', handleDownloadFile);
-            obj.app.post(url + 'uploadfile.ashx', handleUploadFile);
-            obj.app.post(url + 'uploadfilebatch.ashx', handleUploadFileBatch);
-            obj.app.post(url + 'uploadmeshcorefile.ashx', handleUploadMeshCoreFile);
-            obj.app.post(url + 'oneclickrecovery.ashx', handleOneClickRecoveryFile);
-            obj.app.get(url + 'userfiles/*', handleDownloadUserFiles);
-            obj.app.ws(url + 'echo.ashx', handleEchoWebSocket);
-            obj.app.ws(url + '2fahold.ashx', handle2faHoldWebSocket);
-            obj.app.ws(url + 'apf.ashx', function (ws, req) { obj.parent.mpsserver.onWebSocketConnection(ws, req); })
-            obj.app.get(url + 'webrelay.ashx', function (req, res) { res.send('Websocket connection expected'); });
-            obj.app.get(url + 'health.ashx', function (req, res) { res.send('ok'); }); // TODO: Perform more server checking.
-            obj.app.ws(url + 'webrelay.ashx', function (ws, req) { PerformWSSessionAuth(ws, req, false, handleRelayWebSocket); });
-            obj.app.ws(url + 'webider.ashx', function (ws, req) { PerformWSSessionAuth(ws, req, false, function (ws1, req1, domain, user, cookie) { obj.meshIderHandler.CreateAmtIderSession(obj, obj.db, ws1, req1, obj.args, domain, user); }); });
-            obj.app.ws(url + 'control.ashx', function (ws, req) {
-                getWebsocketArgs(ws, req, function (ws, req) {
-                    const domain = getDomain(req);
-                    if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { ws.close(); return; } // Check 3FA URL key
-                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
-                        if (user == null) { // User is not authenticated, perform inner server authentication
-                            if (req.headers['x-meshauth'] === '*') {
-                                PerformWSSessionInnerAuth(ws, req, domain, function (ws1, req1, domain, user) { obj.meshUserHandler.CreateMeshUser(obj, obj.db, ws1, req1, obj.args, domain, user); }); // User is authenticated
-                            } else {
-                                try { ws.close(); } catch (ex) { } // user is not authenticated and inner authentication was not requested, disconnect now.
-                            }
-                        } else {
-                            obj.meshUserHandler.CreateMeshUser(obj, obj.db, ws1, req1, obj.args, domain, user); // User is authenticated
-                        }
-                    });
-                });
-            });
-            obj.app.ws(url + 'devicefile.ashx', function (ws, req) { obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, ws, null, req, domain); });
-            obj.app.get(url + 'devicefile.ashx', handleDeviceFile);
-            obj.app.get(url + 'agentdownload.ashx', handleAgentDownloadFile);
-            obj.app.get(url + 'logo.png', handleLogoRequest);
-            obj.app.get(url + 'loginlogo.png', handleLoginLogoRequest);
-            obj.app.post(url + 'translations', handleTranslationsRequest);
-            obj.app.get(url + 'welcome.jpg', handleWelcomeImageRequest);
-            obj.app.get(url + 'welcome.png', handleWelcomeImageRequest);
-            obj.app.get(url + 'recordings.ashx', handleGetRecordings);
-            obj.app.ws(url + 'recordings.ashx', handleGetRecordingsWebSocket);
-            obj.app.get(url + 'player.htm', handlePlayerRequest);
-            obj.app.get(url + 'player', handlePlayerRequest);
-            obj.app.get(url + 'sharing', handleSharingRequest);
-            obj.app.ws(url + 'agenttransfer.ashx', handleAgentFileTransfer); // Setup agent to/from server file transfer handler
-            obj.app.ws(url + 'meshrelay.ashx', function (ws, req) {
-                PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
-                    if (((parent.config.settings.desktopmultiplex === true) || (domain.desktopmultiplex === true)) && (req.query.p == 2)) {
-                        obj.meshDesktopMultiplexHandler.CreateMeshRelay(obj, ws1, req1, domain, user, cookie); // Desktop multiplexor 1-to-n
-                    } else {
-                        obj.meshRelayHandler.CreateMeshRelay(obj, ws1, req1, domain, user, cookie); // Normal relay 1-to-1
-                    }
-                });
-            });
-            if (obj.args.wanonly != true) { // If the server is not in WAN mode, allow server relayed connections.
-                obj.app.ws(url + 'localrelay.ashx', function (ws, req) {
-                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
-                        if ((user == null) || (cookie == null)) {
-                            try { ws1.close(); } catch (ex) { } 
-                        } else {
-                            obj.meshRelayHandler.CreateLocalRelay(obj, ws1, req1, domain, user, cookie); // Local relay
-                        }
-                    });
-                });
-            }
-            if (domain.agentinvitecodes == true) {
-                obj.app.get(url + 'invite', handleInviteRequest);
-                obj.app.post(url + 'invite', handleInviteRequest);
-            }
-            if (parent.pluginHandler != null) {
-                obj.app.get(url + 'pluginadmin.ashx', obj.handlePluginAdminReq);
-                obj.app.post(url + 'pluginadmin.ashx', obj.handlePluginAdminPostReq);
-                obj.app.get(url + 'pluginHandler.js', obj.handlePluginJS);
-            }
+        if (setupSSO) {
+            setupAllDomainAuthStrategies().then(() => finalizeWebserver());
+        } else {
+            finalizeWebserver()
+        }
 
-            // Setup IP-KVM relay if supported
-            if (domain.ipkvm) {
-                obj.app.ws(url + 'ipkvm.ashx/*', function (ws, req) {
-                    const domain = getDomain(req);
-                    if (domain == null) { parent.debug('web', 'ipkvm: failed domain checks.'); try { ws.close(); } catch (ex) { } return; }
-                    parent.ipKvmManager.handleIpKvmWebSocket(domain, ws, req);
-                });
-                obj.app.get(url + 'ipkvm.ashx/*', function (req, res, next) {
-                    const domain = getDomain(req);
-                    if (domain == null) return;
-                    parent.ipKvmManager.handleIpKvmGet(domain, req, res, next);
-                });
-            }
-
-            // Setup MSTSC.js if needed
-            if (domain.mstsc === true) {
-                obj.app.get(url + 'mstsc.html', function (req, res) { handleMSTSCRequest(req, res, 'mstsc'); });
-                obj.app.ws(url + 'mstscrelay.ashx', function (ws, req) {
-                    const domain = getDomain(req);
-                    if (domain == null) { parent.debug('web', 'mstsc: failed checks.'); try { ws.close(); } catch (e) { } return; }
-                    require('./apprelays.js').CreateMstscRelay(obj, obj.db, ws, req, obj.args, domain);
-                });
-            }
-
-            // Setup SSH if needed
-            if (domain.ssh === true) {
-                obj.app.get(url + 'ssh.html', function (req, res) { handleMSTSCRequest(req, res, 'ssh'); });
-                obj.app.ws(url + 'sshrelay.ashx', function (ws, req) {
-                    const domain = getDomain(req);
-                    if (domain == null) { parent.debug('web', 'ssh: failed checks.'); try { ws.close(); } catch (e) { } return; }
-                    try {
-                        require('./apprelays.js').CreateSshRelay(obj, obj.db, ws, req, obj.args, domain);
-                    } catch (ex) { console.log(ex); }
-                });
-                obj.app.ws(url + 'sshterminalrelay.ashx', function (ws, req) {
-                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
-                        require('./apprelays.js').CreateSshTerminalRelay(obj, obj.db, ws1, req1, domain, user, cookie, obj.args);
-                    });
-                });
-                obj.app.ws(url + 'sshfilesrelay.ashx', function (ws, req) {
-                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
-                        require('./apprelays.js').CreateSshFilesRelay(obj, obj.db, ws1, req1, domain, user, cookie, obj.args);
-                    });
-                });
-            }
-
-            // Setup firebase push only server
-            if ((obj.parent.firebase != null) && (obj.parent.config.firebase)) {
-                if (obj.parent.config.firebase.pushrelayserver) { parent.debug('email', 'Firebase-pushrelay-handler'); obj.app.post(url + 'firebaserelay.aspx', handleFirebasePushOnlyRelayRequest); }
-                if (obj.parent.config.firebase.relayserver) { parent.debug('email', 'Firebase-relay-handler'); obj.app.ws(url + 'firebaserelay.aspx', handleFirebaseRelayRequest); }
-            }
-
-            // Setup auth strategies using passport if needed
-            if (typeof domain.authstrategies == 'object') {
-                const passport = domain.passport = require('passport');
-                passport.serializeUser(function (user, done) { done(null, user.sid); });
-                passport.deserializeUser(function (sid, done) { done(null, { sid: sid }); });
-                obj.app.use(passport.initialize());
-                //obj.app.use(passport.session());
-
-                // Twitter
-                if ((typeof domain.authstrategies.twitter == 'object') && (typeof domain.authstrategies.twitter.clientid == 'string') && (typeof domain.authstrategies.twitter.clientsecret == 'string')) {
-                    const TwitterStrategy = require('passport-twitter');
-                    var options = { consumerKey: domain.authstrategies.twitter.clientid, consumerSecret: domain.authstrategies.twitter.clientsecret };
-                    if (typeof domain.authstrategies.twitter.callbackurl == 'string') { options.callbackURL = domain.authstrategies.twitter.callbackurl; } else { options.callbackURL = url + 'auth-twitter-callback'; }
-                    parent.debug('web', 'Adding Twitter SSO with options: ' + JSON.stringify(options));
-                    passport.use('twitter-' + domain.id, new TwitterStrategy(options,
-                        function (token, tokenSecret, profile, cb) {
-                            parent.debug('web', 'Twitter profile: ' + JSON.stringify(profile));
-                            var user = { sid: '~twitter:' + profile.id, name: profile.displayName, strategy: 'twitter' };
-                            if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string')) { user.email = profile.emails[0].value; }
-                            return cb(null, user);
-                        }
-                    ));
-                    obj.app.get(url + 'auth-twitter', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('twitter-' + domain.id)(req, res, function (err) { console.log('c1', err, req.session); next(); });
-                    });
-                    obj.app.get(url + 'auth-twitter-callback', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        if ((Object.keys(req.session).length == 0) && (req.query.nmr == null)) {
-                            // This is an empty session likely due to the 302 redirection, redirect again (this is a bit of a hack).
-                            var url = req.url;
-                            if (url.indexOf('?') >= 0) { url += '&nmr=1'; } else { url += '?nmr=1'; } // Add this to the URL to prevent redirect loop.
-                            res.set('Content-Type', 'text/html');
-                            res.end('<html><head><meta http-equiv="refresh" content=0;url="' + url + '"></head><body></body></html>');
-                        } else {
-                            domain.passport.authenticate('twitter-' + domain.id, { failureRedirect: '/' })(req, res, function (err) { if (err != null) { console.log(err); } next(); });
-                        }
-                    }, handleStrategyLogin);
-                }
-
-                // Google
-                if ((typeof domain.authstrategies.google == 'object') && (typeof domain.authstrategies.google.clientid == 'string') && (typeof domain.authstrategies.google.clientsecret == 'string')) {
-                    const GoogleStrategy = require('passport-google-oauth20');
-                    var options = { clientID: domain.authstrategies.google.clientid, clientSecret: domain.authstrategies.google.clientsecret };
-                    if (typeof domain.authstrategies.google.callbackurl == 'string') { options.callbackURL = domain.authstrategies.google.callbackurl; } else { options.callbackURL = url + 'auth-google-callback'; }
-                    parent.debug('web', 'Adding Google SSO with options: ' + JSON.stringify(options));
-                    passport.use('google-' + domain.id, new GoogleStrategy(options,
-                        function (token, tokenSecret, profile, cb) {
-                            parent.debug('web', 'Google profile: ' + JSON.stringify(profile));
-                            var user = { sid: '~google:' + profile.id, name: profile.displayName, strategy: 'google' };
-                            if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string') && (profile.emails[0].verified == true)) { user.email = profile.emails[0].value; }
-                            return cb(null, user);
-                        }
-                    ));
-                    obj.app.get(url + 'auth-google', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('google-' + domain.id, { scope: ['profile', 'email'] })(req, res, next);
-                    });
-                    obj.app.get(url + 'auth-google-callback', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('google-' + domain.id, { failureRedirect: '/' })(req, res, function (err) { if (err != null) { console.log(err); } next(); });
-                    }, handleStrategyLogin);
-                }
-
-                // Github
-                if ((typeof domain.authstrategies.github == 'object') && (typeof domain.authstrategies.github.clientid == 'string') && (typeof domain.authstrategies.github.clientsecret == 'string')) {
-                    const GitHubStrategy = require('passport-github2');
-                    var options = { clientID: domain.authstrategies.github.clientid, clientSecret: domain.authstrategies.github.clientsecret };
-                    if (typeof domain.authstrategies.github.callbackurl == 'string') { options.callbackURL = domain.authstrategies.github.callbackurl; } else { options.callbackURL = url + 'auth-github-callback'; }
-                    parent.debug('web', 'Adding Github SSO with options: ' + JSON.stringify(options));
-                    passport.use('github-' + domain.id, new GitHubStrategy(options,
-                        function (token, tokenSecret, profile, cb) {
-                            parent.debug('web', 'Github profile: ' + JSON.stringify(profile));
-                            var user = { sid: '~github:' + profile.id, name: profile.displayName, strategy: 'github' };
-                            if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string')) { user.email = profile.emails[0].value; }
-                            return cb(null, user);
-                        }
-                    ));
-                    obj.app.get(url + 'auth-github', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('github-' + domain.id, { scope: ['user:email'] })(req, res, next);
-                    });
-                    obj.app.get(url + 'auth-github-callback', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('github-' + domain.id, { failureRedirect: '/' })(req, res, next);
-                    }, handleStrategyLogin);
-                }
-
-                // Reddit
-                if ((typeof domain.authstrategies.reddit == 'object') && (typeof domain.authstrategies.reddit.clientid == 'string') && (typeof domain.authstrategies.reddit.clientsecret == 'string')) {
-                    const RedditStrategy = require('passport-reddit');
-                    var options = { clientID: domain.authstrategies.reddit.clientid, clientSecret: domain.authstrategies.reddit.clientsecret };
-                    if (typeof domain.authstrategies.reddit.callbackurl == 'string') { options.callbackURL = domain.authstrategies.reddit.callbackurl; } else { options.callbackURL = url + 'auth-reddit-callback'; }
-                    parent.debug('web', 'Adding Reddit SSO with options: ' + JSON.stringify(options));
-                    passport.use('reddit-' + domain.id, new RedditStrategy.Strategy(options,
-                        function (token, tokenSecret, profile, cb) {
-                            parent.debug('web', 'Reddit profile: ' + JSON.stringify(profile));
-                            var user = { sid: '~reddit:' + profile.id, name: profile.name, strategy: 'reddit' };
-                            if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string')) { user.email = profile.emails[0].value; }
-                            return cb(null, user);
-                        }
-                    ));
-                    obj.app.get(url + 'auth-reddit', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('reddit-' + domain.id, { state: obj.parent.encodeCookie({ 'p': 'reddit' }, obj.parent.loginCookieEncryptionKey), duration: 'permanent' })(req, res, next);
-                    });
-                    obj.app.get(url + 'auth-reddit-callback', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        if ((Object.keys(req.session).length == 0) && (req.query.nmr == null)) {
-                            // This is an empty session likely due to the 302 redirection, redirect again (this is a bit of a hack).
-                            var url = req.url;
-                            if (url.indexOf('?') >= 0) { url += '&nmr=1'; } else { url += '?nmr=1'; } // Add this to the URL to prevent redirect loop.
-                            res.set('Content-Type', 'text/html');
-                            res.end('<html><head><meta http-equiv="refresh" content=0;url="' + url + '"></head><body></body></html>');
-                        } else {
-                            if (req.query.state != null) {
-                                var c = obj.parent.decodeCookie(req.query.state, obj.parent.loginCookieEncryptionKey, 10); // 10 minute timeout
-                                if ((c != null) && (c.p == 'reddit')) { domain.passport.authenticate('reddit-' + domain.id, { failureRedirect: '/' })(req, res, next); return; }
-                            }
-                            next();
-                        }
-                    }, handleStrategyLogin);
-                }
-
-                // Azure
-                if ((typeof domain.authstrategies.azure == 'object') && (typeof domain.authstrategies.azure.clientid == 'string') && (typeof domain.authstrategies.azure.clientsecret == 'string')) {
-                    const AzureOAuth2Strategy = require('passport-azure-oauth2');
-                    var options = { clientID: domain.authstrategies.azure.clientid, clientSecret: domain.authstrategies.azure.clientsecret, tenant: domain.authstrategies.azure.tenantid };
-                    if (typeof domain.authstrategies.azure.callbackurl == 'string') { options.callbackURL = domain.authstrategies.azure.callbackurl; } else { options.callbackURL = url + 'auth-azure-callback'; }
-                    parent.debug('web', 'Adding Azure SSO with options: ' + JSON.stringify(options));
-                    passport.use('azure-' + domain.id, new AzureOAuth2Strategy(options,
-                        function (accessToken, refreshtoken, params, profile, done) {
-                            var userex = null;
-                            try { userex = require('jwt-simple').decode(params.id_token, "", true); } catch (ex) { }
-                            parent.debug('web', 'Azure profile: ' + JSON.stringify(userex));
-                            var user = null;
-                            if (userex != null) {
-                                var user = { sid: '~azure:' + userex.unique_name, name: userex.name, strategy: 'azure' };
-                                if (typeof userex.email == 'string') { user.email = userex.email; }
-                            }
-                            return done(null, user);
-                        }
-                    ));
-                    obj.app.get(url + 'auth-azure', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        domain.passport.authenticate('azure-' + domain.id, { state: obj.parent.encodeCookie({ 'p': 'azure' }, obj.parent.loginCookieEncryptionKey) })(req, res, next);
-                    });
-                    obj.app.get(url + 'auth-azure-callback', function (req, res, next) {
-                        var domain = getDomain(req);
-                        if (domain.passport == null) { next(); return; }
-                        if ((Object.keys(req.session).length == 0) && (req.query.nmr == null)) {
-                            // This is an empty session likely due to the 302 redirection, redirect again (this is a bit of a hack).
-                            var url = req.url;
-                            if (url.indexOf('?') >= 0) { url += '&nmr=1'; } else { url += '?nmr=1'; } // Add this to the URL to prevent redirect loop.
-                            res.set('Content-Type', 'text/html');
-                            res.end('<html><head><meta http-equiv="refresh" content=0;url="' + url + '"></head><body></body></html>');
-                        } else {
-                            if (req.query.state != null) {
-                                var c = obj.parent.decodeCookie(req.query.state, obj.parent.loginCookieEncryptionKey, 10); // 10 minute timeout
-                                if ((c != null) && (c.p == 'azure')) { domain.passport.authenticate('azure-' + domain.id, { failureRedirect: '/' })(req, res, next); return; }
-                            }
-                            next();
-                        }
-                    }, handleStrategyLogin);
-                }
-
-                // Generic SAML
-                if (typeof domain.authstrategies.saml == 'object') {
-                    if ((typeof domain.authstrategies.saml.cert != 'string') || (typeof domain.authstrategies.saml.idpurl != 'string')) {
-                        console.log('ERROR: Missing SAML configuration.');
-                    } else {
-                        const certPath = obj.common.joinPath(obj.parent.datapath, domain.authstrategies.saml.cert);
-                        var cert = obj.fs.readFileSync(certPath);
-                        if (cert == null) {
-                            console.log('ERROR: Unable to read SAML IdP certificate: ' + domain.authstrategies.saml.cert);
-                        } else {
-                            var options = { entryPoint: domain.authstrategies.saml.idpurl, issuer: 'meshcentral' };
-                            if (typeof domain.authstrategies.saml.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.saml.callbackurl; } else { options.callbackUrl = url + 'auth-saml-callback'; }
-                            if (domain.authstrategies.saml.disablerequestedauthncontext != null) { options.disableRequestedAuthnContext = domain.authstrategies.saml.disablerequestedauthncontext; }
-                            if (typeof domain.authstrategies.saml.entityid == 'string') { options.issuer = domain.authstrategies.saml.entityid; }
-                            parent.debug('web', 'Adding SAML SSO with options: ' + JSON.stringify(options));
-                            options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
-                            const SamlStrategy = require('passport-saml').Strategy;
-                            passport.use('saml-' + domain.id, new SamlStrategy(options,
-                                function (profile, done) {
-                                    parent.debug('web', 'SAML profile: ' + JSON.stringify(profile));
-                                    if (typeof profile.nameID != 'string') { return done(); }
-                                    var user = { sid: '~saml:' + profile.nameID, name: profile.nameID, strategy: 'saml' };
-                                    if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) { user.name = profile.firstname + ' ' + profile.lastname; }
-                                    if (typeof profile.email == 'string') { user.email = profile.email; }
-                                    return done(null, user);
-                                }
-                            ));
-                            obj.app.get(url + 'auth-saml', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('saml-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            });
-                            obj.app.post(url + 'auth-saml-callback', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('saml-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            }, handleStrategyLogin);
-                        }
-                    }
-                }
-
-                // Intel SAML
-                if (typeof domain.authstrategies.intel == 'object') {
-                    if ((typeof domain.authstrategies.intel.cert != 'string') || (typeof domain.authstrategies.intel.idpurl != 'string')) {
-                        console.log('ERROR: Missing Intel SAML configuration.');
-                    } else {
-                        var cert = obj.fs.readFileSync(obj.common.joinPath(obj.parent.datapath, domain.authstrategies.intel.cert));
-                        if (cert == null) {
-                            console.log('ERROR: Unable to read Intel SAML IdP certificate: ' + domain.authstrategies.intel.cert);
-                        } else {
-                            var options = { entryPoint: domain.authstrategies.intel.idpurl, issuer: 'meshcentral' };
-                            if (typeof domain.authstrategies.intel.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.intel.callbackurl; } else { options.callbackUrl = url + 'auth-intel-callback'; }
-                            if (domain.authstrategies.intel.disablerequestedauthncontext != null) { options.disableRequestedAuthnContext = domain.authstrategies.intel.disablerequestedauthncontext; }
-                            if (typeof domain.authstrategies.intel.entityid == 'string') { options.issuer = domain.authstrategies.intel.entityid; }
-                            parent.debug('web', 'Adding Intel SSO with options: ' + JSON.stringify(options));
-                            options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
-                            const SamlStrategy = require('passport-saml').Strategy;
-                            passport.use('isaml-' + domain.id, new SamlStrategy(options,
-                                function (profile, done) {
-                                    parent.debug('web', 'Intel profile: ' + JSON.stringify(profile));
-                                    if (typeof profile.nameID != 'string') { return done(); }
-                                    var user = { sid: '~intel:' + profile.nameID, name: profile.nameID, strategy: 'intel' };
-                                    if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) { user.name = profile.firstname + ' ' + profile.lastname; }
-                                    else if ((typeof profile.FirstName == 'string') && (typeof profile.LastName == 'string')) { user.name = profile.FirstName + ' ' + profile.LastName; }
-                                    if (typeof profile.email == 'string') { user.email = profile.email; }
-                                    else if (typeof profile.EmailAddress == 'string') { user.email = profile.EmailAddress; }
-                                    return done(null, user);
-                                }
-                            ));
-                            obj.app.get(url + 'auth-intel', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('isaml-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            });
-                            obj.app.post(url + 'auth-intel-callback', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('isaml-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            }, handleStrategyLogin);
-                        }
-                    }
-                }
-
-                // JumpCloud SAML
-                if (typeof domain.authstrategies.jumpcloud == 'object') {
-                    if ((typeof domain.authstrategies.jumpcloud.cert != 'string') || (typeof domain.authstrategies.jumpcloud.idpurl != 'string')) {
-                        console.log('ERROR: Missing JumpCloud SAML configuration.');
-                    } else {
-                        var cert = obj.fs.readFileSync(obj.common.joinPath(obj.parent.datapath, domain.authstrategies.jumpcloud.cert));
-                        if (cert == null) {
-                            console.log('ERROR: Unable to read JumpCloud IdP certificate: ' + domain.authstrategies.jumpcloud.cert);
-                        } else {
-                            var options = { entryPoint: domain.authstrategies.jumpcloud.idpurl, issuer: 'meshcentral' };
-                            if (typeof domain.authstrategies.jumpcloud.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.jumpcloud.callbackurl; } else { options.callbackUrl = url + 'auth-jumpcloud-callback'; }
-                            if (typeof domain.authstrategies.jumpcloud.entityid == 'string') { options.issuer = domain.authstrategies.jumpcloud.entityid; }
-                            parent.debug('web', 'Adding JumpCloud SSO with options: ' + JSON.stringify(options));
-                            options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
-                            const SamlStrategy = require('passport-saml').Strategy;
-                            passport.use('jumpcloud-' + domain.id, new SamlStrategy(options,
-                                function (profile, done) {
-                                    parent.debug('web', 'JumpCloud profile: ' + JSON.stringify(profile));
-                                    if (typeof profile.nameID != 'string') { return done(); }
-                                    var user = { sid: '~jumpcloud:' + profile.nameID, name: profile.nameID, strategy: 'jumpcloud' };
-                                    if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) { user.name = profile.firstname + ' ' + profile.lastname; }
-                                    if (typeof profile.email == 'string') { user.email = profile.email; }
-                                    return done(null, user);
-                                }
-                            ));
-                            obj.app.get(url + 'auth-jumpcloud', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('jumpcloud-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            });
-                            obj.app.post(url + 'auth-jumpcloud-callback', function (req, res, next) {
-                                var domain = getDomain(req);
-                                if (domain.passport == null) { next(); return; }
-                                domain.passport.authenticate('jumpcloud-' + domain.id, { failureRedirect: '/', failureFlash: true })(req, res, next);
-                            }, handleStrategyLogin);
-                        }
-                    }
-                }
-
-            }
-
-            // Server redirects
-            if (parent.config.domains[i].redirects) { for (var j in parent.config.domains[i].redirects) { if (j[0] != '_') { obj.app.get(url + j, obj.handleDomainRedirect); } } }
-
-            // Server picture
-            obj.app.get(url + 'serverpic.ashx', function (req, res) {
-                // Check if we have "server.jpg" in the data folder, if so, use that.
-                if ((parent.configurationFiles != null) && (parent.configurationFiles['server.png'] != null)) {
-                    res.set({ 'Content-Type': 'image/png' });
-                    res.send(parent.configurationFiles['server.png']);
+        // Setup all domain auth strategy passport.js
+        async function setupAllDomainAuthStrategies() {
+            for (var i in parent.config.domains) {
+                if (parent.config.domains[i].dns != null) {
+                    if (typeof parent.config.domains[''].authstrategies != 'object') { parent.config.domains[''].authstrategies = { 'authStrategyFlags': 0 }; }
+                    parent.config.domains[''].authstrategies.authStrategyFlags |= await setupDomainAuthStrategy(parent.config.domains[i]);
                 } else {
-                    // Check if we have "server.jpg" in the data folder, if so, use that.
-                    var p = obj.path.join(obj.parent.datapath, 'server.png');
-                    if (obj.fs.existsSync(p)) {
-                        // Use the data folder server picture
-                        try { res.sendFile(p); } catch (ex) { res.sendStatus(404); }
-                    } else {
-                        var domain = getDomain(req);
-                        if ((domain != null) && (domain.webpublicpath != null) && (obj.fs.existsSync(obj.path.join(domain.webpublicpath, 'images/server-256.png')))) {
-                            // Use the domain server picture
-                            try { res.sendFile(obj.path.join(domain.webpublicpath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
-                        } else if (parent.webPublicOverridePath && obj.fs.existsSync(obj.path.join(obj.parent.webPublicOverridePath, 'images/server-256.png'))) {
-                            // Use the override server picture
-                            try { res.sendFile(obj.path.join(obj.parent.webPublicOverridePath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
-                        } else {
-                            // Use the default server picture
-                            try { res.sendFile(obj.path.join(obj.parent.webPublicPath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
-                        }
-                    }
+                    if (typeof parent.config.domains[i].authstrategies != 'object') { parent.config.domains[i].authstrategies = { 'authStrategyFlags': 0 }; }
+                    parent.config.domains[i].authstrategies.authStrategyFlags |= await setupDomainAuthStrategy(parent.config.domains[i]);
                 }
-            });
-
-            // Receive mesh agent connections
-            obj.app.ws(url + 'agent.ashx', function (ws, req) {
-                var domain = checkAgentIpAddress(ws, req);
-                if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
-                if (domain.agentkey && ((req.query.key == null) || (domain.agentkey.indexOf(req.query.key) == -1))) { return; } // If agent key is required and not provided or not valid, just hold the websocket and do nothing.
-                //console.log('Agent connect: ' + req.clientIp);
-                try { obj.meshAgentHandler.CreateMeshAgent(obj, obj.db, ws, req, obj.args, domain); } catch (e) { console.log(e); }
-            });
-
-            // Setup MQTT broker over websocket
-            if (obj.parent.mqttbroker != null) {
-                obj.app.ws(url + 'mqtt.ashx', function (ws, req) {
-                    var domain = checkAgentIpAddress(ws, req);
-                    if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
-                    var serialtunnel = SerialTunnel();
-                    serialtunnel.xtransport = 'ws';
-                    serialtunnel.xdomain = domain;
-                    serialtunnel.xip = req.clientIp;
-                    ws.on('message', function (b) { serialtunnel.updateBuffer(Buffer.from(b, 'binary')) });
-                    serialtunnel.forwardwrite = function (b) { ws.send(b, 'binary') }
-                    ws.on('close', function () { serialtunnel.emit('end'); });
-                    obj.parent.mqttbroker.handle(serialtunnel); // Pass socket wrapper to MQTT broker
-                });
             }
-
-            // Setup any .well-known folders
-            var p = obj.parent.path.join(obj.parent.datapath, '.well-known' + ((parent.config.domains[i].id == '') ? '' : ('-' + parent.config.domains[i].id)));
-            if (obj.parent.fs.existsSync(p)) { obj.app.use(url + '.well-known', obj.express.static(p)); }
-
-            // Setup the alternative agent-only port
-            if (obj.agentapp) {
-                // Receive mesh agent connections on alternate port
-                obj.agentapp.ws(url + 'agent.ashx', function (ws, req) {
-                    var domain = checkAgentIpAddress(ws, req);
-                    if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
-                    if (domain.agentkey && ((req.query.key == null) || (domain.agentkey.indexOf(req.query.key) == -1))) { return; } // If agent key is required and not provided or not valid, just hold the websocket and do nothing.
-                    try { obj.meshAgentHandler.CreateMeshAgent(obj, obj.db, ws, req, obj.args, domain); } catch (e) { console.log(e); }
+        }
+        function setupHTTPHandlers() {
+            // Setup all HTTP handlers
+            if (parent.pluginHandler != null) {
+                parent.pluginHandler.callHook('hook_setupHttpHandlers', obj, parent);
+            }
+            if (parent.multiServer != null) { obj.app.ws('/meshserver.ashx', function (ws, req) { parent.multiServer.CreatePeerInServer(parent.multiServer, ws, req, obj.args.tlsoffload == null); }); }
+            for (var i in parent.config.domains) {
+                if ((parent.config.domains[i].dns != null) || (parent.config.domains[i].share != null)) { continue; } // This is a subdomain with a DNS name, no added HTTP bindings needed.
+                var domain = parent.config.domains[i];
+                var url = domain.url;
+                if (typeof domain.rootredirect == 'string') {
+                    // Root page redirects the user to a different URL
+                    obj.app.get(url, handleRootRedirect);
+                } else {
+                    // Present the login page as the root page
+                    obj.app.get(url, handleRootRequest);
+                    obj.app.post(url, obj.bodyParser.urlencoded({ extended: false }), handleRootPostRequest);
+                }
+                obj.app.get(url + 'refresh.ashx', function (req, res) { res.sendStatus(200); });
+                if ((domain.myserver !== false) && ((domain.myserver == null) || (domain.myserver.backup === true))) { obj.app.get(url + 'backup.zip', handleBackupRequest); }
+                if ((domain.myserver !== false) && ((domain.myserver == null) || (domain.myserver.restore === true))) { obj.app.post(url + 'restoreserver.ashx', obj.bodyParser.urlencoded({ extended: false }), handleRestoreRequest); }
+                obj.app.get(url + 'terms', handleTermsRequest);
+                obj.app.get(url + 'xterm', handleXTermRequest);
+                obj.app.get(url + 'login', handleRootRequest);
+                obj.app.post(url + 'login', obj.bodyParser.urlencoded({ extended: false }), handleRootPostRequest);
+                obj.app.post(url + 'tokenlogin', obj.bodyParser.urlencoded({ extended: false }), handleLoginRequest);
+                obj.app.get(url + 'logout', handleLogoutRequest);
+                obj.app.get(url + 'MeshServerRootCert.cer', handleRootCertRequest);
+                obj.app.get(url + 'manifest.json', handleManifestRequest);
+                obj.app.post(url + 'changepassword', obj.bodyParser.urlencoded({ extended: false }), handlePasswordChangeRequest);
+                obj.app.post(url + 'deleteaccount', obj.bodyParser.urlencoded({ extended: false }), handleDeleteAccountRequest);
+                obj.app.post(url + 'createaccount', obj.bodyParser.urlencoded({ extended: false }), handleCreateAccountRequest);
+                obj.app.post(url + 'resetpassword', obj.bodyParser.urlencoded({ extended: false }), handleResetPasswordRequest);
+                obj.app.post(url + 'resetaccount', obj.bodyParser.urlencoded({ extended: false }), handleResetAccountRequest);
+                obj.app.get(url + 'checkmail', handleCheckMailRequest);
+                obj.app.get(url + 'agentinvite', handleAgentInviteRequest);
+                obj.app.get(url + 'userimage.ashx', handleUserImageRequest);
+                obj.app.post(url + 'amtevents.ashx', obj.bodyParser.urlencoded({ extended: false }), obj.handleAmtEventRequest);
+                obj.app.get(url + 'meshagents', obj.handleMeshAgentRequest);
+                obj.app.get(url + 'messenger', handleMessengerRequest);
+                obj.app.get(url + 'messenger.png', handleMessengerImageRequest);
+                obj.app.get(url + 'meshosxagent', obj.handleMeshOsxAgentRequest);
+                obj.app.get(url + 'meshsettings', obj.handleMeshSettingsRequest);
+                obj.app.get(url + 'devicepowerevents.ashx', obj.handleDevicePowerEvents);
+                obj.app.get(url + 'downloadfile.ashx', handleDownloadFile);
+                obj.app.get(url + 'commander.ashx', handleMeshCommander);
+                obj.app.post(url + 'uploadfile.ashx', obj.bodyParser.urlencoded({ extended: false }), handleUploadFile);
+                obj.app.post(url + 'uploadfilebatch.ashx', obj.bodyParser.urlencoded({ extended: false }), handleUploadFileBatch);
+                obj.app.post(url + 'uploadmeshcorefile.ashx', obj.bodyParser.urlencoded({ extended: false }), handleUploadMeshCoreFile);
+                obj.app.post(url + 'oneclickrecovery.ashx', obj.bodyParser.urlencoded({ extended: false }), handleOneClickRecoveryFile);
+                obj.app.get(url + 'userfiles/*', handleDownloadUserFiles);
+                obj.app.ws(url + 'echo.ashx', handleEchoWebSocket);
+                obj.app.ws(url + '2fahold.ashx', handle2faHoldWebSocket);
+                obj.app.ws(url + 'apf.ashx', function (ws, req) { obj.parent.mpsserver.onWebSocketConnection(ws, req); })
+                obj.app.get(url + 'webrelay.ashx', function (req, res) { res.send('Websocket connection expected'); });
+                obj.app.get(url + 'health.ashx', function (req, res) { res.send('ok'); }); // TODO: Perform more server checking.
+                obj.app.ws(url + 'webrelay.ashx', function (ws, req) { PerformWSSessionAuth(ws, req, false, handleRelayWebSocket); });
+                obj.app.ws(url + 'webider.ashx', function (ws, req) { PerformWSSessionAuth(ws, req, false, function (ws1, req1, domain, user, cookie, authData) { obj.meshIderHandler.CreateAmtIderSession(obj, obj.db, ws1, req1, obj.args, domain, user); }); });
+                obj.app.ws(url + 'control.ashx', function (ws, req) {
+                    getWebsocketArgs(ws, req, function (ws, req) {
+                        const domain = getDomain(req);
+                        if (obj.CheckWebServerOriginName(domain, req) == false) {
+                            try { ws.send(JSON.stringify({ action: 'close', cause: 'invalidorigin', msg: 'invalidorigin' })); } catch (ex) { }
+                            try { ws.close(); } catch (ex) { }
+                            return;
+                        }
+                        if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { // Check 3FA URL key
+                            try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'nokey' })); } catch (ex) { }
+                            try { ws.close(); } catch (ex) { }
+                            return;
+                        }
+                        PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
+                            if (user == null) { // User is not authenticated, perform inner server authentication
+                                if (req.headers['x-meshauth'] === '*') {
+                                    PerformWSSessionInnerAuth(ws, req, domain, function (ws1, req1, domain, user) { obj.meshUserHandler.CreateMeshUser(obj, obj.db, ws1, req1, obj.args, domain, user, authData); }); // User is authenticated
+                                } else {
+                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'noauth' })); } catch (ex) { }
+                                    try { ws.close(); } catch (ex) { } // user is not authenticated and inner authentication was not requested, disconnect now.
+                                }
+                            } else {
+                                obj.meshUserHandler.CreateMeshUser(obj, obj.db, ws1, req1, obj.args, domain, user, authData); // User is authenticated
+                            }
+                        });
+                    });
                 });
-
-                // Setup mesh relay on alternative agent-only port
-                obj.agentapp.ws(url + 'meshrelay.ashx', function (ws, req) {
-                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie) {
+                obj.app.ws(url + 'devicefile.ashx', function (ws, req) { obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, ws, null, req, domain); });
+                obj.app.get(url + 'devicefile.ashx', handleDeviceFile);
+                obj.app.get(url + 'agentdownload.ashx', handleAgentDownloadFile);
+                obj.app.get(url + 'logo.png', handleLogoRequest);
+                obj.app.get(url + 'loginlogo.png', handleLoginLogoRequest);
+                obj.app.get(url + 'pwalogo.png', handlePWALogoRequest);
+                obj.app.post(url + 'translations', obj.bodyParser.urlencoded({ extended: false }), handleTranslationsRequest);
+                obj.app.get(url + 'welcome.jpg', handleWelcomeImageRequest);
+                obj.app.get(url + 'welcome.png', handleWelcomeImageRequest);
+                obj.app.get(url + 'recordings.ashx', handleGetRecordings);
+                obj.app.ws(url + 'recordings.ashx', handleGetRecordingsWebSocket);
+                obj.app.get(url + 'player.htm', handlePlayerRequest);
+                obj.app.get(url + 'player', handlePlayerRequest);
+                obj.app.get(url + 'sharing', handleSharingRequest);
+                obj.app.ws(url + 'agenttransfer.ashx', handleAgentFileTransfer); // Setup agent to/from server file transfer handler
+                obj.app.ws(url + 'meshrelay.ashx', function (ws, req) {
+                    PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
                         if (((parent.config.settings.desktopmultiplex === true) || (domain.desktopmultiplex === true)) && (req.query.p == 2)) {
                             obj.meshDesktopMultiplexHandler.CreateMeshRelay(obj, ws1, req1, domain, user, cookie); // Desktop multiplexor 1-to-n
                         } else {
@@ -6356,54 +6714,1217 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         }
                     });
                 });
+                if (obj.args.wanonly != true) { // If the server is not in WAN mode, allow server relayed connections.
+                    obj.app.ws(url + 'localrelay.ashx', function (ws, req) {
+                        PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
+                            if ((user == null) || (cookie == null)) {
+                                try { ws1.close(); } catch (ex) { }
+                            } else {
+                                obj.meshRelayHandler.CreateLocalRelay(obj, ws1, req1, domain, user, cookie); // Local relay
+                            }
+                        });
+                    });
+                }
+                obj.app.get(url + 'invite', handleInviteRequest);
+                obj.app.post(url + 'invite', obj.bodyParser.urlencoded({ extended: false }), handleInviteRequest);
+                
+                if (parent.pluginHandler != null) {
+                    obj.app.get(url + 'pluginadmin.ashx', obj.handlePluginAdminReq);
+                    obj.app.post(url + 'pluginadmin.ashx', obj.bodyParser.urlencoded({ extended: false }), obj.handlePluginAdminPostReq);
+                    obj.app.get(url + 'pluginHandler.js', obj.handlePluginJS);
+                }
 
-                // Allows agents to transfer files
-                obj.agentapp.ws(url + 'devicefile.ashx', function (ws, req) { obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, ws, null, req, domain); });
+                // New account CAPTCHA request
+                if ((domain.newaccountscaptcha != null) && (domain.newaccountscaptcha !== false)) {
+                    obj.app.get(url + 'newAccountCaptcha.ashx', handleNewAccountCaptchaRequest);
+                }
 
-                // Setup agent to/from server file transfer handler
-                obj.agentapp.ws(url + 'agenttransfer.ashx', handleAgentFileTransfer); // Setup agent to/from server file transfer handler
+                // Check CrowdSec Bounser if configured
+                if (parent.crowdSecBounser != null) {
+                    obj.app.get(url + 'captcha.ashx', handleCaptchaGetRequest);
+                    obj.app.post(url + 'captcha.ashx', obj.bodyParser.urlencoded({ extended: false }), handleCaptchaPostRequest);
+                }
 
-                // Setup agent downloads for meshcore updates
-                obj.agentapp.get(url + 'meshagents', obj.handleMeshAgentRequest);
+                // Setup IP-KVM relay if supported
+                if (domain.ipkvm) {
+                    obj.app.ws(url + 'ipkvm.ashx/*', function (ws, req) {
+                        const domain = getDomain(req);
+                        if (domain == null) { parent.debug('web', 'ipkvm: failed domain checks.'); try { ws.close(); } catch (ex) { } return; }
+                        parent.ipKvmManager.handleIpKvmWebSocket(domain, ws, req);
+                    });
+                    obj.app.get(url + 'ipkvm.ashx/*', function (req, res, next) {
+                        const domain = getDomain(req);
+                        if (domain == null) return;
+                        parent.ipKvmManager.handleIpKvmGet(domain, req, res, next);
+                    });
+                }
+
+                // Setup RDP unless indicated as disabled
+                if (domain.mstsc !== false) {
+                    obj.app.get(url + 'mstsc.html', function (req, res) { handleMSTSCRequest(req, res, 'mstsc'); });
+                    obj.app.ws(url + 'mstscrelay.ashx', function (ws, req) {
+                        const domain = getDomain(req);
+                        if (domain == null) { parent.debug('web', 'mstsc: failed checks.'); try { ws.close(); } catch (e) { } return; }
+                        // If no user is logged in and we have a default user, set it now.
+                        if ((req.session.userid == null) && (typeof obj.args.user == 'string') && (obj.users['user/' + domain.id + '/' + obj.args.user.toLowerCase()])) { req.session.userid = 'user/' + domain.id + '/' + obj.args.user.toLowerCase(); }
+                        try { require('./apprelays.js').CreateMstscRelay(obj, obj.db, ws, req, obj.args, domain); } catch (ex) { console.log(ex); }
+                    });
+                }
+
+                // Setup SSH if needed
+                if (domain.ssh === true) {
+                    obj.app.get(url + 'ssh.html', function (req, res) { handleMSTSCRequest(req, res, 'ssh'); });
+                    obj.app.ws(url + 'sshrelay.ashx', function (ws, req) {
+                        const domain = getDomain(req);
+                        if (domain == null) { parent.debug('web', 'ssh: failed checks.'); try { ws.close(); } catch (e) { } return; }
+                        // If no user is logged in and we have a default user, set it now.
+                        if ((req.session.userid == null) && (typeof obj.args.user == 'string') && (obj.users['user/' + domain.id + '/' + obj.args.user.toLowerCase()])) { req.session.userid = 'user/' + domain.id + '/' + obj.args.user.toLowerCase(); }
+                        try { require('./apprelays.js').CreateSshRelay(obj, obj.db, ws, req, obj.args, domain); } catch (ex) { console.log(ex); }
+                    });
+                    obj.app.ws(url + 'sshterminalrelay.ashx', function (ws, req) {
+                        PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
+                            require('./apprelays.js').CreateSshTerminalRelay(obj, obj.db, ws1, req1, domain, user, cookie, obj.args);
+                        });
+                    });
+                    obj.app.ws(url + 'sshfilesrelay.ashx', function (ws, req) {
+                        PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
+                            require('./apprelays.js').CreateSshFilesRelay(obj, obj.db, ws1, req1, domain, user, cookie, obj.args);
+                        });
+                    });
+                }
+
+                // Setup firebase push only server
+                if ((obj.parent.firebase != null) && (obj.parent.config.firebase)) {
+                    if (obj.parent.config.firebase.pushrelayserver) { parent.debug('email', 'Firebase-pushrelay-handler'); obj.app.post(url + 'firebaserelay.aspx', obj.bodyParser.urlencoded({ extended: false }), handleFirebasePushOnlyRelayRequest); }
+                    if (obj.parent.config.firebase.relayserver) { parent.debug('email', 'Firebase-relay-handler'); obj.app.ws(url + 'firebaserelay.aspx', handleFirebaseRelayRequest); }
+                }
+
+                // Setup auth strategies using passport if needed
+                if (typeof domain.authstrategies == 'object') {
+                    parent.authLog('setupHTTPHandlers', `Setting up authentication strategies login and callback URLs for ${domain.id == '' ? 'root' : '"' + domain.id + '"'} domain.`);
+                    // Twitter
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.twitter) != 0) {
+                        obj.app.get(url + 'auth-twitter', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('twitter-' + domain.id)(req, res, function (err) { console.log('c1', err, req.session); next(); });
+                        });
+                        obj.app.get(url + 'auth-twitter-callback', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            if ((Object.keys(req.session).length == 0) && (req.query.nmr == null)) {
+                                // This is an empty session likely due to the 302 redirection, redirect again (this is a bit of a hack).
+                                var url = req.url;
+                                if (url.indexOf('?') >= 0) { url += '&nmr=1'; } else { url += '?nmr=1'; } // Add this to the URL to prevent redirect loop.
+                                res.set('Content-Type', 'text/html');
+                                res.end('<html><head><meta http-equiv="refresh" content=0;url="' + encodeURIComponent(url) + '"></head><body></body></html>');
+                            } else {
+                                domain.passport.authenticate('twitter-' + domain.id, { failureRedirect: domain.url })(req, res, function (err) { if (err != null) { console.log(err); } next(); });
+                            }
+                        }, handleStrategyLogin);
+                    }
+
+                    // Google
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.google) != 0) {
+                        obj.app.get(url + 'auth-google', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('google-' + domain.id, { scope: ['profile', 'email'] })(req, res, next);
+                        });
+                        obj.app.get(url + 'auth-google-callback', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('google-' + domain.id, { failureRedirect: domain.url })(req, res, function (err) { if (err != null) { console.log(err); } next(); });
+                        }, handleStrategyLogin);
+                    }
+
+                    // GitHub
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.github) != 0) {
+                        obj.app.get(url + 'auth-github', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('github-' + domain.id, { scope: ['user:email'] })(req, res, next);
+                        });
+                        obj.app.get(url + 'auth-github-callback', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('github-' + domain.id, { failureRedirect: domain.url })(req, res, next);
+                        }, handleStrategyLogin);
+                    }
+
+                    // Azure
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.azure) != 0) {
+                        obj.app.get(url + 'auth-azure', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('azure-' + domain.id, { state: obj.parent.encodeCookie({ 'p': 'azure' }, obj.parent.loginCookieEncryptionKey) })(req, res, next);
+                        });
+                        obj.app.get(url + 'auth-azure-callback', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            if ((Object.keys(req.session).length == 0) && (req.query.nmr == null)) {
+                                // This is an empty session likely due to the 302 redirection, redirect again (this is a bit of a hack).
+                                var url = req.url;
+                                if (url.indexOf('?') >= 0) { url += '&nmr=1'; } else { url += '?nmr=1'; } // Add this to the URL to prevent redirect loop.
+                                res.set('Content-Type', 'text/html');
+                                res.end('<html><head><meta http-equiv="refresh" content=0;url="' + encodeURIComponent(url) + '"></head><body></body></html>');
+                            } else {
+                                if (req.query.state != null) {
+                                    var c = obj.parent.decodeCookie(req.query.state, obj.parent.loginCookieEncryptionKey, 10); // 10 minute timeout
+                                    if ((c != null) && (c.p == 'azure')) { domain.passport.authenticate('azure-' + domain.id, { failureRedirect: domain.url })(req, res, next); return; }
+                                }
+                                next();
+                            }
+                        }, handleStrategyLogin);
+                    }
+
+                    // Setup OpenID Connect URLs
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.oidc) != 0) {
+                        let authURL = url + 'auth-oidc'
+                        parent.authLog('setupHTTPHandlers', `OIDC: Authorization URL: ${authURL}`);
+                        obj.app.get(authURL, function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate(`oidc-${domain.id}`, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        });
+                        let redirectPath;
+                        if (typeof domain.authstrategies.oidc.client.redirect_uri == 'string') {
+                            redirectPath = (new URL(domain.authstrategies.oidc.client.redirect_uri)).pathname;
+                        } else if (Array.isArray(domain.authstrategies.oidc.client.redirect_uris)) {
+                            redirectPath = (new URL(domain.authstrategies.oidc.client.redirect_uris[0])).pathname;
+                        } else {
+                            redirectPath = url + 'auth-oidc-callback';
+                        }
+                        parent.authLog('setupHTTPHandlers', `OIDC: Callback URL: ${redirectPath}`);
+                        obj.app.get(redirectPath, obj.bodyParser.urlencoded({ extended: false }), function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            if (req.session && req.session.userid) { next(); return; } // already logged in so dont authenticate just carry on
+                            if (req.session && req.session['oidc-' + domain.id]) { // we have a request to login so do authenticate
+                                domain.passport.authenticate(`oidc-${domain.id}`, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                            } else { // no idea so carry on
+                                next(); return;
+                            }
+                        }, handleStrategyLogin);
+                    }
+
+                    // Generic SAML
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.saml) != 0) {
+                        obj.app.get(url + 'auth-saml', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('saml-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        });
+                        obj.app.post(url + 'auth-saml-callback', obj.bodyParser.urlencoded({ extended: false }), function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('saml-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        }, handleStrategyLogin);
+                    }
+
+                    // Intel SAML
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.intelSaml) != 0) {
+                        obj.app.get(url + 'auth-intel', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('isaml-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        });
+                        obj.app.post(url + 'auth-intel-callback', obj.bodyParser.urlencoded({ extended: false }), function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('isaml-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        }, handleStrategyLogin);
+                    }
+
+                    // JumpCloud SAML
+                    if ((domain.authstrategies.authStrategyFlags & domainAuthStrategyConsts.jumpCloudSaml) != 0) {
+                        obj.app.get(url + 'auth-jumpcloud', function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('jumpcloud-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        });
+                        obj.app.post(url + 'auth-jumpcloud-callback', obj.bodyParser.urlencoded({ extended: false }), function (req, res, next) {
+                            var domain = getDomain(req);
+                            if (domain.passport == null) { next(); return; }
+                            domain.passport.authenticate('jumpcloud-' + domain.id, { failureRedirect: domain.url, failureFlash: true })(req, res, next);
+                        }, handleStrategyLogin);
+                    }
+                }
+
+                // Setup Duo HTTP handlers if supported
+                if ((typeof domain.duo2factor == 'object') && (typeof domain.duo2factor.integrationkey == 'string') && (typeof domain.duo2factor.secretkey == 'string') && (typeof domain.duo2factor.apihostname == 'string')) {
+                    // Duo authentication handler
+                    obj.app.get(url + 'auth-duo', function (req, res){
+                        var domain = getDomain(req);
+                        const sec = parent.decryptSessionData(req.session.e);
+                        if ((req.query.state !== sec.duostate) || (req.query.duo_code == null)) {
+                            // The state returned from Duo is not the same as what was in the session, so must fail
+                            parent.debug('web', 'handleRootRequest: Duo 2FA state failed.');
+                            req.session.loginmode = 1;
+                            req.session.messageid = 117; // Invalid security check
+                            res.redirect(domain.url + getQueryPortion(req)); // redirect back to main page
+                            return;
+                        } else {
+                            // User credentials are stored in session, just check again and get userid
+                            obj.authenticate(sec.tuser, sec.tpass, domain, function (err, userid, passhint, loginOptions) {
+                                if ((userid != null) && (err == null)) {
+                                    // Login data correct, now exchange authorization code for 2FA
+                                    const duo = require('@duosecurity/duo_universal');
+                                    const client = new duo.Client({
+                                        clientId: domain.duo2factor.integrationkey,
+                                        clientSecret: domain.duo2factor.secretkey,
+                                        apiHost: domain.duo2factor.apihostname,
+                                        redirectUrl: obj.generateBaseURL(domain, req) + 'auth-duo' + (domain.loginkey != null ? ('?key=' + domain.loginkey) : '')
+                                    });
+                                    client.exchangeAuthorizationCodeFor2FAResult(req.query.duo_code, userid.split('/')[2]).then(function (data) {
+                                        const sec = parent.decryptSessionData(req.session.e);
+                                        if ((sec != null) && (sec.duoconfig == 1)) {
+                                            // Duo 2FA exchange success
+                                            parent.debug('web', 'handleRootRequest: Duo 2FA configuration success.');
+
+                                            // Enable Duo for this user
+                                            var user = obj.users[userid];
+                                            if (user.otpduo == null) {
+                                                user.otpduo = {};
+                                                db.SetUser(user);
+
+                                                // Notify change
+                                                var targets = ['*', 'server-users', user._id];
+                                                if (user.groups) { for (var i in user.groups) { targets.push('server-users:' + i); } }
+                                                var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 160, msg: "Enabled duo two-factor authentication.", domain: domain.id };
+                                                if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
+                                                parent.DispatchEvent(targets, obj, event);
+                                            }
+
+                                            // Clear the Duo state
+                                            delete sec.duostate;
+                                            delete sec.duoconfig;
+                                            req.session.e = parent.encryptSessionData(sec);
+
+                                            var url = req.session.duorurl;
+                                            delete req.session.duorurl;
+                                            res.redirect(url ? url : domain.url); // Redirect back to the user's original page
+                                        } else {
+                                            // Duo 2FA exchange success
+                                            parent.debug('web', 'handleRootRequest: Duo 2FA authorization success.');
+                                            req.session.userid = userid;
+                                            delete req.session.currentNode;
+                                            req.session.ip = req.clientIp; // Bind this session to the IP address of the request
+                                            setSessionRandom(req);
+
+                                            // Clear the Duo state
+                                            delete sec.duostate;
+                                            req.session.e = parent.encryptSessionData(sec);
+
+                                            obj.parent.authLog('https', 'Accepted Duo authentication for ' + userid + ' from ' + req.clientIp + ':' + req.connection.remotePort, { useragent: req.headers['user-agent'], sessionid: req.session.x });
+                                            res.redirect(domain.url + getQueryPortion(req));
+                                        }
+                                    }).catch(function (err) {
+                                        console.log('err', err);
+                                        const sec = parent.decryptSessionData(req.session.e);
+                                        if ((sec != null) && (sec.duoconfig == 1)) {
+                                            // Duo 2FA exchange success
+                                            parent.debug('web', 'handleRootRequest: Duo 2FA configuration failed.');
+
+                                            // Clear the Duo state
+                                            delete sec.duostate;
+                                            delete sec.duoconfig;
+                                            req.session.e = parent.encryptSessionData(sec);
+
+                                            var url = req.session.duorurl;
+                                            delete req.session.duorurl;
+                                            res.redirect(url ? url : domain.url); // Redirect back to the user's original page
+                                        } else {
+                                            // Duo 2FA exchange failed
+                                            parent.debug('web', 'handleRootRequest: Duo 2FA authorization failed.');
+
+                                            // Clear the Duo state
+                                            delete sec.duostate;
+                                            req.session.e = parent.encryptSessionData(sec);
+
+                                            req.session.loginmode = 1;
+                                            req.session.messageid = 117; // Invalid security check
+                                            res.redirect(domain.url + getQueryPortion(req));
+                                        }
+                                    });
+                                } else {
+                                    // Login failed
+                                    handleRootRequestEx(req, res, domain, direct);
+                                }
+                            });
+                        }
+                    });
+
+                    // Configure Duo handler
+                    obj.app.get(url + 'add-duo', function (req, res) {
+                        var domain = getDomain(req);
+                        const sec = parent.decryptSessionData(req.session.e);
+
+                        if (req.session.userid == null) {
+                            res.sendStatus(404);
+                        } else {
+                            // Redirect to Duo here
+                            const duo = require('@duosecurity/duo_universal');
+                            const client = new duo.Client({
+                                clientId: domain.duo2factor.integrationkey,
+                                clientSecret: domain.duo2factor.secretkey,
+                                apiHost: domain.duo2factor.apihostname,
+                                redirectUrl: obj.generateBaseURL(domain, req) + 'auth-duo' + (domain.loginkey != null ? ('&key=' + domain.loginkey) : '')
+                            });
+
+                            // Setup the Duo configuration
+                            if (req.query.rurl) { req.session.duorurl = req.query.rurl; } // Set Duo return URL
+                            const sec = parent.decryptSessionData(req.session.e);
+                            sec.duostate = client.generateState();
+                            sec.duoconfig = 1;
+                            req.session.e = parent.encryptSessionData(sec);
+                            parent.debug('web', 'Redirecting user ' + req.session.userid + ' to Duo for configuration');
+                            res.redirect(client.createAuthUrl(req.session.userid.split('/')[2], sec.duostate));
+                        }
+                    });
+                }
+
+                // Server redirects
+                if (parent.config.domains[i].redirects) { for (var j in parent.config.domains[i].redirects) { if (j[0] != '_') { obj.app.get(url + j, obj.handleDomainRedirect); } } }
+
+                // Server picture
+                obj.app.get(url + 'serverpic.ashx', function (req, res) {
+                    // Check if we have "server.jpg" in the data folder, if so, use that.
+                    if ((parent.configurationFiles != null) && (parent.configurationFiles['server.png'] != null)) {
+                        res.set({ 'Content-Type': 'image/png' });
+                        res.send(parent.configurationFiles['server.png']);
+                    } else {
+                        // Check if we have "server.jpg" in the data folder, if so, use that.
+                        var p = obj.path.join(obj.parent.datapath, 'server.png');
+                        if (obj.fs.existsSync(p)) {
+                            // Use the data folder server picture
+                            try { res.sendFile(p); } catch (ex) { res.sendStatus(404); }
+                        } else {
+                            var domain = getDomain(req);
+                            if ((domain != null) && (domain.webpublicpath != null) && (obj.fs.existsSync(obj.path.join(domain.webpublicpath, 'images/server-256.png')))) {
+                                // Use the domain server picture
+                                try { res.sendFile(obj.path.join(domain.webpublicpath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
+                            } else if (parent.webPublicOverridePath && obj.fs.existsSync(obj.path.join(obj.parent.webPublicOverridePath, 'images/server-256.png'))) {
+                                // Use the override server picture
+                                try { res.sendFile(obj.path.join(obj.parent.webPublicOverridePath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
+                            } else {
+                                // Use the default server picture
+                                try { res.sendFile(obj.path.join(obj.parent.webPublicPath, 'images/server-256.png')); } catch (ex) { res.sendStatus(404); }
+                            }
+                        }
+                    }
+                });
+
+                // Receive mesh agent connections
+                obj.app.ws(url + 'agent.ashx', function (ws, req) {
+                    var domain = checkAgentIpAddress(ws, req);
+                    if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
+                    if (domain.agentkey && ((req.query.key == null) || (domain.agentkey.indexOf(req.query.key) == -1))) { return; } // If agent key is required and not provided or not valid, just hold the websocket and do nothing.
+                    //console.log('Agent connect: ' + req.clientIp);
+                    try { obj.meshAgentHandler.CreateMeshAgent(obj, obj.db, ws, req, obj.args, domain); } catch (ex) { console.log(ex); }
+                });
+
+                // Setup MQTT broker over websocket
+                if (obj.parent.mqttbroker != null) {
+                    obj.app.ws(url + 'mqtt.ashx', function (ws, req) {
+                        var domain = checkAgentIpAddress(ws, req);
+                        if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
+                        var serialtunnel = SerialTunnel();
+                        serialtunnel.xtransport = 'ws';
+                        serialtunnel.xdomain = domain;
+                        serialtunnel.xip = req.clientIp;
+                        ws.on('message', function (b) { serialtunnel.updateBuffer(Buffer.from(b, 'binary')) });
+                        serialtunnel.forwardwrite = function (b) { ws.send(b, 'binary') }
+                        ws.on('close', function () { serialtunnel.emit('end'); });
+                        obj.parent.mqttbroker.handle(serialtunnel); // Pass socket wrapper to MQTT broker
+                    });
+                }
+
+                // Setup any .well-known folders
+                var p = obj.parent.path.join(obj.parent.datapath, '.well-known' + ((parent.config.domains[i].id == '') ? '' : ('-' + parent.config.domains[i].id)));
+                if (obj.parent.fs.existsSync(p)) { obj.app.use(url + '.well-known', obj.express.static(p)); }
+
+                // Setup the alternative agent-only port
+                if (obj.agentapp) {
+                    // Receive mesh agent connections on alternate port
+                    obj.agentapp.ws(url + 'agent.ashx', function (ws, req) {
+                        var domain = checkAgentIpAddress(ws, req);
+                        if (domain == null) { parent.debug('web', 'Got agent connection with bad domain or blocked IP address ' + req.clientIp + ', holding.'); return; }
+                        if (domain.agentkey && ((req.query.key == null) || (domain.agentkey.indexOf(req.query.key) == -1))) { return; } // If agent key is required and not provided or not valid, just hold the websocket and do nothing.
+                        try { obj.meshAgentHandler.CreateMeshAgent(obj, obj.db, ws, req, obj.args, domain); } catch (e) { console.log(e); }
+                    });
+
+                    // Setup mesh relay on alternative agent-only port
+                    obj.agentapp.ws(url + 'meshrelay.ashx', function (ws, req) {
+                        PerformWSSessionAuth(ws, req, true, function (ws1, req1, domain, user, cookie, authData) {
+                            if (((parent.config.settings.desktopmultiplex === true) || (domain.desktopmultiplex === true)) && (req.query.p == 2)) {
+                                obj.meshDesktopMultiplexHandler.CreateMeshRelay(obj, ws1, req1, domain, user, cookie); // Desktop multiplexor 1-to-n
+                            } else {
+                                obj.meshRelayHandler.CreateMeshRelay(obj, ws1, req1, domain, user, cookie); // Normal relay 1-to-1
+                            }
+                        });
+                    });
+
+                    // Allows agents to transfer files
+                    obj.agentapp.ws(url + 'devicefile.ashx', function (ws, req) { obj.meshDeviceFileHandler.CreateMeshDeviceFile(obj, ws, null, req, domain); });
+
+                    // Setup agent to/from server file transfer handler
+                    obj.agentapp.ws(url + 'agenttransfer.ashx', handleAgentFileTransfer); // Setup agent to/from server file transfer handler
+
+                    // Setup agent downloads for meshcore updates
+                    obj.agentapp.get(url + 'meshagents', obj.handleMeshAgentRequest);
+
+                    // Setup agent file downloads
+                    obj.agentapp.get(url + 'agentdownload.ashx', handleAgentDownloadFile);
+                }
+
+                // Setup web relay on this web server if needed
+                // We set this up when a DNS name is used as a web relay instead of a port
+                if (obj.args.relaydns != null) {
+                    obj.webRelayRouter = require('express').Router();
+
+                    // This is the magic URL that will setup the relay session
+                    obj.webRelayRouter.get('/control-redirect.ashx', function (req, res, next) {
+                        if (obj.args.relaydns.indexOf(req.hostname) == -1) { res.sendStatus(404); return; }
+                        if ((req.session.userid == null) && obj.args.user && obj.users['user//' + obj.args.user.toLowerCase()]) { req.session.userid = 'user//' + obj.args.user.toLowerCase(); } // Use a default user if needed
+                        res.set({ 'Cache-Control': 'no-store' });
+                        parent.debug('web', 'webRelaySetup');
+
+                        // Decode the relay cookie
+                        if (req.query.c == null) { res.sendStatus(404); return; }
+
+                        // Decode and check if this relay cookie is valid
+                        var userid, domainid, domain, nodeid, addr, port, appid, webSessionId, expire, publicid;
+                        const urlCookie = obj.parent.decodeCookie(req.query.c, parent.loginCookieEncryptionKey, 32); // Allow cookies up to 32 minutes old. The web page will renew this cookie every 30 minutes.
+                        if (urlCookie == null) { res.sendStatus(404); return; }
+
+                        // Decode the incoming cookie
+                        if ((urlCookie.ruserid != null) && (urlCookie.x != null)) {
+                            if (parent.webserver.destroyedSessions[urlCookie.ruserid + '/' + urlCookie.x] != null) { res.sendStatus(404); return; }
+
+                            // This is a standard user, figure out what our web relay will be.
+                            if (req.session.x != urlCookie.x) { req.session.x = urlCookie.x; } // Set the sessionid if missing
+                            if (req.session.userid != urlCookie.ruserid) { req.session.userid = urlCookie.ruserid; } // Set the session userid if missing
+                            if (req.session.z) { delete req.session.z; } // Clear the web relay guest session
+                            userid = req.session.userid;
+                            domainid = userid.split('/')[1];
+                            domain = parent.config.domains[domainid];
+                            nodeid = ((req.query.relayid != null) ? req.query.relayid : req.query.n);
+                            addr = (req.query.addr != null) ? req.query.addr : '127.0.0.1';
+                            port = parseInt(req.query.p);
+                            appid = parseInt(req.query.appid);
+                            webSessionId = req.session.userid + '/' + req.session.x;
+
+                            // Check that all the required arguments are present
+                            if ((req.session.userid == null) || (req.session.x == null) || (req.query.n == null) || (req.query.p == null) || (parent.webserver.destroyedSessions[webSessionId] != null) || ((req.query.appid != 1) && (req.query.appid != 2))) { res.redirect('/'); return; }
+                        } else if (urlCookie.r == 8) {
+                            // This is a guest user, figure out what our web relay will be.
+                            userid = urlCookie.userid;
+                            domainid = userid.split('/')[1];
+                            domain = parent.config.domains[domainid];
+                            nodeid = urlCookie.nid;
+                            addr = (urlCookie.addr != null) ? urlCookie.addr : '127.0.0.1';
+                            port = urlCookie.port;
+                            appid = (urlCookie.p == 16) ? 2 : 1; // appid: 1 = HTTP, 2 = HTTPS
+                            webSessionId = userid + '/' + urlCookie.pid;
+                            publicid = urlCookie.pid;
+                            if (req.session.x) { delete req.session.x; } // Clear the web relay sessionid
+                            if (req.session.userid) { delete req.session.userid; }  // Clear the web relay userid
+                            if (req.session.z != webSessionId) { req.session.z = webSessionId; } // Set the web relay guest session
+                            expire = urlCookie.expire;
+                            if ((expire != null) && (expire <= Date.now())) { parent.debug('webrelay', 'expired link'); res.sendStatus(404); return; }
+                        }
+
+                        // No session identifier was setup, exit now
+                        if (webSessionId == null) { res.sendStatus(404); return; }
+
+                        // Check that we have an exact session on any of the relay DNS names
+                        var xrelaySessionId, xrelaySession, freeRelayHost, oldestRelayTime, oldestRelayHost;
+                        for (var hostIndex in obj.args.relaydns) {
+                            const host = obj.args.relaydns[hostIndex];
+                            xrelaySessionId = webSessionId + '/' + host;
+                            xrelaySession = webRelaySessions[xrelaySessionId];
+                            if (xrelaySession == null) {
+                                // We found an unused hostname, save this as it could be useful.
+                                if (freeRelayHost == null) { freeRelayHost = host; }
+                            } else {
+                                // Check if we already have a relay session that matches exactly what we want
+                                if ((xrelaySession.domain.id == domain.id) && (xrelaySession.userid == userid) && (xrelaySession.nodeid == nodeid) && (xrelaySession.addr == addr) && (xrelaySession.port == port) && (xrelaySession.appid == appid)) {
+                                    // We found an exact match, we are all setup already, redirect to root of that DNS name
+                                    if (host == req.hostname) {
+                                        // Request was made on the same host, redirect to root.
+                                        res.redirect('/');
+                                    } else {
+                                        // Request was made to a different host
+                                        const httpport = ((args.aliasport != null) ? args.aliasport : args.port);
+                                        res.redirect('https://' + host + ((httpport != 443) ? (':' + httpport) : '') + '/');
+                                    }
+                                    return;
+                                }
+
+                                // Keep a record of the oldest web relay session, this could be useful.
+                                if (oldestRelayHost == null) {
+                                    // Oldest host not set yet, set it
+                                    oldestRelayHost = host;
+                                    oldestRelayTime = xrelaySession.lastOperation;
+                                } else {
+                                    // Check if this host is older then oldest so far
+                                    if (oldestRelayTime > xrelaySession.lastOperation) {
+                                        oldestRelayHost = host;
+                                        oldestRelayTime = xrelaySession.lastOperation;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check that the user has rights to access this device
+                        parent.webserver.GetNodeWithRights(domain, userid, nodeid, function (node, rights, visible) {
+                            // If there is no remote control or relay rights, reject this web relay
+                            if ((rights & 0x00200008) == 0) { res.sendStatus(404); return; } // MESHRIGHT_REMOTECONTROL or MESHRIGHT_RELAY
+
+                            // Check if there is a free relay DNS name we can use
+                            var selectedHost = null;
+                            if (freeRelayHost != null) {
+                                // There is a free one, use it.
+                                selectedHost = freeRelayHost;
+                            } else {
+                                // No free ones, close the oldest one
+                                selectedHost = oldestRelayHost;
+                            }
+                            xrelaySessionId = webSessionId + '/' + selectedHost;
+
+                            if (selectedHost == req.hostname) {
+                                // If this web relay session id is not free, close it now
+                                xrelaySession = webRelaySessions[xrelaySessionId];
+                                if (xrelaySession != null) { xrelaySession.close(); delete webRelaySessions[xrelaySessionId]; }
+
+                                // Create a web relay session
+                                const relaySession = require('./apprelays.js').CreateWebRelaySession(obj, db, req, args, domain, userid, nodeid, addr, port, appid, xrelaySessionId, expire, node.mtype);
+                                relaySession.xpublicid = publicid;
+                                relaySession.onclose = function (sessionId) {
+                                    // Remove the relay session
+                                    delete webRelaySessions[sessionId];
+                                    // If there are not more relay sessions, clear the cleanup timer
+                                    if ((Object.keys(webRelaySessions).length == 0) && (obj.cleanupTimer != null)) { clearInterval(webRelayCleanupTimer); obj.cleanupTimer = null; }
+                                }
+
+                                // Set the multi-tunnel session
+                                webRelaySessions[xrelaySessionId] = relaySession;
+
+                                // Setup the cleanup timer if needed
+                                if (obj.cleanupTimer == null) { webRelayCleanupTimer = setInterval(checkWebRelaySessionsTimeout, 10000); }
+
+                                // Redirect to root.
+                                res.redirect('/');
+                            } else {
+                                if (req.query.noredirect != null) {
+                                    // No redirects allowed, fail here. This is important to make sure there is no redirect cascades
+                                    res.sendStatus(404);
+                                } else {
+                                    // Request was made to a different host, redirect using the full URL so an HTTP cookie can be created on the other DNS name.
+                                    const httpport = ((args.aliasport != null) ? args.aliasport : args.port);
+                                    res.redirect('https://' + selectedHost + ((httpport != 443) ? (':' + httpport) : '') + req.url + '&noredirect=1');
+                                }
+                            }
+                        });
+                    });
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.get('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.post('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.put('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.delete('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.options('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+
+                    // Handle all incoming requests as web relays
+                    obj.webRelayRouter.head('/*', function (req, res) { try { handleWebRelayRequest(req, res); } catch (ex) { console.log(ex); } })
+                }
+
+                // Indicates to ExpressJS that the override public folder should be used to serve static files.
+                obj.app.use(url, function(req, res, next){
+                    var domain = getDomain(req);
+                    if (domain.webpublicpath != null) { // Use domain public path
+                        obj.express.static(domain.webpublicpath)(req, res, next);
+                    } else if (obj.parent.webPublicOverridePath != null) { // Use override path
+                        obj.express.static(obj.parent.webPublicOverridePath)(req, res, next);
+                    } else { // carry on and use default public path
+                        next();
+                    }
+                });
+                // Indicates to ExpressJS that the default public folder should be used to serve static files.
+                obj.app.use(url, obj.express.static(obj.parent.webPublicPath));
+
+                // Start regular disconnection list flush every 2 minutes.
+                obj.wsagentsDisconnectionsTimer = setInterval(function () { obj.wsagentsDisconnections = {}; }, 120000);
+            }
+        }
+        function finalizeWebserver() {
+            // Setup all HTTP handlers
+            setupHTTPHandlers()
+
+            // Handle 404 error
+            if (obj.args.nice404 !== false) {
+                obj.app.use(function (req, res, next) {
+                    parent.debug('web', '404 Error ' + req.url);
+                    var domain = getDomain(req);
+                    if ((domain == null) || (domain.auth == 'sspi')) { res.sendStatus(404); return; }
+                    if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL 
+                    const cspNonce = obj.crypto.randomBytes(15).toString('base64');
+                    res.set({ 'Content-Security-Policy': "default-src 'none'; script-src 'self' 'nonce-" + cspNonce + "'; img-src 'self'; style-src 'self' 'nonce-" + cspNonce + "';" }); // This page supports very tight CSP policy
+                    res.status(404).render(getRenderPage((domain.sitestyle >= 2) ? 'error4042' : 'error404', req, domain), getRenderArgs({ cspNonce: cspNonce }, req, domain));
+                });
             }
 
-            // Indicates to ExpressJS that the override public folder should be used to serve static files.
-            if (parent.config.domains[i].webpublicpath != null) {
-                // Use domain public path
-                obj.app.use(url, obj.express.static(parent.config.domains[i].webpublicpath));
-            } else if (obj.parent.webPublicOverridePath != null) {
-                // Use override path
-                obj.app.use(url, obj.express.static(obj.parent.webPublicOverridePath));
+            // Start server on a free port.
+            CheckListenPort(obj.args.port, obj.args.portbind, StartWebServer);
+
+            // Start on a second agent-only alternative port if needed.
+            if (obj.args.agentport) { CheckListenPort(obj.args.agentport, obj.args.agentportbind, StartAltWebServer); }
+
+            // We are done starting the web server.
+            if (doneFunc) doneFunc();
+        }
+    }
+
+    function nice404(req, res) {
+        parent.debug('web', '404 Error ' + req.url);
+        var domain = getDomain(req);
+        if ((domain == null) || (domain.auth == 'sspi')) { res.sendStatus(404); return; }
+        if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL 
+        if (obj.args.nice404 == false) { res.sendStatus(404); return; }
+        const cspNonce = obj.crypto.randomBytes(15).toString('base64');
+        res.set({ 'Content-Security-Policy': "default-src 'none'; script-src 'self' 'nonce-" + cspNonce + "'; img-src 'self'; style-src 'self' 'nonce-" + cspNonce + "';" }); // This page supports very tight CSP policy
+        res.status(404).render(getRenderPage((domain.sitestyle >= 2) ? 'error4042' : 'error404', req, domain), getRenderArgs({ cspNonce: cspNonce }, req, domain));
+    }
+
+    // Auth strategy flags
+    const domainAuthStrategyConsts = {
+        twitter: 1,
+        google: 2,
+        github: 3,
+        reddit: 8, // Deprecated
+        azure: 16,
+        oidc: 32,
+        saml: 64,
+        intelSaml: 128,
+        jumpCloudSaml: 256
+    }
+
+    // Setup auth strategies for a domain
+    async function setupDomainAuthStrategy(domain) {
+        // Return binary flags representing all auth strategies that have been setup
+        let authStrategyFlags = 0;
+
+        // Setup auth strategies using passport if needed
+        if (typeof domain.authstrategies != 'object') return authStrategyFlags;
+
+        const url = domain.url
+        const passport = domain.passport = require('passport');
+        passport.serializeUser(function (user, done) { done(null, user.sid); });
+        passport.deserializeUser(function (sid, done) { done(null, { sid: sid }); });
+        obj.app.use(passport.initialize());
+        obj.app.use(require('connect-flash')());
+
+        // Twitter
+        if ((typeof domain.authstrategies.twitter == 'object') && (typeof domain.authstrategies.twitter.clientid == 'string') && (typeof domain.authstrategies.twitter.clientsecret == 'string')) {
+            const TwitterStrategy = require('passport-twitter');
+            let options = { consumerKey: domain.authstrategies.twitter.clientid, consumerSecret: domain.authstrategies.twitter.clientsecret };
+            if (typeof domain.authstrategies.twitter.callbackurl == 'string') { options.callbackURL = domain.authstrategies.twitter.callbackurl; } else { options.callbackURL = url + 'auth-twitter-callback'; }
+            parent.authLog('setupDomainAuthStrategy', 'Adding Twitter SSO with options: ' + JSON.stringify(options));
+            passport.use('twitter-' + domain.id, new TwitterStrategy(options,
+                function (token, tokenSecret, profile, cb) {
+                    parent.authLog('setupDomainAuthStrategy', 'Twitter profile: ' + JSON.stringify(profile));
+                    var user = { sid: '~twitter:' + profile.id, name: profile.displayName, strategy: 'twitter' };
+                    if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string')) { user.email = profile.emails[0].value; }
+                    return cb(null, user);
+                }
+            ));
+            authStrategyFlags |= domainAuthStrategyConsts.twitter;
+        }
+
+        // Google
+        if ((typeof domain.authstrategies.google == 'object') && (typeof domain.authstrategies.google.clientid == 'string') && (typeof domain.authstrategies.google.clientsecret == 'string')) {
+            const GoogleStrategy = require('passport-google-oauth20');
+            let options = { clientID: domain.authstrategies.google.clientid, clientSecret: domain.authstrategies.google.clientsecret };
+            if (typeof domain.authstrategies.google.callbackurl == 'string') { options.callbackURL = domain.authstrategies.google.callbackurl; } else { options.callbackURL = url + 'auth-google-callback'; }
+            parent.authLog('setupDomainAuthStrategy', 'Adding Google SSO with options: ' + JSON.stringify(options));
+            passport.use('google-' + domain.id, new GoogleStrategy(options,
+                function (token, tokenSecret, profile, cb) {
+                    parent.authLog('setupDomainAuthStrategy', 'Google profile: ' + JSON.stringify(profile));
+                    var user = { sid: '~google:' + profile.id, name: profile.displayName, strategy: 'google' };
+                    if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string') && (profile.emails[0].verified == true)) { user.email = profile.emails[0].value; }
+                    return cb(null, user);
+                }
+            ));
+            authStrategyFlags |= domainAuthStrategyConsts.google;
+        }
+
+        // Github
+        if ((typeof domain.authstrategies.github == 'object') && (typeof domain.authstrategies.github.clientid == 'string') && (typeof domain.authstrategies.github.clientsecret == 'string')) {
+            const GitHubStrategy = require('passport-github2');
+            let options = { clientID: domain.authstrategies.github.clientid, clientSecret: domain.authstrategies.github.clientsecret };
+            if (typeof domain.authstrategies.github.callbackurl == 'string') { options.callbackURL = domain.authstrategies.github.callbackurl; } else { options.callbackURL = url + 'auth-github-callback'; }
+            parent.authLog('setupDomainAuthStrategy', 'Adding Github SSO with options: ' + JSON.stringify(options));
+            passport.use('github-' + domain.id, new GitHubStrategy(options,
+                function (token, tokenSecret, profile, cb) {
+                    parent.authLog('setupDomainAuthStrategy', 'Github profile: ' + JSON.stringify(profile));
+                    var user = { sid: '~github:' + profile.id, name: profile.displayName, strategy: 'github' };
+                    if ((typeof profile.emails == 'object') && (profile.emails[0] != null) && (typeof profile.emails[0].value == 'string')) { user.email = profile.emails[0].value; }
+                    return cb(null, user);
+                }
+            ));
+            authStrategyFlags |= domainAuthStrategyConsts.github;
+        }
+
+        // Azure
+        if ((typeof domain.authstrategies.azure == 'object') && (typeof domain.authstrategies.azure.clientid == 'string') && (typeof domain.authstrategies.azure.clientsecret == 'string')) {
+            const AzureOAuth2Strategy = require('passport-azure-oauth2');
+            let options = { clientID: domain.authstrategies.azure.clientid, clientSecret: domain.authstrategies.azure.clientsecret, tenant: domain.authstrategies.azure.tenantid };
+            if (typeof domain.authstrategies.azure.callbackurl == 'string') { options.callbackURL = domain.authstrategies.azure.callbackurl; } else { options.callbackURL = url + 'auth-azure-callback'; }
+            parent.authLog('setupDomainAuthStrategy', 'Adding Azure SSO with options: ' + JSON.stringify(options));
+            passport.use('azure-' + domain.id, new AzureOAuth2Strategy(options,
+                function (accessToken, refreshtoken, params, profile, done) {
+                    var userex = null;
+                    try { userex = require('jwt-simple').decode(params.id_token, '', true); } catch (ex) { }
+                    parent.authLog('setupDomainAuthStrategy', 'Azure profile: ' + JSON.stringify(userex));
+                    var user = null;
+                    if (userex != null) {
+                        var user = { sid: '~azure:' + userex.unique_name, name: userex.name, strategy: 'azure' };
+                        if (typeof userex.email == 'string') { user.email = userex.email; }
+                    }
+                    return done(null, user);
+                }
+            ));
+            authStrategyFlags |= domainAuthStrategyConsts.azure;
+        }
+
+        // Generic SAML
+        if (typeof domain.authstrategies.saml == 'object') {
+            if ((typeof domain.authstrategies.saml.cert != 'string') || (typeof domain.authstrategies.saml.idpurl != 'string')) {
+                parent.debug('error', 'Missing SAML configuration.');
+            } else {
+                const certPath = obj.common.joinPath(obj.parent.datapath, domain.authstrategies.saml.cert);
+                var cert = obj.fs.readFileSync(certPath);
+                if (cert == null) {
+                    parent.debug('error', 'Unable to read SAML IdP certificate: ' + domain.authstrategies.saml.cert);
+                } else {
+                    var options = { entryPoint: domain.authstrategies.saml.idpurl, issuer: 'meshcentral' };
+                    if (typeof domain.authstrategies.saml.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.saml.callbackurl; } else { options.callbackUrl = url + 'auth-saml-callback'; }
+                    if (domain.authstrategies.saml.disablerequestedauthncontext != null) { options.disableRequestedAuthnContext = domain.authstrategies.saml.disablerequestedauthncontext; }
+                    if (typeof domain.authstrategies.saml.entityid == 'string') { options.issuer = domain.authstrategies.saml.entityid; }
+                    parent.authLog('setupDomainAuthStrategy', 'Adding SAML SSO with options: ' + JSON.stringify(options));
+                    options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
+                    const SamlStrategy = require('passport-saml').Strategy;
+                    passport.use('saml-' + domain.id, new SamlStrategy(options,
+                        function (profile, done) {
+                            parent.authLog('setupDomainAuthStrategy', 'SAML profile: ' + JSON.stringify(profile));
+                            if (typeof profile.nameID != 'string') { return done(); }
+                            var user = { sid: '~saml:' + profile.nameID, name: profile.nameID, strategy: 'saml' };
+                            if (typeof profile.displayname == 'string') {
+                                user.name = profile.displayname;
+                            } else if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) {
+                                user.name = profile.firstname + ' ' + profile.lastname;
+                            }
+                            if (typeof profile.email == 'string') { user.email = profile.email; }
+                            return done(null, user);
+                        }
+                    ));
+                    authStrategyFlags |= domainAuthStrategyConsts.saml
+                }
+            }
+        }
+
+        // Intel SAML
+        if (typeof domain.authstrategies.intel == 'object') {
+            if ((typeof domain.authstrategies.intel.cert != 'string') || (typeof domain.authstrategies.intel.idpurl != 'string')) {
+                parent.debug('error', 'Missing Intel SAML configuration.');
+            } else {
+                var cert = obj.fs.readFileSync(obj.common.joinPath(obj.parent.datapath, domain.authstrategies.intel.cert));
+                if (cert == null) {
+                    parent.debug('error', 'Unable to read Intel SAML IdP certificate: ' + domain.authstrategies.intel.cert);
+                } else {
+                    var options = { entryPoint: domain.authstrategies.intel.idpurl, issuer: 'meshcentral' };
+                    if (typeof domain.authstrategies.intel.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.intel.callbackurl; } else { options.callbackUrl = url + 'auth-intel-callback'; }
+                    if (domain.authstrategies.intel.disablerequestedauthncontext != null) { options.disableRequestedAuthnContext = domain.authstrategies.intel.disablerequestedauthncontext; }
+                    if (typeof domain.authstrategies.intel.entityid == 'string') { options.issuer = domain.authstrategies.intel.entityid; }
+                    parent.authLog('setupDomainAuthStrategy', 'Adding Intel SSO with options: ' + JSON.stringify(options));
+                    options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
+                    const SamlStrategy = require('passport-saml').Strategy;
+                    passport.use('isaml-' + domain.id, new SamlStrategy(options,
+                        function (profile, done) {
+                            parent.authLog('setupDomainAuthStrategy', 'Intel profile: ' + JSON.stringify(profile));
+                            if (typeof profile.nameID != 'string') { return done(); }
+                            var user = { sid: '~intel:' + profile.nameID, name: profile.nameID, strategy: 'intel' };
+                            if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) { user.name = profile.firstname + ' ' + profile.lastname; }
+                            else if ((typeof profile.FirstName == 'string') && (typeof profile.LastName == 'string')) { user.name = profile.FirstName + ' ' + profile.LastName; }
+                            if (typeof profile.email == 'string') { user.email = profile.email; }
+                            else if (typeof profile.EmailAddress == 'string') { user.email = profile.EmailAddress; }
+                            return done(null, user);
+                        }
+                    ));
+                    authStrategyFlags |= domainAuthStrategyConsts.intelSaml
+                }
+            }
+        }
+
+        // JumpCloud SAML
+        if (typeof domain.authstrategies.jumpcloud == 'object') {
+            if ((typeof domain.authstrategies.jumpcloud.cert != 'string') || (typeof domain.authstrategies.jumpcloud.idpurl != 'string')) {
+                parent.debug('error', 'Missing JumpCloud SAML configuration.');
+            } else {
+                var cert = obj.fs.readFileSync(obj.common.joinPath(obj.parent.datapath, domain.authstrategies.jumpcloud.cert));
+                if (cert == null) {
+                    parent.debug('error', 'Unable to read JumpCloud IdP certificate: ' + domain.authstrategies.jumpcloud.cert);
+                } else {
+                    var options = { entryPoint: domain.authstrategies.jumpcloud.idpurl, issuer: 'meshcentral' };
+                    if (typeof domain.authstrategies.jumpcloud.callbackurl == 'string') { options.callbackUrl = domain.authstrategies.jumpcloud.callbackurl; } else { options.callbackUrl = url + 'auth-jumpcloud-callback'; }
+                    if (typeof domain.authstrategies.jumpcloud.entityid == 'string') { options.issuer = domain.authstrategies.jumpcloud.entityid; }
+                    parent.authLog('setupDomainAuthStrategy', 'Adding JumpCloud SSO with options: ' + JSON.stringify(options));
+                    options.cert = cert.toString().split('-----BEGIN CERTIFICATE-----').join('').split('-----END CERTIFICATE-----').join('');
+                    const SamlStrategy = require('passport-saml').Strategy;
+                    passport.use('jumpcloud-' + domain.id, new SamlStrategy(options,
+                        function (profile, done) {
+                            parent.authLog('setupDomainAuthStrategy', 'JumpCloud profile: ' + JSON.stringify(profile));
+                            if (typeof profile.nameID != 'string') { return done(); }
+                            var user = { sid: '~jumpcloud:' + profile.nameID, name: profile.nameID, strategy: 'jumpcloud' };
+                            if ((typeof profile.firstname == 'string') && (typeof profile.lastname == 'string')) { user.name = profile.firstname + ' ' + profile.lastname; }
+                            if (typeof profile.email == 'string') { user.email = profile.email; }
+                            return done(null, user);
+                        }
+                    ));
+                    authStrategyFlags |= domainAuthStrategyConsts.jumpCloudSaml
+                }
+            }
+        }
+
+        // Setup OpenID Connect Authentication Strategy
+        if (obj.common.validateObject(domain.authstrategies.oidc)) {
+            parent.authLog('setupDomainAuthStrategy', `OIDC: Setting up strategy for domain: ${domain.id == null ? 'default' : domain.id}`);
+            // Ensure required objects exist
+            let initStrategy = domain.authstrategies.oidc
+            if (typeof initStrategy.issuer == 'string') { initStrategy.issuer = { 'issuer': initStrategy.issuer } }
+            let strategy = migrateOldConfigs(Object.assign({ 'client': {}, 'issuer': {}, 'options': {}, 'custom': {}, 'obj': { 'openidClient': require('openid-client') } }, initStrategy))
+            let preset = obj.common.validateString(strategy.custom.preset) ? strategy.custom.preset : null
+            if (!preset) {
+                if (typeof strategy.custom.tenant_id == 'string') { strategy.custom.preset = preset = 'azure' }
+                if (strategy.custom.customer_id || strategy.custom.identitysource || strategy.client.client_id.split('.')[2] == 'googleusercontent') { strategy.custom.preset = preset = 'google' }
             }
 
-            // Indicates to ExpressJS that the default public folder should be used to serve static files.
-            obj.app.use(url, obj.express.static(obj.parent.webPublicPath));
+            // Check issuer url
+            let presetIssuer
+            if (preset == 'azure') { presetIssuer = 'https://login.microsoftonline.com/' + strategy.custom.tenant_id + '/v2.0'; }
+            if (preset == 'google') { presetIssuer = 'https://accounts.google.com'; }
+            if (!obj.common.validateString(strategy.issuer.issuer)) {
+                if (!preset) {
+                    let error = new Error('OIDC: Missing issuer URI.');
+                    parent.authLog('error', `${error.message} STRATEGY: ${JSON.stringify(strategy)}`);
+                    throw error;
+                } else {
+                    strategy.issuer.issuer = presetIssuer
+                    parent.authLog('setupDomainAuthStrategy', `OIDC: PRESET: ${preset.toUpperCase()}: Using preset issuer: ${presetIssuer}`);
+                }
+            } else if ((typeof strategy.issuer.issuer == 'string') && (typeof strategy.custom.preset == 'string')) {
+                let error = new Error(`OIDC: PRESET: ${strategy.custom.preset.toUpperCase()}: PRESET OVERRIDDEN: CONFIG ISSUER: ${strategy.issuer.issuer} PRESET ISSUER: ${presetIssuer}`);
+                parent.authLog('setupDomainAuthStrategy', error.message);
+                console.warn(error)
+            }
 
-            // Start regular disconnection list flush every 2 minutes.
-            obj.wsagentsDisconnectionsTimer = setInterval(function () { obj.wsagentsDisconnections = {}; }, 120000);
+            // Setup Strategy Options
+            strategy.custom.scope = obj.common.convertStrArray(strategy.custom.scope, ' ')
+            if (strategy.custom.scope.length > 1) {
+                strategy.options = Object.assign(strategy.options, { 'params': { 'scope': strategy.custom.scope } })
+            } else {
+                strategy.options = Object.assign(strategy.options, { 'params': { 'scope': ['openid', 'profile', 'email'] } })
+            }
+            if (typeof strategy.groups == 'object') {
+                let groupScope = strategy.groups.scope || null
+                if (groupScope == null) {
+                    if (preset == 'azure') { groupScope = 'Group.Read.All' }
+                    if (preset == 'google') { groupScope = 'https://www.googleapis.com/auth/cloud-identity.groups.readonly' }
+                    if (typeof preset != 'string') { groupScope = 'groups' }
+                }
+                strategy.options.params.scope.push(groupScope)
+            }
+            strategy.options.params.scope = strategy.options.params.scope.join(' ')
+
+            // Discover additional information if available, use endpoints from config if present
+            let issuer
+            try {
+                parent.authLog('setupDomainAuthStrategy', `OIDC: Discovering Issuer Endpoints: ${strategy.issuer.issuer}`);
+                issuer = await strategy.obj.openidClient.Issuer.discover(strategy.issuer.issuer);
+            } catch (err) {
+                let error = new Error('OIDC: Discovery failed.', { cause: err });
+                parent.authLog('setupDomainAuthStrategy', `ERROR: ${JSON.stringify(error)} ISSUER_URI: ${strategy.issuer.issuer}`);
+                throw error
+            }
+            if (Object.keys(strategy.issuer).length > 1) {
+                parent.authLog('setupDomainAuthStrategy', `OIDC: Adding Issuer Metadata: ${JSON.stringify(strategy.issuer)}`);
+                issuer = new strategy.obj.openidClient.Issuer(Object.assign(issuer?.metadata, strategy.issuer));
+            }
+            strategy.issuer = issuer?.metadata;
+            strategy.obj.issuer = issuer;
+
+            var httpport = ((args.aliasport != null) ? args.aliasport : args.port);
+            var origin = 'https://' + (domain.dns ? domain.dns : parent.certificates.CommonName);
+            if (httpport != 443) { origin += ':' + httpport; }
+
+            // Make sure redirect_uri and post_logout_redirect_uri exist before continuing
+            if (!strategy.client.redirect_uri) {
+                strategy.client.redirect_uri = origin + url + 'auth-oidc-callback';
+            }
+            if (!strategy.client.post_logout_redirect_uri) {
+                strategy.client.post_logout_redirect_uri = origin + url + 'login';
+            }
+
+            // Create client and overwrite in options
+            let client = new issuer.Client(strategy.client)
+            strategy.options = Object.assign(strategy.options, { 'client': client, sessionKey: 'oidc-' + domain.id });
+            strategy.client = client.metadata
+            strategy.obj.client = client
+
+            // Setup strategy and save configs for later
+            passport.use('oidc-' + domain.id, new strategy.obj.openidClient.Strategy(strategy.options, oidcCallback));
+            parent.config.domains[domain.id].authstrategies.oidc = strategy;
+            parent.debug('verbose', 'OIDC: Saved Configuration: ' + JSON.stringify(strategy));
+            if (preset) { parent.authLog('setupDomainAuthStrategy', 'OIDC: ' + preset.toUpperCase() + ': Setup Complete'); }
+            else { parent.authLog('setupDomainAuthStrategy', 'OIDC: Setup Complete'); }
+
+            authStrategyFlags |= domainAuthStrategyConsts.oidc
+
+            function migrateOldConfigs(strategy) {
+                let oldConfigs = {
+                    'client': {
+                        'clientid': 'client_id',
+                        'clientsecret': 'client_secret',
+                        'callbackurl': 'redirect_uri'
+                    },
+                    'issuer': {
+                        'authorizationurl': 'authorization_endpoint',
+                        'tokenurl': 'token_endpoint',
+                        'userinfourl': 'userinfo_endpoint'
+                    },
+                    'custom': {
+                        'tenantid': 'tenant_id',
+                        'customerid': 'customer_id'
+                    }
+                }
+                for (var type in oldConfigs) {
+                    for (const [key, value] of Object.entries(oldConfigs[type])) {
+                        if (Object.hasOwn(strategy, key)) {
+                            if (strategy[type][value] && obj.common.validateString(strategy[type][value])) {
+                                let error = new Error('OIDC: OLD CONFIG: Config conflict, new config overrides old config');
+                                parent.authLog('migrateOldConfigs', `${JSON.stringify(error)} OLD CONFIG: ${key}: ${strategy[key]} NEW CONFIG: ${value}:${strategy[type][value]}`);
+                            } else {
+                                parent.authLog('migrateOldConfigs', `OIDC: OLD CONFIG: Moving old config to new location. strategy.${key} => strategy.${type}.${value}`);
+                                strategy[type][value] = strategy[key];
+                            }
+                            delete strategy[key]
+                        }
+                    }
+                }
+                if (typeof strategy.scope == 'string') {
+                    if (!strategy.custom.scope) {
+                        strategy.custom.scope = strategy.scope;
+                        strategy.options.params = { 'scope': strategy.scope };
+                        parent.authLog('migrateOldConfigs', `OIDC: OLD CONFIG: Moving old config to new location. strategy.scope => strategy.custom.scope`);
+                    } else {
+                        let error = new Error('OIDC: OLD CONFIG: Config conflict, using new config values.');
+                        parent.authLog('migrateOldConfigs', `${error.message} OLD CONFIG: strategy.scope: ${strategy.scope} NEW CONFIG: strategy.custom.scope:${strategy.custom.scope}`);
+                        parent.debug('warning', error.message)
+                    }
+                    delete strategy.scope
+                }
+                if (strategy.groups && strategy.groups.sync && strategy.groups.sync.enabled && strategy.groups.sync.enabled === true) {
+                    if (strategy.groups.sync.filter) {
+                        delete strategy.groups.sync.enabled;
+                    } else {
+                        strategy.groups.sync = true;
+                    }
+                    parent.authLog('migrateOldConfigs', `OIDC: OLD CONFIG: Moving old config to new location. strategy.groups.sync.enabled => strategy.groups.sync`);
+                }
+                return strategy
+            }
+
+            // Callback function must be able to grab info from API's using the access token, would prefer to use the token here.
+            function oidcCallback(tokenset, profile, verified) {
+                // Initialize user object
+                let user = { 'strategy': 'oidc' }
+                let claims = obj.common.validateObject(strategy.custom.claims) ? strategy.custom.claims : null;
+                user.sid = obj.common.validateString(profile.sub) ? '~oidc:' + profile.sub : null;
+                user.name = obj.common.validateString(profile.name) ? profile.name : null;
+                user.email = obj.common.validateString(profile.email) ? profile.email : null;
+                if (claims != null) {
+                    user.sid = obj.common.validateString(profile[claims.uuid]) ? '~oidc:' + profile[claims.uuid] : user.sid;
+                    user.name = obj.common.validateString(profile[claims.name]) ? profile[claims.name] : user.name;
+                    user.email = obj.common.validateString(profile[claims.email]) ? profile[claims.email] : user.email;
+                }
+                user.emailVerified = profile.email_verified ? profile.email_verified : obj.common.validateEmail(user.email);
+                user.groups = obj.common.validateStrArray(profile.groups, 1) ? profile.groups : null;
+                user.preset = obj.common.validateString(strategy.custom.preset) ? strategy.custom.preset : null;
+                if (strategy.groups && obj.common.validateString(strategy.groups.claim)) {
+                    user.groups = obj.common.validateStrArray(profile[strategy.groups.claim], 1) ? profile[strategy.groups.claim] : null
+                }
+
+                // Setup end session enpoint if not already configured this requires an auth token
+                try {
+                    if (!strategy.issuer.end_session_endpoint) {
+                        strategy.issuer.end_session_endpoint = strategy.obj.client.endSessionUrl({ 'id_token_hint': tokenset })
+                        parent.authLog('oidcCallback', `OIDC: Discovered end_session_endpoint: ${strategy.issuer.end_session_endpoint}`);
+                    }
+                } catch (err) {
+                    let error = new Error('OIDC: Discovering end_session_endpoint failed. Using Default.', { cause: err });
+                    strategy.issuer.end_session_endpoint = strategy.issuer.issuer + '/logout';
+                    parent.debug('error', `${error.message} end_session_endpoint: ${strategy.issuer.end_session_endpoint} post_logout_redirect_uri: ${strategy.client.post_logout_redirect_uri} TOKENSET: ${JSON.stringify(tokenset)}`);
+                    parent.authLog('oidcCallback', error.message);
+                }
+
+                // Setup presets and groups, get groups from API if needed then return
+                if (strategy.groups && typeof user.preset == 'string') {
+                    getGroups(user.preset, tokenset).then((groups) => {
+                        user = Object.assign(user, { 'groups': groups });
+                        return verified(null, user);
+                    }).catch((err) => {
+                        let error = new Error('OIDC: GROUPS: No groups found due to error:', { cause: err });
+                        parent.debug('error', `${JSON.stringify(error)}`);
+                        parent.authLog('oidcCallback', error.message);
+                        user.groups = [];
+                        return verified(null, user);
+                    });
+                } else {
+                    return verified(null, user);
+                }
+
+                async function getGroups(preset, tokenset) {
+                    let url = '';
+                    if (preset == 'azure') { url = strategy.groups.recursive == true ? 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf' : 'https://graph.microsoft.com/v1.0/me/memberOf'; }
+                    if (preset == 'google') { url = strategy.custom.customer_id ? 'https://cloudidentity.googleapis.com/v1/groups?parent=customers/' + strategy.custom.customer_id : strategy.custom.identitysource ? 'https://cloudidentity.googleapis.com/v1/groups?parent=identitysources/' + strategy.custom.identitysource : null; }
+                    return new Promise((resolve, reject) => {
+                        const options = {
+                            'headers': { authorization: 'Bearer ' + tokenset.access_token }
+                        }
+                        const req = require('https').get(url, options, (res) => {
+                            let data = []
+                            res.on('data', (chunk) => {
+                                data.push(chunk);
+                            });
+                            res.on('end', () => {
+                                if (res.statusCode < 200 || res.statusCode >= 300) {
+                                    let error = new Error('OIDC: GROUPS: Bad response code from API, statusCode: ' + res.statusCode);
+                                    parent.authLog('getGroups', `ERROR: ${error.message} URL: ${url} OPTIONS: ${JSON.stringify(options)}`);
+                                    console.error(error);
+                                    reject(error);
+                                }
+                                if (data.length == 0) {
+                                    let error = new Error('OIDC: GROUPS: Getting groups from API failed, request returned no data in response.');
+                                    parent.authLog('getGroups', `ERROR: ${error.message} URL: ${url} OPTIONS: ${JSON.stringify(options)}`);
+                                    console.error(error);
+                                    reject(error);
+                                }
+                                try {
+                                    if (Buffer.isBuffer(data[0])) {
+                                        data = Buffer.concat(data);
+                                        data = data.toString();
+                                    } else { // else if (typeof data[0] == 'string') 
+                                        data = data.join();
+                                    }
+                                } catch (err) {
+                                    let error = new Error('OIDC: GROUPS: Getting groups from API failed. Error joining response data.', { cause: err });
+                                    parent.authLog('getGroups', `ERROR: ${error.message} URL: ${url} OPTIONS: ${JSON.stringify(options)}`);
+                                    console.error(error);
+                                    reject(error);
+                                }
+                                if (preset == 'azure') {
+                                    data = JSON.parse(data);
+                                    if (data.error) {
+                                        let error = new Error('OIDC: GROUPS: Getting groups from API failed. Error joining response data.', { cause: data.error });
+                                        parent.authLog('getGroups', `ERROR: ${error.message} URL: ${url} OPTIONS: ${JSON.stringify(options)}`);
+                                        console.error(error);
+                                        reject(error);
+                                    }
+                                    data = data.value;
+                                }
+                                if (preset == 'google') {
+                                    data = data.split('\n');
+                                    data = data.join('');
+                                    data = JSON.parse(data);
+                                    data = data.groups;
+                                }
+                                let groups = []
+                                for (var i in data) {
+                                    if (typeof data[i].displayName == 'string') {
+                                        groups.push(data[i].displayName);
+                                    }
+                                }
+                                if (groups.length == 0) {
+                                    let warn = new Error('OIDC: GROUPS: No groups returned from API.');
+                                    parent.authLog('getGroups', `WARN: ${warn.message} DATA: ${data}`);
+                                    console.warn(warn);
+                                    resolve(groups);
+                                } else {
+                                    resolve(groups);
+                                }
+                            });
+                        });
+                        req.on('error', (err) => {
+                            let error = new Error('OIDC: GROUPS: Request error.', { cause: err });
+                            parent.authLog('getGroups', `ERROR: ${error.message} URL: ${url} OPTIONS: ${JSON.stringify(options)}`);
+                            console.error(error);
+                            reject(error);
+                        });
+                        req.end();
+                    });
+                }
+            }
         }
+        return authStrategyFlags;
+    }
 
-        // Handle 404 error
-        if (obj.args.nice404 !== false) {
-            obj.app.use(function (req, res, next) {
-                parent.debug('web', '404 Error ' + req.url);
-                var domain = getDomain(req);
-                if ((domain == null) || (domain.auth == 'sspi')) { res.sendStatus(404); return; }
-                if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; } // Check 3FA URL 
-                const cspNonce = obj.crypto.randomBytes(15).toString('base64');
-                res.set({ 'Content-Security-Policy': "default-src 'none'; script-src 'self' 'nonce-" + cspNonce + "'; img-src 'self'; style-src 'self' 'nonce-" + cspNonce + "';" }); // This page supports very tight CSP policy
-                res.status(404).render(getRenderPage((domain.sitestyle == 2) ? 'error4042' : 'error404', req, domain), getRenderArgs({ cspNonce: cspNonce }, req, domain));
-            });
+    // Handle an incoming request as a web relay 
+    function handleWebRelayRequest(req, res) {
+        var webRelaySessionId = null;
+        if ((req.session.userid != null) && (req.session.x != null)) { webRelaySessionId = req.session.userid + '/' + req.session.x; }
+        else if (req.session.z != null) { webRelaySessionId = req.session.z; }
+        if ((webRelaySessionId != null) && (obj.destroyedSessions[webRelaySessionId] == null)) {
+            var relaySession = webRelaySessions[webRelaySessionId + '/' + req.hostname];
+            if (relaySession != null) {
+                // The web relay session is valid, use it
+                relaySession.handleRequest(req, res);
+            } else {
+                // No web relay session with this relay identifier, close the HTTP request.
+                res.sendStatus(404);
+            }
+        } else {
+            // The user is not logged in or does not have a relay identifier, close the HTTP request.
+            res.sendStatus(404);
         }
+    }
 
-        // Start server on a free port.
-        CheckListenPort(obj.args.port, obj.args.portbind, StartWebServer);
-
-        // Start on a second agent-only alternative port if needed.
-        if (obj.args.agentport) { CheckListenPort(obj.args.agentport, obj.args.agentportbind, StartAltWebServer); }
-
-        // We are done starting the web server.
-        if (doneFunc) doneFunc();
+    // Handle an incoming websocket connection as a web relay 
+    function handleWebRelayWebSocket(ws, req) {
+        var webRelaySessionId = null;
+        if ((req.session.userid != null) && (req.session.x != null)) { webRelaySessionId = req.session.userid + '/' + req.session.x; }
+        else if (req.session.z != null) { webRelaySessionId = req.session.z; }
+        if ((webRelaySessionId != null) && (obj.destroyedSessions[webRelaySessionId] == null)) {
+            var relaySession = webRelaySessions[webRelaySessionId + '/' + req.hostname];
+            if (relaySession != null) {
+                // The multi-tunnel session is valid, use it
+                relaySession.handleWebSocket(ws, req);
+            } else {
+                // No multi-tunnel session with this relay identifier, close the websocket.
+                ws.close();
+            }
+        } else {
+            // The user is not logged in or does not have a relay identifier, close the websocket.
+            ws.close();
+        }
     }
 
     // Perform server inner authentication
@@ -6423,7 +7944,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     if ((obj.common.validateString(command.cnonce, 1, 256) == false) || (obj.common.validateString(command.tlshash, 1, 512) == false)) {
                         try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'badargs' })); } catch (ex) { }
                         try { ws.close(); } catch (ex) { }
-                        break; 
+                        break;
                     }
 
                     // Check that the TLS hash is an acceptable one.
@@ -6456,16 +7977,20 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 var user = obj.users[userid];
                                 if ((err == null) && (user)) {
                                     // Check if a 2nd factor is needed
-                                    var emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
+                                    const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
 
                                     // See if we support two-factor trusted cookies
                                     var twoFactorCookieDays = 30;
                                     if (typeof domain.twofactorcookiedurationdays == 'number') { twoFactorCookieDays = domain.twofactorcookiedurationdays; }
 
-                                    if (checkUserOneTimePasswordRequired(domain, user, req, loginOptions) == true) {
+                                    // Check if two factor can be skipped
+                                    const twoFactorSkip = checkUserOneTimePasswordSkip(domain, user, req, loginOptions);
+
+                                    if ((twoFactorSkip == null) && (checkUserOneTimePasswordRequired(domain, user, req, loginOptions) == true)) {
                                         // Figure out if email 2FA is allowed
                                         var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
                                         var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
+                                        var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
                                         //var push2fa = ((parent.firebase != null) && (user.otpdev != null));
                                         if ((typeof command.token != 'string') || (command.token == '**email**') || (command.token == '**sms**')/* || (command.token == '**push**')*/) {
                                             if ((command.token == '**email**') && (email2fa == true)) {
@@ -6475,7 +8000,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                 parent.debug('web', 'Sending 2FA email to: ' + user.email);
                                                 domain.mailserver.sendAccountLoginMail(domain, user.email, user.otpekey.k, obj.getLanguageCodes(req), req.query.key);
                                                 // Ask for a login token & confirm email was sent
-                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                             } else if ((command.token == '**sms**') && (sms2fa == true)) {
                                                 // Cause a token to be sent to the user's phone number
                                                 user.otpsms = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
@@ -6483,7 +8008,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                 parent.debug('web', 'Sending 2FA SMS to: ' + user.phone);
                                                 parent.smsserver.sendToken(domain, user.phone, user.otpsms.k, obj.getLanguageCodes(req));
                                                 // Ask for a login token & confirm sms was sent
-                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, sms2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, sms2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                            } else if ((command.token == '**msg**') && (msg2fa == true)) {
+                                                // Cause a token to be sent to the user's messenger account
+                                                user.otpmsg = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
+                                                obj.db.SetUser(user);
+                                                parent.debug('web', 'Sending 2FA message to: ' + user.phone);
+                                                parent.msgserver.sendToken(domain, user.msghandle, user.otpmsg.k, obj.getLanguageCodes(req));
+                                                // Ask for a login token & confirm sms was sent
+                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, msg2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                                 /*
                                             } else if ((command.token == '**push**') && (push2fa == true)) {
                                                 // Cause push notification to device
@@ -6498,25 +8031,25 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                             } else {
                                                 // Ask for a login token
                                                 parent.debug('web', 'Asking for login token');
-                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (ex) { console.log(ex); }
+                                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (ex) { console.log(ex); }
                                             }
                                         } else {
-                                            checkUserOneTimePassword(req, domain, user, command.token, null, function (result) {
+                                            checkUserOneTimePassword(req, domain, user, command.token, null, function (result, authData) {
                                                 if (result == false) {
                                                     // Failed, ask for a login token again
                                                     parent.debug('web', 'Invalid login token, asking again');
-                                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                                 } else {
                                                     // We are authenticated with 2nd factor.
                                                     // Check email verification
                                                     if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
                                                         parent.debug('web', 'Invalid login, asking for email validation');
-                                                        try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true })); ws.close(); } catch (e) { }
+                                                        try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
                                                     } else {
                                                         // We are authenticated
                                                         ws._socket.pause();
                                                         ws.removeAllListeners(['message', 'close', 'error']);
-                                                        func(ws, req, domain, user);
+                                                        func(ws, req, domain, user, authData);
                                                     }
                                                 }
                                             });
@@ -6527,12 +8060,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                             parent.debug('web', 'Invalid login, asking for email validation');
                                             var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
                                             var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
-                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true })); ws.close(); } catch (e) { }
+                                            var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
+                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
                                         } else {
                                             // We are authenticated
                                             ws._socket.pause();
                                             ws.removeAllListeners(['message', 'close', 'error']);
-                                            func(ws, req, domain, user);
+                                            func(ws, req, domain, user, twoFactorSkip);
                                         }
                                     }
                                 }
@@ -6586,13 +8120,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             // Check if inner authentication is requested
             if (req.headers['x-meshauth'] === '*') { func(ws, req, domain, null); return; }
 
-            var emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
+            const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
 
             // A web socket session can be authenticated in many ways (Default user, session, user/pass and cookie). Check authentication here.
             if ((req.query.user != null) && (req.query.pass != null)) {
                 // A user/pass is provided in URL arguments
                 obj.authenticate(req.query.user, req.query.pass, domain, function (err, userid, passhint, loginOptions) {
-
                     var user = obj.users[userid];
 
                     // Check if user as the "notools" site right. If so, deny this connection as tools are not allowed to connect.
@@ -6613,6 +8146,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             // Figure out if email 2FA is allowed
                             var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
                             var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
+                            var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
                             //var push2fa = ((parent.firebase != null) && (user.otpdev != null));
                             if ((typeof req.query.token != 'string') || (req.query.token == '**email**') || (req.query.token == '**sms**')/* || (req.query.token == '**push**')*/) {
                                 if ((req.query.token == '**email**') && (email2fa == true)) {
@@ -6622,7 +8156,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                     parent.debug('web', 'Sending 2FA email to: ' + user.email);
                                     domain.mailserver.sendAccountLoginMail(domain, user.email, user.otpekey.k, obj.getLanguageCodes(req), req.query.key);
                                     // Ask for a login token & confirm email was sent
-                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                 } else if ((req.query.token == '**sms**') && (sms2fa == true)) {
                                     // Cause a token to be sent to the user's phone number
                                     user.otpsms = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
@@ -6630,7 +8164,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                     parent.debug('web', 'Sending 2FA SMS to: ' + user.phone);
                                     parent.smsserver.sendToken(domain, user.phone, user.otpsms.k, obj.getLanguageCodes(req));
                                     // Ask for a login token & confirm sms was sent
-                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, sms2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, sms2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                } else if ((req.query.token == '**msg**') && (msg2fa == true)) {
+                                    // Cause a token to be sent to the user's messenger account
+                                    user.otpmsg = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
+                                    obj.db.SetUser(user);
+                                    parent.debug('web', 'Sending 2FA message to: ' + user.msghandle);
+                                    parent.msgserver.sendToken(domain, user.msghandle, user.otpmsg.k, obj.getLanguageCodes(req));
+                                    // Ask for a login token & confirm message was sent
+                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, msg2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                     /*
                                 } else if ((command.token == '**push**') && (push2fa == true)) {
                                     // Cause push notification to device
@@ -6645,22 +8187,25 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 } else {
                                     // Ask for a login token
                                     parent.debug('web', 'Asking for login token');
-                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                    try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                 }
                             } else {
-                                checkUserOneTimePassword(req, domain, user, req.query.token, null, function (result) {
+                                checkUserOneTimePassword(req, domain, user, req.query.token, null, function (result, authData) {
                                     if (result == false) {
                                         // Failed, ask for a login token again
                                         parent.debug('web', 'Invalid login token, asking again');
-                                        try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                        try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                     } else {
                                         // We are authenticated with 2nd factor.
                                         // Check email verification
                                         if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
                                             parent.debug('web', 'Invalid login, asking for email validation');
-                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true })); ws.close(); } catch (e) { }
+                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
                                         } else {
-                                            func(ws, req, domain, user);
+                                            req.session.userid = user._id;
+                                            req.session.ip = req.clientIp;
+                                            setSessionRandom(req);
+                                            func(ws, req, domain, user, null, authData);
                                         }
                                     }
                                 });
@@ -6671,9 +8216,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 parent.debug('web', 'Invalid login, asking for email validation');
                                 var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
                                 var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
-                                try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, email2fasent: true })); ws.close(); } catch (e) { }
+                                var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
+                                try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
                             } else {
                                 // We are authenticated
+                                req.session.userid = user._id;
+                                req.session.ip = req.clientIp;
+                                setSessionRandom(req);
                                 func(ws, req, domain, user);
                             }
                         }
@@ -6692,31 +8241,39 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     }
                 });
                 return;
-            } else if ((req.query.auth != null) && (req.query.auth != '')) {
+            }
+
+            if ((req.query.auth != null) && (req.query.auth != '')) {
                 // This is a encrypted cookie authentication
                 var cookie = obj.parent.decodeCookie(req.query.auth, obj.parent.loginCookieEncryptionKey, 60); // Cookie with 1 hour timeout
                 if ((cookie == null) && (obj.parent.multiServer != null)) { cookie = obj.parent.decodeCookie(req.query.auth, obj.parent.serverKey, 60); } // Try the server key
-                if ((obj.args.cookieipcheck !== false) && (cookie != null) && (cookie.ip != null) && (cookie.ip != req.clientIp && (cookie.ip != req.clientIp))) { // If the cookie if binded to an IP address, check here.
+                if ((cookie != null) && (cookie.ip != null) && !checkCookieIp(cookie.ip, req.clientIp)) { // If the cookie if binded to an IP address, check here.
                     parent.debug('web', 'ERR: Invalid cookie IP address, got \"' + cookie.ip + '\", expected \"' + cleanRemoteAddr(req.clientIp) + '\".');
                     cookie = null;
                 }
                 if ((cookie != null) && (cookie.userid != null) && (obj.users[cookie.userid]) && (cookie.domainid == domain.id) && (cookie.userid.split('/')[1] == domain.id)) {
                     // Valid cookie, we are authenticated. Cookie of format { userid: 'user//name', domain: '' }
                     func(ws, req, domain, obj.users[cookie.userid], cookie);
+                    return;
                 } else if ((cookie != null) && (cookie.a === 3) && (typeof cookie.u == 'string') && (obj.users[cookie.u]) && (cookie.u.split('/')[1] == domain.id)) {
                     // Valid cookie, we are authenticated. Cookie of format { u: 'user//name', a: 3 }
                     func(ws, req, domain, obj.users[cookie.u], cookie);
+                    return;
                 } else if ((cookie != null) && (cookie.nouser === 1)) {
                     // This is a valid cookie, but no user. This is used for agent self-sharing.
                     func(ws, req, domain, null, cookie);
-                } else {
+                    return;
+                } /*else {
                     // This is a bad cookie, keep going anyway, maybe we have a active session that will save us.
                     if ((cookie != null) && (cookie.domainid != domain.id)) { parent.debug('web', 'ERR: Invalid domain, got \"' + cookie.domainid + '\", expected \"' + domain.id + '\".'); }
                     parent.debug('web', 'ERR: Websocket bad cookie auth (Cookie:' + (cookie != null) + '): ' + req.query.auth);
                     try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'noauth-2b' })); ws.close(); } catch (e) { }
+                    return;
                 }
-                return;
-            } else if (req.headers['x-meshauth'] != null) {
+                */
+            }
+
+            if (req.headers['x-meshauth'] != null) {
                 // This is authentication using a custom HTTP header
                 var s = req.headers['x-meshauth'].split(',');
                 for (var i in s) { s[i] = Buffer.from(s[i], 'base64').toString(); }
@@ -6742,10 +8299,11 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             // Figure out if email 2FA is allowed
                             var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
                             var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
+                            var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
                             if (s.length != 3) {
-                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                             } else {
-                                checkUserOneTimePassword(req, domain, user, s[2], null, function (result) {
+                                checkUserOneTimePassword(req, domain, user, s[2], null, function (result, authData) {
                                     if (result == false) {
                                         if ((s[2] == '**email**') && (email2fa == true)) {
                                             // Cause a token to be sent to the user's registered email
@@ -6763,6 +8321,14 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                             parent.smsserver.sendToken(domain, user.phone, user.otpsms.k, obj.getLanguageCodes(req));
                                             // Ask for a login token & confirm sms was sent
                                             try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', sms2fa: sms2fa, sms2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
+                                        } else if ((s[2] == '**msg**') && (msg2fa == true)) {
+                                            // Cause a token to be sent to the user's phone number
+                                            user.otpmsg = { k: obj.common.zeroPad(getRandomSixDigitInteger(), 6), d: Date.now() };
+                                            obj.db.SetUser(user);
+                                            parent.debug('web', 'Sending 2FA message to: ' + user.msghandle);
+                                            parent.msgserver.sendToken(domain, user.msghandle, user.otpmsg.k, obj.getLanguageCodes(req));
+                                            // Ask for a login token & confirm sms was sent
+                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', msg2fa: msg2fa, msg2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                         } else {
                                             // Ask for a login token
                                             try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
@@ -6774,7 +8340,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                             parent.debug('web', 'Invalid login, asking for email validation');
                                             try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                         } else {
-                                            func(ws, req, domain, user);
+                                            func(ws, req, domain, user, null, authData);
                                         }
                                     }
                                 });
@@ -6785,7 +8351,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
                                 parent.debug('web', 'Invalid login, asking for email validation');
                                 try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                            } else {
+                            } else {                                
+                                req.session.userid = user._id;
+                                req.session.ip = req.clientIp;
+                                setSessionRandom(req);
                                 func(ws, req, domain, user);
                             }
                         }
@@ -6804,13 +8373,13 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 return;
             }
 
-            //console.log(req.headers['x-meshauth']);
-
             if (obj.args.user && obj.users['user/' + domain.id + '/' + obj.args.user.toLowerCase()]) {
                 // A default user is active
                 func(ws, req, domain, obj.users['user/' + domain.id + '/' + obj.args.user.toLowerCase()]);
                 return;
-            } else if (req.session && (req.session.userid != null) && (req.session.userid.split('/')[1] == domain.id) && (obj.users[req.session.userid])) {
+            }
+
+            if (req.session && (req.session.userid != null) && (req.session.userid.split('/')[1] == domain.id) && (obj.users[req.session.userid])) {
                 // This user is logged in using the ExpressJS session
                 func(ws, req, domain, obj.users[req.session.userid]);
                 return;
@@ -6843,16 +8412,22 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         obj.args.port = port;
         if (obj.tlsServer != null) {
             if (obj.args.lanonly == true) {
-                obj.tcpServer = obj.tlsServer.listen(port, addr, function () { console.log('MeshCentral HTTPS server running on port ' + port + ((args.aliasport != null) ? (', alias port ' + args.aliasport) : '') + '.'); });
+                obj.tcpServer = obj.tlsServer.listen(port, addr, function () { console.log('MeshCentral HTTPS server running on port ' + port + ((typeof args.aliasport == 'number') ? (', alias port ' + args.aliasport) : '') + '.'); });
             } else {
-                obj.tcpServer = obj.tlsServer.listen(port, addr, function () { console.log('MeshCentral HTTPS server running on ' + certificates.CommonName + ':' + port + ((args.aliasport != null) ? (', alias port ' + args.aliasport) : '') + '.'); });
+                obj.tcpServer = obj.tlsServer.listen(port, addr, function () {
+                    console.log('MeshCentral HTTPS server running on ' + certificates.CommonName + ':' + port + ((typeof args.aliasport == 'number') ? (', alias port ' + args.aliasport) : '') + '.');
+                    if (args.relaydns != null) { console.log('MeshCentral HTTPS relay server running on ' + args.relaydns[0] + ':' + port + ((typeof args.aliasport == 'number') ? (', alias port ' + args.aliasport) : '') + '.'); }
+                });
                 obj.parent.updateServerState('servername', certificates.CommonName);
             }
-            if (obj.parent.authlog) { obj.parent.authLog('https', 'Server listening on ' + ((addr != null) ? addr : '0.0.0.0') + ' port ' + port + '.'); }
+            obj.parent.debug('https', 'Server listening on ' + ((addr != null) ? addr : '0.0.0.0') + ' port ' + port + '.');
             obj.parent.updateServerState('https-port', port);
             if (args.aliasport != null) { obj.parent.updateServerState('https-aliasport', args.aliasport); }
         } else {
-            obj.tcpServer = obj.app.listen(port, addr, function () { console.log('MeshCentral HTTP server running on port ' + port + ((args.aliasport != null) ? (', alias port ' + args.aliasport) : '') + '.'); });
+            obj.tcpServer = obj.app.listen(port, addr, function () {
+                console.log('MeshCentral HTTP server running on port ' + port + ((typeof args.aliasport == 'number') ? (', alias port ' + args.aliasport) : '') + '.');
+                if (args.relaydns != null) { console.log('MeshCentral HTTP relay server running on ' + args.relaydns[0] + ':' + port + ((typeof args.aliasport == 'number') ? (', alias port ' + args.aliasport) : '') + '.'); }
+            });
             obj.parent.updateServerState('http-port', port);
             if (args.aliasport != null) { obj.parent.updateServerState('http-aliasport', args.aliasport); }
         }
@@ -6875,14 +8450,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     function StartAltWebServer(port, addr) {
         if ((port < 1) || (port > 65535)) return;
         var agentAliasPort = null;
+        var agentAliasDns = null;
         if (args.agentaliasport != null) { agentAliasPort = args.agentaliasport; }
+        if (args.agentaliasdns != null) { agentAliasDns = args.agentaliasdns; }
         if (obj.tlsAltServer != null) {
             if (obj.args.lanonly == true) {
                 obj.tcpAltServer = obj.tlsAltServer.listen(port, addr, function () { console.log('MeshCentral HTTPS agent-only server running on port ' + port + ((agentAliasPort != null) ? (', alias port ' + agentAliasPort) : '') + '.'); });
             } else {
-                obj.tcpAltServer = obj.tlsAltServer.listen(port, addr, function () { console.log('MeshCentral HTTPS agent-only server running on ' + certificates.CommonName + ':' + port + ((agentAliasPort != null) ? (', alias port ' + agentAliasPort) : '') + '.'); });
+                obj.tcpAltServer = obj.tlsAltServer.listen(port, addr, function () { console.log('MeshCentral HTTPS agent-only server running on ' + ((agentAliasDns != null) ? agentAliasDns : certificates.CommonName) + ':' + port + ((agentAliasPort != null) ? (', alias port ' + agentAliasPort) : '') + '.'); });
             }
-            if (obj.parent.authlog) { obj.parent.authLog('https', 'Server listening on 0.0.0.0 port ' + port + '.'); }
+            obj.parent.debug('https', 'Server listening on 0.0.0.0 port ' + port + '.');
             obj.parent.updateServerState('https-agent-port', port);
         } else {
             obj.tcpAltServer = obj.agentapp.listen(port, addr, function () { console.log('MeshCentral HTTP agent-only server running on port ' + port + ((agentAliasPort != null) ? (', alias port ' + agentAliasPort) : '') + '.'); });
@@ -7037,9 +8614,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
     };
 
-    //
-    // Access Control Functions
-    //
+    /* Access Control Functions */
 
     // Remove user rights
     function removeUserRights(rights, user) {
@@ -7067,6 +8642,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
         return rights;
     }
+
+
+    // Return the node and rights for a array of nodeids
+    obj.GetNodesWithRights = function (domain, user, nodeids, func) {
+        var rc = nodeids.length, r = {};
+        for (var i in nodeids) {
+            obj.GetNodeWithRights(domain, user, nodeids[i], function (node, rights, visible) {
+                if ((node != null) && (visible == true)) { r[node._id] = { node: node, rights: rights }; if (--rc == 0) { func(r); } }
+            });
+        }
+    }
+
 
     // Return the node and rights for a given nodeid
     obj.GetNodeWithRights = function (domain, user, nodeid, func) {
@@ -7364,7 +8951,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         delete user2.subscriptions;
         delete user2.passtype;
         delete user2.otpsms;
+        delete user2.otpmsg;
         if ((typeof user2.otpekey == 'object') && (user2.otpekey != null)) { user2.otpekey = 1; } // Indicates that email 2FA is enabled.
+        if ((typeof user2.otpduo == 'object') && (user2.otpduo != null)) { user2.otpduo = 1; } // Indicates that duo 2FA is enabled.
         if ((typeof user2.otpsecret == 'string') && (user2.otpsecret != null)) { user2.otpsecret = 1; } // Indicates a time secret is present.
         if ((typeof user2.otpkeys == 'object') && (user2.otpkeys != null)) { user2.otpkeys = 0; if (user.otpkeys != null) { for (var i = 0; i < user.otpkeys.keys.length; i++) { if (user.otpkeys.keys[i].u == true) { user2.otpkeys = 1; } } } } // Indicates the number of one time backup codes that are active.
         if ((typeof user2.otphkeys == 'object') && (user2.otphkeys != null)) { user2.otphkeys = user2.otphkeys.length; } // Indicates the number of hardware keys setup
@@ -7380,8 +8969,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if ((r.pmt != null) || (r.ssh != null) || (r.rdp != null) || ((r.intelamt != null) && ((r.intelamt.pass != null) || (r.intelamt.mpspass != null)))) {
             r = Object.assign({}, r); // Shallow clone
             if (r.pmt != null) { r.pmt = 1; }
-            if (r.ssh != null) { r.ssh = (r.ssh.k != null) ? 2 : 1; }
-            if (r.rdp != null) { r.rdp = 1; }
+            if (r.ssh != null) {
+                var n = {};
+                for (var i in r.ssh) {
+                    if (i.startsWith('user/')) {
+                        if (r.ssh[i].p) { n[i] = 1; } // Username and password
+                        else if (r.ssh[i].k && r.ssh[i].kp) { n[i] = 2; } // Username, key and password
+                        else if (r.ssh[i].k) { n[i] = 3; } // Username and key. No password.
+                    }
+                }
+                r.ssh = n;
+            }
+            if (r.rdp != null) { var n = {}; for (var i in r.rdp) { if (i.startsWith('user/')) { n[i] = 1; } } r.rdp = n; }
             if ((r.intelamt != null) && ((r.intelamt.pass != null) || (r.intelamt.mpspass != null))) {
                 r.intelamt = Object.assign({}, r.intelamt); // Shallow clone
                 if (r.intelamt.pass != null) { r.intelamt.pass = 1; }; // Remove the Intel AMT administrator password from the node
@@ -7410,8 +9009,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     }
 
     // Filter the user web site and only output state that we need to keep
-    const acceptableUserWebStateStrings = ['webPageStackMenu', 'notifications', 'deviceView', 'nightMode', 'webPageFullScreen', 'search', 'showRealNames', 'sort', 'deskAspectRatio', 'viewsize', 'DeskControl', 'uiMode', 'footerBar'];
-    const acceptableUserWebStateDesktopStrings = ['encoding', 'showfocus', 'showmouse', 'showcad', 'limitFrameRate', 'noMouseRotate', 'quality', 'scaling']
+    const acceptableUserWebStateStrings = ['webPageStackMenu', 'notifications', 'deviceView', 'nightMode', 'webPageFullScreen', 'search', 'showRealNames', 'sort', 'deskAspectRatio', 'viewsize', 'DeskControl', 'uiMode', 'footerBar','loctag','theme','lastThemes'];
+    const acceptableUserWebStateDesktopStrings = ['encoding', 'showfocus', 'showmouse', 'showcad', 'limitFrameRate', 'noMouseRotate', 'quality', 'scaling', 'agentencoding']
     obj.filterUserWebState = function (state) {
         if (typeof state == 'string') { try { state = JSON.parse(state); } catch (ex) { return null; } }
         if ((state == null) || (typeof state != 'object')) { return null; }
@@ -7432,6 +9031,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
         if ((typeof state.deskKeyShortcuts == 'string') && (state.deskKeyShortcuts.length < 2048)) { out.deskKeyShortcuts = state.deskKeyShortcuts; }
         if ((typeof state.deskStrings == 'string') && (state.deskStrings.length < 10000)) { out.deskStrings = state.deskStrings; }
+        if ((typeof state.runopt == 'string') && (state.runopt.length < 30000)) { out.runopt = state.runopt; }
         return JSON.stringify(out);
     }
 
@@ -7440,6 +9040,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         var mobile = isMobileBrowser(req), minify = (domain.minify == true), p;
         if (req.query.mobile == '1') { mobile = true; } else if (req.query.mobile == '0') { mobile = false; }
         if (req.query.minify == '1') { minify = true; } else if (req.query.minify == '0') { minify = false; }
+        if ((domain != null) && (domain.mobilesite === false)) { mobile = false; }
         if (mobile) {
             if ((domain != null) && (domain.webviewspath != null)) { // If the domain has a web views path, use that first
                 if (minify) {
@@ -7513,8 +9114,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }
         xargs.extitle = encodeURIComponent(xargs.title).split('\'').join('\\\'');
         xargs.domainurl = domain.url;
-        xargs.autocomplete = (domain.autocomplete === false)?'x':'autocomplete'; // This option allows autocomplete to be turned off on the login page.
+        xargs.autocomplete = (domain.autocomplete === false) ? 'autocomplete=off x' : 'autocomplete'; // This option allows autocomplete to be turned off on the login page.
         if (typeof domain.hide == 'number') { xargs.hide = domain.hide; }
+
+        // To mitigate any possible BREACH attack, we generate a random 0 to 255 bytes length string here.
+        xargs.randomlength = (args.webpagelengthrandomization !== false) ? parent.crypto.randomBytes(parent.crypto.randomBytes(1)[0]).toString('base64') : '';
+
         return xargs;
     }
 
@@ -7620,9 +9225,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (obj.renderPages != null) {
             // Get the list of acceptable languages in order
             var acceptLanguages = obj.getLanguageCodes(req);
-
+            var domain = getDomain(req);
             // Take a look at the options we have for this file
-            var fileOptions = obj.renderPages[obj.path.basename(filename)];
+            var fileOptions = obj.renderPages[domain.id][obj.path.basename(filename)];
             if (fileOptions != null) {
                 for (var i in acceptLanguages) {
                     if ((acceptLanguages[i] == 'en') || (acceptLanguages[i].startsWith('en-'))) {
@@ -7631,12 +9236,24 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                         if (user && user.llang) { delete user.llang; obj.db.SetUser(user); } // Clear user 'last language' used if needed. Since English is the default, remove "last language".
                         break;
                     }
-                    if (fileOptions[acceptLanguages[i]] != null) {
+
+                    // See if a language (like "fr-ca") or short-language (like "fr") matches an available translation file.
+                    var foundLanguage = null;
+                    if (fileOptions[acceptLanguages[i]] != null) { foundLanguage = acceptLanguages[i]; } else {
+                        const ptr = acceptLanguages[i].indexOf('-');
+                        if (ptr >= 0) {
+                            const shortAcceptedLanguage = acceptLanguages[i].substring(0, ptr);
+                            if (fileOptions[shortAcceptedLanguage] != null) { foundLanguage = shortAcceptedLanguage; }
+                        }
+                    }
+
+                    // If a language is found, render it.
+                    if (foundLanguage != null) {
                         // Found a match. If the file no longer exists, default to English.
-                        obj.fs.exists(fileOptions[acceptLanguages[i]] + '.handlebars', function (exists) {
-                            if (exists) { args.lang = acceptLanguages[i]; res.render(fileOptions[acceptLanguages[i]], args); } else { args.lang = 'en'; res.render(filename, args); }
+                        obj.fs.exists(fileOptions[foundLanguage] + '.handlebars', function (exists) {
+                            if (exists) { args.lang = foundLanguage; res.render(fileOptions[foundLanguage], args); } else { args.lang = 'en'; res.render(filename, args); }
                         });
-                        if (user && (user.llang != acceptLanguages[i])) { user.llang = acceptLanguages[i]; obj.db.SetUser(user); }  // Set user 'last language' used if needed.
+                        if (user && (user.llang != foundLanguage)) { user.llang = foundLanguage; obj.db.SetUser(user); }  // Set user 'last language' used if needed.
                         return;
                     }
                 }
@@ -7657,33 +9274,55 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (translateFolder != null) {
             obj.renderPages = {};
             obj.renderLanguages = ['en'];
-            var files = obj.fs.readdirSync(translateFolder);
-            for (var i in files) {
-                var name = files[i];
-                if (name.endsWith('.handlebars')) {
-                    name = name.substring(0, name.length - 11);
-                    var xname = name.split('_');
-                    if (xname.length == 2) {
-                        if (obj.renderPages[xname[0]] == null) { obj.renderPages[xname[0]] = {}; }
-                        obj.renderPages[xname[0]][xname[1]] = obj.path.join(translateFolder, name);
-                        if (obj.renderLanguages.indexOf(xname[1]) == -1) { obj.renderLanguages.push(xname[1]); }
-                    }
-                }
-            }
-
-            // See if there are any custom rending pages that will override the default ones
-            if ((obj.parent.webViewsOverridePath != null) && (obj.fs.existsSync(obj.path.join(obj.parent.webViewsOverridePath, 'translations')))) {
-                translateFolder = obj.path.join(obj.parent.webViewsOverridePath, 'translations');
+            for (var i in parent.config.domains) {
+                if (obj.fs.existsSync('views/translations')) { translateFolder = 'views/translations'; }
+                if (obj.fs.existsSync(obj.path.join(__dirname, 'views', 'translations'))) { translateFolder = obj.path.join(__dirname, 'views', 'translations'); }
                 var files = obj.fs.readdirSync(translateFolder);
+                var domain = parent.config.domains[i].id;
+                obj.renderPages[domain] = {};
                 for (var i in files) {
                     var name = files[i];
                     if (name.endsWith('.handlebars')) {
                         name = name.substring(0, name.length - 11);
                         var xname = name.split('_');
                         if (xname.length == 2) {
-                            if (obj.renderPages[xname[0]] == null) { obj.renderPages[xname[0]] = {}; }
-                            obj.renderPages[xname[0]][xname[1]] = obj.path.join(translateFolder, name);
+                            if (obj.renderPages[domain][xname[0]] == null) { obj.renderPages[domain][xname[0]] = {}; }
+                            obj.renderPages[domain][xname[0]][xname[1]] = obj.path.join(translateFolder, name);
                             if (obj.renderLanguages.indexOf(xname[1]) == -1) { obj.renderLanguages.push(xname[1]); }
+                        }
+                    }
+                }
+                // See if there are any custom rending pages that will override the default ones
+                if ((obj.parent.webViewsOverridePath != null) && (obj.fs.existsSync(obj.path.join(obj.parent.webViewsOverridePath, 'translations')))) {
+                    translateFolder = obj.path.join(obj.parent.webViewsOverridePath, 'translations');
+                    var files = obj.fs.readdirSync(translateFolder);
+                    for (var i in files) {
+                        var name = files[i];
+                        if (name.endsWith('.handlebars')) {
+                            name = name.substring(0, name.length - 11);
+                            var xname = name.split('_');
+                            if (xname.length == 2) {
+                                if (obj.renderPages[domain][xname[0]] == null) { obj.renderPages[domain][xname[0]] = {}; }
+                                obj.renderPages[domain][xname[0]][xname[1]] = obj.path.join(translateFolder, name);
+                                if (obj.renderLanguages.indexOf(xname[1]) == -1) { obj.renderLanguages.push(xname[1]); }
+                            }
+                        }
+                    }
+                }
+                // See if there is a custom meshcentral-web-domain folder as that will override the default ones
+                if (obj.fs.existsSync(obj.path.join(__dirname, '..', 'meshcentral-web-' + domain, 'views', 'translations'))) {
+                    translateFolder = obj.path.join(__dirname, '..', 'meshcentral-web-' + domain, 'views', 'translations');
+                    var files = obj.fs.readdirSync(translateFolder);
+                    for (var i in files) {
+                        var name = files[i];
+                        if (name.endsWith('.handlebars')) {
+                            name = name.substring(0, name.length - 11);
+                            var xname = name.split('_');
+                            if (xname.length == 2) {
+                                if (obj.renderPages[domain][xname[0]] == null) { obj.renderPages[domain][xname[0]] = {}; }
+                                obj.renderPages[domain][xname[0]][xname[1]] = obj.path.join(translateFolder, name);
+                                if (obj.renderLanguages.indexOf(xname[1]) == -1) { obj.renderLanguages.push(xname[1]); }
+                            }
                         }
                     }
                 }
@@ -7772,7 +9411,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
     }
 
-    // Insure exclusivity of a push messaging token for Android device
+    // Ensure exclusivity of a push messaging token for Android device
     obj.removePmtFromAllOtherNodes = function (node) {
         if (typeof node.pmt != 'string') return;
         db.Get('pmt_' + node.pmt, function (err, docs) {
@@ -7790,7 +9429,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                             var event = { etype: 'node', action: 'changenode', nodeid: oldNode._id, domain: oldNode.domain, node: obj.CloneSafeNode(oldNode) }
                             if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the mesh. Another event will come.
                             parent.DispatchEvent(['*', oldNode.meshid, oldNode._id], obj, event);
-                        } 
+                        }
                     }
                 });
             }
@@ -7808,18 +9447,37 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     }
 
     // Return decoded user agent information
-    function getUserAgentInfo(req) {
+    obj.getUserAgentInfo = function (req) {
         var browser = 'Unknown', os = 'Unknown';
         try {
-            const ua = obj.uaparser(req.headers['user-agent']);
+            const ua = obj.uaparser((typeof req == 'string') ? req : req.headers['user-agent']);
             if (ua.browser && ua.browser.name) { ua.browserStr = ua.browser.name; if (ua.browser.version) { ua.browserStr += '/' + ua.browser.version } }
             if (ua.os && ua.os.name) { ua.osStr = ua.os.name; if (ua.os.version) { ua.osStr += '/' + ua.os.version } }
             return ua;
         } catch (ex) { return { browserStr: browser, osStr: os } }
     }
 
-    // Return the query string portion of the URL, the ? and anything after.
-    function getQueryPortion(req) { var s = req.url.indexOf('?'); if (s == -1) { if (req.body && req.body.urlargs) { return req.body.urlargs; } return ''; } return req.url.substring(s); }
+    // Return the query string portion of the URL, the ? and anything after BUT remove secret keys from authentication providers    
+    function getQueryPortion(req) {
+        var removeKeys = ['duo_code', 'state']; // Keys to remove 
+        var s = req.url.indexOf('?');
+        if (s == -1) {
+            if (req.body && req.body.urlargs) {
+                return req.body.urlargs;
+            }
+            return '';
+        }
+        var queryString = req.url.substring(s + 1);
+        var params = queryString.split('&');
+        var filteredParams = [];
+        for (var i = 0; i < params.length; i++) {
+            var key = params[i].split('=')[0];
+            if (removeKeys.indexOf(key) === -1) {
+                filteredParams.push(params[i]);
+            }
+        }
+        return (filteredParams.length > 0 ? ('?' + filteredParams.join('&')) : '');
+      }
 
     // Generate a random Intel AMT password
     function checkAmtPassword(p) { return (p.length > 7) && (/\d/.test(p)) && (/[a-z]/.test(p)) && (/[A-Z]/.test(p)) && (/\W/.test(p)); }
@@ -8036,6 +9694,169 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         var toRemove = [], t = Date.now() - (2 * 60 * 60 * 1000);
         for (var i in obj.destroyedSessions) { if (obj.destroyedSessions[i] < t) { toRemove.push(i); } }
         for (var i in toRemove) { delete obj.destroyedSessions[toRemove[i]]; }
+    }
+
+    // Check and/or convert the agent color value into a correct string or return empty string.
+    function checkAgentColorString(header, value) {
+        if ((typeof header !== 'string') || (typeof value !== 'string')) return '';
+        if (value.startsWith('#') && (value.length == 7)) {
+            // Convert color in hex format
+            value = parseInt(value.substring(1, 3), 16) + ',' + parseInt(value.substring(3, 5), 16) + ',' + parseInt(value.substring(5, 7), 16);
+        } else {
+            // Check color in decimal format
+            const valueSplit = value.split(',');
+            if (valueSplit.length != 3) return '';
+            const r = parseInt(valueSplit[0]), g = parseInt(valueSplit[1]), b = parseInt(valueSplit[2]);
+            if (isNaN(r) || (r < 0) || (r > 255) || isNaN(g) || (g < 0) || (g > 255) || isNaN(b) || (b < 0) || (b > 255)) return '';
+            value = r + ',' + g + ',' + b;
+        }
+        return header + value + '\r\n';
+    }
+
+    // Check that everything is cleaned up
+    function checkWebRelaySessionsTimeout() {
+        for (var i in webRelaySessions) { webRelaySessions[i].checkTimeout(); }
+    }
+
+    // Return true if this is a private IP address
+    function isPrivateAddress(ip_addr) {
+        // If this is a loopback address, return true
+        if ((ip_addr == '127.0.0.1') || (ip_addr == '::1')) return true;
+
+        // Check IPv4 private addresses
+        const ipcheck = require('ipcheck');
+        const IPv4PrivateRanges = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.0.0/29', '192.0.0.8/32', '192.0.0.9/32', '192.0.0.10/32', '192.0.0.170/32', '192.0.0.171/32', '192.0.2.0/24', '192.31.196.0/24', '192.52.193.0/24', '192.88.99.0/24', '192.168.0.0/16', '192.175.48.0/24', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '240.0.0.0/4', '255.255.255.255/32']
+        for (var i in IPv4PrivateRanges) { if (ipcheck.match(ip_addr, IPv4PrivateRanges[i])) return true; }
+
+        // Check IPv6 private addresses
+        return /^::$/.test(ip_addr) ||
+            /^::1$/.test(ip_addr) ||
+            /^::f{4}:([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip_addr) ||
+            /^::f{4}:0.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip_addr) ||
+            /^64:ff9b::([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.test(ip_addr) ||
+            /^100::([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4})$/.test(ip_addr) ||
+            /^2001::([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4})$/.test(ip_addr) ||
+            /^2001:2[0-9a-fA-F]:([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4})$/.test(ip_addr) ||
+            /^2001:db8:([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4})$/.test(ip_addr) ||
+            /^2002:([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4}):?([0-9a-fA-F]{0,4})$/.test(ip_addr) ||
+            /^f[c-d]([0-9a-fA-F]{2,2}):/i.test(ip_addr) ||
+            /^fe[8-9a-bA-B][0-9a-fA-F]:/i.test(ip_addr) ||
+            /^ff([0-9a-fA-F]{2,2}):/i.test(ip_addr)
+    }
+
+    // Check that a cookie IP is within the correct range depending on the active policy
+    function checkCookieIp(cookieip, ip) {
+        if (obj.args.cookieipcheck == 'none') return true; // 'none' - No IP address checking
+        if (obj.args.cookieipcheck == 'strict') return (cookieip == ip); // 'strict' - Strict IP address checking, this can cause issues with HTTP proxies or load-balancers.
+        if (require('ipcheck').match(cookieip, ip + '/24')) return true; // 'lax' - IP address need to be in the some range
+        return (isPrivateAddress(cookieip) && isPrivateAddress(ip)); // 'lax' - If both IP addresses are private or loopback, accept it. This is needed because sometimes browsers will resolve IP addresses oddly on private networks.
+    }
+
+    // Takes a formating string like "this {{{a}}} is an {{{b}}} example" and fills the a and b with input o.a and o.b
+    function assembleStringFromObject(format, o) {
+        var r = '', i = format.indexOf('{{{');
+        if (i > 0) { r = format.substring(0, i); format = format.substring(i); }
+        const cmd = format.split('{{{');
+        for (var j in cmd) { if (j == 0) continue; i = cmd[j].indexOf('}}}'); r += o[cmd[j].substring(0, i)] + cmd[j].substring(i + 3); }
+        return r;
+    }
+
+    // Sync an account with an external user group.
+    // Return true if the user was changed
+    function syncExternalUserGroups(domain, user, userMemberships, userMembershipType) {
+        var userChanged = false;
+        if (user.links == null) { user.links = {}; }
+
+        // Create a user of memberships for this user that type
+        var existingUserMemberships = {};
+        for (var i in user.links) {
+            if (i.startsWith('ugrp/') && (obj.userGroups[i] != null) && (obj.userGroups[i].membershipType == userMembershipType)) { existingUserMemberships[i] = obj.userGroups[i]; }
+        }
+
+        // Go thru the list user memberships and create and add to any user groups as needed
+        for (var i in userMemberships) {
+            const membership = userMemberships[i];
+            var ugrpid = 'ugrp/' + domain.id + '/' + obj.crypto.createHash('sha384').update(membership).digest('base64').replace(/\+/g, '@').replace(/\//g, '$');
+            var ugrp = obj.userGroups[ugrpid];
+            if (ugrp == null) {
+                // This user group does not exist, create it
+                ugrp = { type: 'ugrp', _id: ugrpid, name: membership, domain: domain.id, membershipType: userMembershipType, links: {} };
+
+                // Save the new group
+                db.Set(ugrp);
+                if (db.changeStream == false) { obj.userGroups[ugrpid] = ugrp; }
+
+                // Event the user group creation
+                var event = { etype: 'ugrp', ugrpid: ugrpid, name: ugrp.name, action: 'createusergroup', links: ugrp.links, msgid: 69, msgArgv: [ugrp.name], msg: 'User group created: ' + ugrp.name, ugrpdomain: domain.id };
+                parent.DispatchEvent(['*', ugrpid, user._id], obj, event); // Even if DB change stream is active, this event must be acted upon.
+
+                // Log in the auth log
+                parent.authLog('https', userMembershipType.toUpperCase() + ': Created user group ' + ugrp.name);
+            }
+
+            if (existingUserMemberships[ugrpid] == null) {
+                // This user is not part of the user group, add it.
+                if (user.links == null) { user.links = {}; }
+                user.links[ugrp._id] = { rights: 1 };
+                userChanged = true;
+                db.SetUser(user);
+                parent.DispatchEvent([user._id], obj, 'resubscribe');
+
+                // Notify user change
+                var targets = ['*', 'server-users', user._id];
+                var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 67, msgArgs: [user.name], msg: 'User group membership changed: ' + user.name, domain: domain.id };
+                if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
+                parent.DispatchEvent(targets, obj, event);
+
+                // Add a user to the user group
+                ugrp.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
+                db.Set(ugrp);
+
+                // Notify user group change
+                var event = { etype: 'ugrp', userid: user._id, username: user.name, ugrpid: ugrp._id, name: ugrp.name, desc: ugrp.desc, action: 'usergroupchange', links: ugrp.links, msgid: 71, msgArgs: [user.name, ugrp.name], msg: 'Added user(s) ' + user.name + ' to user group ' + ugrp.name, addUserDomain: domain.id };
+                if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
+                parent.DispatchEvent(['*', ugrp._id, user._id], obj, event);
+
+                // Log in the auth log
+                parent.authLog('https', userMembershipType.toUpperCase() + ': Adding ' + user.name + ' to user group ' + userMemberships[i] + '.');
+            } else {
+                // User is already part of this user group
+                delete existingUserMemberships[ugrpid];
+            }
+        }
+
+        // Remove the user from any memberships they don't belong to anymore
+        for (var ugrpid in existingUserMemberships) {
+            var ugrp = obj.userGroups[ugrpid];
+            parent.authLog('https', userMembershipType.toUpperCase() + ': Removing ' + user.name + ' from user group ' + ugrp.name + '.');
+            if ((user.links != null) && (user.links[ugrpid] != null)) {
+                delete user.links[ugrpid];
+
+                // Notify user change
+                var targets = ['*', 'server-users', user._id, user._id];
+                var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountchange', msgid: 67, msgArgs: [user.name], msg: 'User group membership changed: ' + user.name, domain: domain.id };
+                if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user. Another event will come.
+                parent.DispatchEvent(targets, obj, event);
+
+                db.SetUser(user);
+                parent.DispatchEvent([user._id], obj, 'resubscribe');
+            }
+
+            if (ugrp != null) {
+                // Remove the user from the group
+                if ((ugrp.links != null) && (ugrp.links[user._id] != null)) {
+                    delete ugrp.links[user._id];
+                    db.Set(ugrp);
+
+                    // Notify user group change
+                    var event = { etype: 'ugrp', userid: user._id, username: user.name, ugrpid: ugrp._id, name: ugrp.name, desc: ugrp.desc, action: 'usergroupchange', links: ugrp.links, msgid: 72, msgArgs: [user.name, ugrp.name], msg: 'Removed user ' + user.name + ' from user group ' + ugrp.name, domain: domain.id };
+                    if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
+                    parent.DispatchEvent(['*', ugrp._id, user._id], obj, event);
+                }
+            }
+        }
+
+        return userChanged;
     }
 
     return obj;

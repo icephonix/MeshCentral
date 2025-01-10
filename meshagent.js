@@ -58,15 +58,15 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         dataAccounting();
 
         if ((arg == 1) || (arg == null)) { try { ws.close(); if (obj.nodeid != null) { parent.parent.debug('agent', 'Soft disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')'); } } catch (e) { console.log(e); } } // Soft close, close the websocket
-        if (arg == 2) { 
-            try { 
+        if (arg == 2) {
+            try {
                 if (ws._socket._parent != null)
                     ws._socket._parent.end();
                 else
                     ws._socket.end();
-                
-                if (obj.nodeid != null) { 
-                    parent.parent.debug('agent', 'Hard disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')'); 
+
+                if (obj.nodeid != null) {
+                    parent.parent.debug('agent', 'Hard disconnect ' + obj.nodeid + ' (' + obj.remoteaddrport + ')');
                 }
             } catch (e) { console.log(e); }
         }
@@ -269,7 +269,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
             else if (cmdid == 12) { // MeshCommand_AgentHash
                 if ((msg.length == 52) && (obj.agentExeInfo != null) && (obj.agentExeInfo.update == true)) {
                     const agenthash = msg.substring(4);
-                    const agentUpdateMethod = compareAgentBinaryHash(obj.agentExeInfo, agenthash)
+                    const agentUpdateMethod = compareAgentBinaryHash(obj.agentExeInfo, agenthash);
                     if (agentUpdateMethod === 2) { // Use meshcore agent update system
                         // Send the recovery core to the agent, if the agent is capable of running one
                         if (((obj.agentInfo.capabilities & 16) != 0) && (parent.parent.meshAgentsArchitectureNumbers[obj.agentInfo.agentId].core != null)) {
@@ -616,7 +616,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         }
 
         if ((mesh == null) && (typeof domain.orphanagentuser == 'string')) {
-            const adminUser = parent.users['user/' + domain.id + '/' + domain.orphanagentuser.toLowerCase()];
+            const adminUser = parent.users['user/' + domain.id + '/' + domain.orphanagentuser];
             if ((adminUser != null) && (adminUser.siteadmin == 0xFFFFFFFF)) {
                 // Mesh name is hex instead of base64
                 const meshname = obj.meshid.substring(0, 18);
@@ -927,6 +927,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         // Not sure why, but in rare cases, obj.agentInfo is undefined here.
         if ((obj.agentInfo == null) || (typeof obj.agentInfo.capabilities != 'number')) { return; } // This is an odd case.
         obj.agentExeInfo = parent.parent.meshAgentBinaries[obj.agentInfo.agentId];
+        if (domain.meshAgentBinaries && domain.meshAgentBinaries[obj.agentInfo.agentId]) { obj.agentExeInfo = domain.meshAgentBinaries[obj.agentInfo.agentId]; }
 
         // Check if this agent is reconnecting too often.
         if (disconnectCount > 4) {
@@ -1057,7 +1058,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
             db.Get('iploc_' + obj.remoteaddr, function (err, iplocs) {
                 if ((iplocs != null) && (iplocs.length == 1)) {
                     // We have a location in the database for this remote IP
-                    const iploc = nodes[0], x = {};
+                    const iploc = iplocs[0], x = {};
                     if ((iploc != null) && (iploc.ip != null) && (iploc.loc != null)) {
                         x.publicip = iploc.ip;
                         x.iploc = iploc.loc + ',' + (Math.floor((new Date(iploc.date)) / 1000));
@@ -1066,10 +1067,10 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                 } else {
                     // Check if we need to ask for the IP location
                     var doIpLocation = 0;
-                    if (device.iploc == null) {
+                    if (obj.iploc == null) {
                         doIpLocation = 1;
                     } else {
-                        const loc = device.iploc.split(',');
+                        const loc = obj.iploc.split(',');
                         if (loc.length < 3) {
                             doIpLocation = 2;
                         } else {
@@ -1362,6 +1363,16 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                             }
                             if ((typeof command.sessionid == 'string') && (command.sessionid.length < 500)) { event.sessionid = command.sessionid; }
                             parent.parent.DispatchEvent(targets, obj, event);
+
+                            // If this is a help request, see if we need to email notify anyone
+                            if (event.msgid == 98) {
+                                // Get the node and change it if needed
+                                db.Get(obj.dbNodeKey, function (err, nodes) { // TODO: THIS IS A BIG RACE CONDITION HERE, WE NEED TO FIX THAT. If this call is made twice at the same time on the same device, data will be missed.
+                                    if ((nodes == null) || (nodes.length != 1)) { delete obj.deviceChanging; return; }
+                                    const device = nodes[0];
+                                    if (typeof device.name == 'string') { parent.parent.NotifyUserOfDeviceHelpRequest(domain, device.meshid, device._id, device.name, command.msgArgs[0], command.msgArgs[1]); }
+                                });
+                            }
                         }
                         break;
                     }
@@ -1731,8 +1742,15 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     }
                     break;
                 }
-                case 'scriptTask': {
-                    // TODO
+                case 'amtconfig': {
+                    // Sent by the agent when the agent needs a Intel AMT APF connection to the server
+                    const cookie = parent.parent.encodeCookie({ a: 'apf', n: obj.dbNodeKey, m: obj.dbMeshKey }, parent.parent.loginCookieEncryptionKey);
+                    try { obj.send(JSON.stringify({ action: 'amtconfig', user: '**MeshAgentApfTunnel**', pass: cookie })); } catch (ex) { }
+                    break;
+                }
+                case 'script-task': {
+                    // These command are for running regular batch jobs on the remote device
+                    if (parent.parent.taskManager != null) { parent.parent.taskManager.agentAction(command, obj); }
                     break;
                 }
                 default: {
@@ -1757,7 +1775,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         if (inviteCookie == null) return;
 
         // Create the server url
-        var serverName = parent.getWebServerName(domain);
+        var serverName = parent.getWebServerName(domain, req);
         var httpsPort = ((args.aliasport == null) ? args.port : args.aliasport); // Use HTTPS alias port is specified
         var xdomain = (domain.dns == null) ? domain.id : '';
         if (xdomain != '') xdomain += '/';
@@ -1824,7 +1842,7 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
             // Event device share removal
             if (removedExact != null) {
                 // Send out an event that we removed a device share
-                var targets = parent.CreateNodeDispatchTargets(obj.dbMeshKey, obj.dbNodeKey, []);
+                var targets = parent.CreateNodeDispatchTargets(obj.dbMeshKey, obj.dbNodeKey, ['server-shareremove']);
                 var event = { etype: 'node', nodeid: obj.dbNodeKey, action: 'removedDeviceShare', msg: 'Removed Device Share', msgid: 102, msgArgs: ['Agent'], domain: domain.id, publicid: publicid };
                 parent.parent.DispatchEvent(targets, obj, event);
             }
@@ -1882,7 +1900,10 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     if (!device.intelamt) { device.intelamt = {}; }
                     if ((command.intelamt.Versions != null) && (typeof command.intelamt.Versions == 'object')) {
                         if ((command.intelamt.Versions.AMT != null) && (typeof command.intelamt.Versions.AMT == 'string') && (command.intelamt.Versions.AMT.length < 12) && (device.intelamt.ver != command.intelamt.Versions.AMT)) { changes.push('AMT version'); device.intelamt.ver = command.intelamt.Versions.AMT; change = 1; log = 1; }
-                        if ((command.intelamt.Versions.Sku != null) && (typeof command.intelamt.Versions.Sku == 'string')) { var sku = parseInt(command.intelamt.Versions.Sku); if (device.intelamt.sku !== command.intelamt.sku) { device.intelamt.sku = sku; change = 1; log = 1; } }
+                        if ((command.intelamt.Versions.Sku != null) && (typeof command.intelamt.Versions.Sku == 'string')) {
+                            const sku = parseInt(command.intelamt.Versions.Sku);
+                            if (device.intelamt.sku !== sku) { device.intelamt.sku = sku; change = 1; log = 1; }
+                        }
                     }
                     if ((command.intelamt.ProvisioningState != null) && (typeof command.intelamt.ProvisioningState == 'number') && (device.intelamt.state != command.intelamt.ProvisioningState)) { changes.push('AMT state'); device.intelamt.state = command.intelamt.ProvisioningState; change = 1; log = 1; }
                     if ((command.intelamt.Flags != null) && (typeof command.intelamt.Flags == 'number') && (device.intelamt.flags != command.intelamt.Flags)) {
@@ -1899,6 +1920,14 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     if (!device.wsc) { device.wsc = {}; }
                     if (JSON.stringify(device.wsc) != JSON.stringify(command.wsc)) { /*changes.push('Windows Security Center status');*/ device.wsc = command.wsc; change = 1; log = 1; }
                 }
+                if (command.defender != null) { // Defender For Windows Server
+                    if (!device.defender) { device.defender = {}; }
+                    if (JSON.stringify(device.defender) != JSON.stringify(command.defender)) { /*changes.push('Defender status');*/ device.defender = command.defender; change = 1; log = 1; }
+                }
+                if (command.lastbootuptime != null) { // Last Boot Up Time
+                    if (!device.lastbootuptime) { device.lastbootuptime = ""; }
+                    if (device.lastbootuptime != command.lastbootuptime) { /*changes.push('Last Boot Up Time');*/ device.lastbootuptime = command.lastbootuptime; change = 1; log = 1; }
+                }
 
                 // Push Messaging Token
                 if ((command.pmt != null) && (typeof command.pmt == 'string') && (device.pmt != command.pmt)) {
@@ -1914,6 +1943,9 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     if (device.host != obj.remoteaddr) { device.host = obj.remoteaddr; change = 1; changes.push('host'); }
                     // TODO: Check that the agent has an interface that is the same as the one we got this websocket connection on. Only set if we have a match.
                 }
+
+                // Remove old volumes and BitLocker data, this is part of sysinfo.
+                delete device.volumes;
 
                 // If there are changes, event the new device
                 if (change == 1) {
@@ -2093,7 +2125,13 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
         // If the hash matches or is null, no update required.
         if ((agentExeInfo.hash == agentHash) || (agentHash == '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0')) return 0;
         // If this is a macOS x86 or ARM agent type and it matched the universal binary, no update required.
-        if (((agentExeInfo.id == 16) || (agentExeInfo.id == 29)) && (parent.parent.meshAgentBinaries[10005].hash == agentHash)) return 0;
+        if ((agentExeInfo.id == 16) || (agentExeInfo.id == 29)) {
+            if (domain.meshAgentBinaries && domain.meshAgentBinaries[10005]) {
+                if (domain.meshAgentBinaries[10005].hash == agentHash) return 0;
+            } else {
+                if (parent.parent.meshAgentBinaries[10005].hash == agentHash) return 0;
+            }
+        }
 
         // No match, update the agent.
         if (args.agentupdatesystem === 2) return 2; // If set, force a meshcore update.

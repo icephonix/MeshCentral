@@ -26,11 +26,12 @@ module.exports.CreateMeshMail = function (parent, domain) {
     obj.mailCookieEncryptionKey = null;
     obj.verifyemail = false;
     obj.domain = domain;
+    obj.emailDelay = 5 * 60 * 1000; // Default of 5 minute email delay.
     //obj.mailTemplates = {};
     const sortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
     const constants = (obj.parent.crypto.constants ? obj.parent.crypto.constants : require('constants')); // require('constants') is deprecated in Node 11.10, use require('crypto').constants instead.
 
-    function EscapeHtml(x) { if (typeof x == "string") return x.replace(/&/g, '&amp;').replace(/>/g, '&gt;').replace(/</g, '&lt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); if (typeof x == "boolean") return x; if (typeof x == "number") return x; }
+    function EscapeHtml(x) { if (typeof x == 'string') return x.replace(/&/g, '&amp;').replace(/>/g, '&gt;').replace(/</g, '&lt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); if (typeof x == "boolean") return x; if (typeof x == "number") return x; }
     //function EscapeHtmlBreaks(x) { if (typeof x == "string") return x.replace(/&/g, '&amp;').replace(/>/g, '&gt;').replace(/</g, '&lt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\r/g, '<br />').replace(/\n/g, '').replace(/\t/g, '&nbsp;&nbsp;'); if (typeof x == "boolean") return x; if (typeof x == "number") return x; }
 
     // Setup where we read our configuration from
@@ -41,19 +42,38 @@ module.exports.CreateMeshMail = function (parent, domain) {
         obj.sendGridServer = require('@sendgrid/mail');
         obj.sendGridServer.setApiKey(obj.config.sendgrid.apikey);
         if (obj.config.sendgrid.verifyemail == true) { obj.verifyemail = true; }
+        if ((typeof obj.config.sendgrid.emaildelayseconds == 'number') && (obj.config.sendgrid.emaildelayseconds > 0)) { obj.emailDelay = obj.config.sendgrid.emaildelayseconds * 1000; }
     } else if (obj.config.smtp != null) {
         // Setup SMTP mail server
-        const nodemailer = require('nodemailer');
-        var options = { host: obj.config.smtp.host, secure: (obj.config.smtp.tls == true), tls: {} };
-        //var options = { host: obj.config.smtp.host, secure: (obj.config.smtp.tls == true), tls: { secureProtocol: 'SSLv23_method', ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE, rejectUnauthorized: false } };
-        if (obj.config.smtp.port != null) { options.port = obj.config.smtp.port; }
-        if (obj.config.smtp.tlscertcheck === false) { options.tls.rejectUnauthorized = false; }
-        if (obj.config.smtp.tlsstrict === true) { options.tls.secureProtocol = 'SSLv23_method'; options.tls.ciphers = 'RSA+AES:!aNULL:!MD5:!DSS'; options.tls.secureOptions = constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE; }
-        if ((obj.config.smtp.user != null) && (obj.config.smtp.pass != null)) { options.auth = { user: obj.config.smtp.user, pass: obj.config.smtp.pass }; }
-        if (obj.config.smtp.verifyemail == true) { obj.verifyemail = true; }
-        obj.smtpServer = nodemailer.createTransport(options);
+        if ((typeof obj.config.smtp.emaildelayseconds == 'number') && (obj.config.smtp.emaildelayseconds > 0)) { obj.emailDelay = obj.config.smtp.emaildelayseconds * 1000; }
+        if (obj.config.smtp.name == 'console') {
+            // This is for debugging, the mails will be displayed on the console
+            obj.smtpServer = 'console';
+        } else {
+            const nodemailer = require('nodemailer');
+            var options = { name: obj.config.smtp.name, host: obj.config.smtp.host, secure: (obj.config.smtp.tls == true), tls: {} };
+            //var options = { host: obj.config.smtp.host, secure: (obj.config.smtp.tls == true), tls: { secureProtocol: 'SSLv23_method', ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE, rejectUnauthorized: false } };
+            if (obj.config.smtp.port != null) { options.port = obj.config.smtp.port; }
+            if (obj.config.smtp.tlscertcheck === false) { options.tls.rejectUnauthorized = false; }
+            if (obj.config.smtp.tlsstrict === true) { options.tls.secureProtocol = 'SSLv23_method'; options.tls.ciphers = 'RSA+AES:!aNULL:!MD5:!DSS'; options.tls.secureOptions = constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE; }
+            if ((obj.config.smtp.auth != null) && (typeof obj.config.smtp.auth == 'object')) {
+                var user = obj.config.smtp.from;
+                if ((user == null) && (obj.config.smtp.user != null)) { user = obj.config.smtp.user; }
+                if ((obj.config.smtp.auth.user != null) && (typeof obj.config.smtp.auth.user == 'string')) { user = obj.config.smtp.auth.user; }
+                if (user.toLowerCase().endsWith('@gmail.com')) { options = { service: 'gmail', auth: { user: user } }; obj.config.smtp.host = 'gmail'; } else { options.auth = { user: user } }
+                if (obj.config.smtp.auth.type) { options.auth.type = obj.config.smtp.auth.type; }
+                if (obj.config.smtp.auth.clientid) { options.auth.clientId = obj.config.smtp.auth.clientid; options.auth.type = 'OAuth2'; }
+                if (obj.config.smtp.auth.clientsecret) { options.auth.clientSecret = obj.config.smtp.auth.clientsecret; }
+                if (obj.config.smtp.auth.refreshtoken) { options.auth.refreshToken = obj.config.smtp.auth.refreshtoken; }
+            }
+            else if ((obj.config.smtp.user != null) && (obj.config.smtp.pass != null)) { options.auth = { user: obj.config.smtp.user, pass: obj.config.smtp.pass }; }
+            if (obj.config.smtp.verifyemail == true) { obj.verifyemail = true; }
+
+            obj.smtpServer = nodemailer.createTransport(options);
+        }
     } else if (obj.config.sendmail != null) {
         // Setup Sendmail
+        if ((typeof obj.config.sendmail.emaildelayseconds == 'number') && (obj.config.sendmail.emaildelayseconds > 0)) { obj.emailDelay = obj.config.sendmail.emaildelayseconds * 1000; }
         const nodemailer = require('nodemailer');
         var options = { sendmail: true };
         if (typeof obj.config.sendmail.newline == 'string') { options.newline = obj.config.sendmail.newline; }
@@ -330,6 +350,7 @@ module.exports.CreateMeshMail = function (parent, domain) {
                 if (loginkey != null) { options.urlargs1 = '?key=' + loginkey; options.urlargs2 = '&key=' + loginkey; } else { options.urlargs1 = ''; options.urlargs2 = ''; }
                 options.windows = ((os == 0) || (os == 1)) ? 1 : 0;
                 options.linux = ((os == 0) || (os == 2)) ? 1 : 0;
+                options.assistant = ((os == 0) || (os == 5)) ? 1 : 0;
                 options.osx = ((os == 0) || (os == 3)) ? 1 : 0;
                 options.link = (os == 4) ? 1 : 0;
                 options.linkurl = createInviteLink(domain, meshid, flags, expirehours);
@@ -364,8 +385,8 @@ module.exports.CreateMeshMail = function (parent, domain) {
                 }
 
                 // Set all the template replacement options and generate the final email text (both in txt and html formats).
-                var optionsHtml = { username: username, email: email, servername: domain.title ? domain.title : 'MeshCentral', header: true, footer: false };
-                var optionsTxt = { username: username, email: email, servername: domain.title ? domain.title : 'MeshCentral', header: true, footer: false };
+                const optionsHtml = { username: EscapeHtml(username), email: EscapeHtml(email), servername: EscapeHtml(domain.title ? domain.title : 'MeshCentral'), header: true, footer: false };
+                const optionsTxt = { username: username, email: email, servername: domain.title ? domain.title : 'MeshCentral', header: true, footer: false };
                 if ((connections == null) || (connections.length == 0)) {
                     optionsHtml.connections = false;
                     optionsTxt.connections = false;
@@ -380,6 +401,39 @@ module.exports.CreateMeshMail = function (parent, domain) {
                     optionsHtml.disconnections = disconnections.join('<br />\r\n');
                     optionsTxt.disconnections = disconnections.join('\r\n');
                 }
+
+                // Get from field
+                var from = null;
+                if (obj.config.sendgrid && (typeof obj.config.sendgrid.from == 'string')) { from = obj.config.sendgrid.from; }
+                else if (obj.config.smtp && (typeof obj.config.smtp.from == 'string')) { from = obj.config.smtp.from; }
+
+                // Send the email
+                obj.pendingMails.push({ to: email, from: from, subject: mailReplacements(template.htmlSubject, domain, optionsTxt), text: mailReplacements(template.txt, domain, optionsTxt), html: mailReplacements(template.html, domain, optionsHtml) });
+                sendNextMail();
+            }
+        });
+    };
+
+    // Send device help request notification mail
+    obj.sendDeviceHelpMail = function (domain, username, email, devicename, nodeid, helpusername, helprequest, language) {
+        obj.checkEmail(email, function (checked) {
+            if (checked) {
+                parent.debug('email', "Sending device help notification to " + email);
+
+                if ((parent.certificates == null) || (parent.certificates.CommonName == null) || (parent.certificates.CommonName.indexOf('.') == -1)) {
+                    parent.debug('email', "Error: Server name not set."); // If the server name is not set, email not possible.
+                    return;
+                }
+
+                var template = getTemplate('device-help', domain, language);
+                if ((template == null) || (template.htmlSubject == null) || (template.txtSubject == null)) {
+                    parent.debug('email', "Error: Failed to get mail template."); // No email template found
+                    return;
+                }
+
+                // Set all the template replacement options and generate the final email text (both in txt and html formats).
+                const optionsHtml = { devicename: EscapeHtml(devicename), helpusername: EscapeHtml(helpusername), helprequest: EscapeHtml(helprequest), nodeid: nodeid.split('/')[2], servername: EscapeHtml(domain.title ? domain.title : 'MeshCentral') };
+                const optionsTxt = { devicename: devicename, helpusername: helpusername, helprequest: helprequest, nodeid: nodeid.split('/')[2], servername: domain.title ? domain.title : 'MeshCentral' };
 
                 // Get from field
                 var from = null;
@@ -428,42 +482,57 @@ module.exports.CreateMeshMail = function (parent, domain) {
                     }
                 });
         } else if (obj.smtpServer != null) {
-            // SMTP send
             parent.debug('email', 'SMTP sending mail to ' + mailToSend.to + '.');
-            obj.smtpServer.sendMail(mailToSend, function (err, info) {
-                parent.debug('email', 'SMTP response: ' + JSON.stringify(err) + ', ' + JSON.stringify(info));
+            if (obj.smtpServer == 'console') {
+                // Display the email on the console, this is for easy debugging
+                if (mailToSend.from == null) { delete mailToSend.from; }
+                if (mailToSend.html == null) { delete mailToSend.html; }
+                console.log('Email', mailToSend);
                 obj.sendingMail = false;
-                if (err == null) {
-                    // Send the next mail
-                    obj.pendingMails.shift();
-                    obj.retry = 0;
-                    sendNextMail();
-                } else {
-                    obj.retry++;
-                    parent.debug('email', 'SMTP server failed (Retry:' + obj.retry + '): ' + JSON.stringify(err));
-                    console.log('SMTP server failed (Retry:' + obj.retry + '/3): ' + JSON.stringify(err));
-                    // Wait and try again
-                    if (obj.retry < 3) {
-                        setTimeout(sendNextMail, 10000);
-                    } else {
-                        // Failed, send the next mail
-                        parent.debug('email', 'SMTP server failed (Skipping): ' + JSON.stringify(err));
-                        console.log('SMTP server failed (Skipping): ' + JSON.stringify(err));
+                obj.pendingMails.shift();
+                obj.retry = 0;
+                sendNextMail();
+            } else {
+                // SMTP send
+                obj.smtpServer.sendMail(mailToSend, function (err, info) {
+                    parent.debug('email', 'SMTP response: ' + JSON.stringify(err) + ', ' + JSON.stringify(info));
+                    obj.sendingMail = false;
+                    if (err == null) {
+                        // Send the next mail
                         obj.pendingMails.shift();
                         obj.retry = 0;
                         sendNextMail();
+                    } else {
+                        obj.retry++;
+                        parent.debug('email', 'SMTP server failed (Retry:' + obj.retry + '): ' + JSON.stringify(err));
+                        console.log('SMTP server failed (Retry:' + obj.retry + '/3): ' + JSON.stringify(err));
+                        // Wait and try again
+                        if (obj.retry < 3) {
+                            setTimeout(sendNextMail, 10000);
+                        } else {
+                            // Failed, send the next mail
+                            parent.debug('email', 'SMTP server failed (Skipping): ' + JSON.stringify(err));
+                            console.log('SMTP server failed (Skipping): ' + JSON.stringify(err));
+                            obj.pendingMails.shift();
+                            obj.retry = 0;
+                            sendNextMail();
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     }
 
     // Send out the next mail in the pending list
     obj.verify = function () {
-        if (obj.smtpServer == null) return;
+        if ((obj.smtpServer == null) || (obj.smtpServer == 'console')) return;
         obj.smtpServer.verify(function (err, info) {
             if (err == null) {
-                console.log('SMTP mail server ' + obj.config.smtp.host + ' working as expected.');
+                if (obj.config.smtp.host == 'gmail') {
+                    console.log('Gmail server with OAuth working as expected.');
+                } else {
+                    console.log('SMTP mail server ' + obj.config.smtp.host + ' working as expected.');
+                }
             } else {
                 // Remove all non-object types from error to avoid a JSON stringify error.
                 var err2 = {};
@@ -506,7 +575,7 @@ module.exports.CreateMeshMail = function (parent, domain) {
     }
 
     //
-    // Device connetion and disconnection notifications
+    // Device connection and disconnection notifications
     //
 
     obj.deviceNotifications = {}; // UserId --> { timer, nodes: nodeid --> connectType }
@@ -519,7 +588,7 @@ module.exports.CreateMeshMail = function (parent, domain) {
         // Add the user and start a timer
         if (obj.deviceNotifications[user._id] == null) {
             obj.deviceNotifications[user._id] = { nodes: {} };
-            obj.deviceNotifications[user._id].timer = setTimeout(function () { sendDeviceNotifications(user._id); }, 5 * 60 * 1000); // 5 minute before email is sent
+            obj.deviceNotifications[user._id].timer = setTimeout(function () { sendDeviceNotifications(user._id); }, obj.emailDelay);
         }
 
         // Add the device
@@ -583,7 +652,7 @@ module.exports.CreateMeshMail = function (parent, domain) {
         // Add the user and start a timer
         if (obj.deviceNotifications[user._id] == null) {
             obj.deviceNotifications[user._id] = { nodes: {} };
-            obj.deviceNotifications[user._id].timer = setTimeout(function () { sendDeviceNotifications(user._id); }, 5 * 60 * 1000); // 5 minute before email is sent
+            obj.deviceNotifications[user._id].timer = setTimeout(function () { sendDeviceNotifications(user._id); }, obj.emailDelay);
         }
 
         // Add the device

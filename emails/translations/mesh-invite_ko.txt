@@ -26,6 +26,12 @@ Linux의 경우, 다음을 잘라내어 터미널에 붙여 넣어 에이전트�
 ~wget -q "[[[SERVERURL]]]/meshagents?script=1" --no-check-certificate -O ./meshinstall.sh && chmod 755 ./meshinstall.sh && sudo ./meshinstall.sh [[[SERVERURL]]] '[[[MESHIDHEX]]]'
 ~
 ~</area-linux>
+~<area-assistant>
+Windows용 MeshCentral Assistant의 경우 다음 링크로 이동하여 프로세스를 완료하십시오.
+~
+~[[[SERVERURL]]]/meshagents?id=10006&meshid=[[[MESHIDHEX]]]&tag=mailto:[[[EMAIL]]]
+~
+~</area-assistant>
 ~<area-link>
 소프트웨어를 설치하려면, 다음에 접속하여 지시에 따르십시오 : [[[SERVERURL]]][[[LINKURL]]][[[URLARGS2]]]
 ~</area-link>

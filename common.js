@@ -106,7 +106,7 @@ module.exports.random = function (max) {
     return r;
 };
 
-// Split a comma seperated string, ignoring commas in quotes.
+// Split a comma separated string, ignoring commas in quotes.
 module.exports.quoteSplit = function (str) {
     var tmp = '', quote = 0, result = [];
     for (var i in str) { if (str[i] == '"') { quote = (quote + 1) % 2; } if ((str[i] == ',') && (quote == 0)) { tmp = tmp.trim(); result.push(tmp); tmp = ''; } else { tmp += str[i]; } }
@@ -142,24 +142,47 @@ module.exports.zeroPad = function(num, c) { if (c == null) { c = 2; } var s = '0
 
 // Lowercase all the names in a object recursively
 // Allow for exception keys, child of exceptions will not get lower-cased.
-module.exports.objKeysToLower = function (obj, exceptions) {
+// Exceptions is an array of "keyname" or "parent\keyname"
+module.exports.objKeysToLower = function (obj, exceptions, parent) {
     for (var i in obj) {
-        if ((typeof obj[i] == 'object') && ((exceptions == null) || (exceptions.indexOf(i.toLowerCase()) == -1))) { module.exports.objKeysToLower(obj[i], exceptions); } // LowerCase all key names in the child object
+        if ((typeof obj[i] == 'object') &&
+            ((exceptions == null) || (exceptions.indexOf(i.toLowerCase()) == -1) && ((parent == null) || (exceptions.indexOf(parent.toLowerCase() + '/' + i.toLowerCase()) == -1)))
+        ) {
+            module.exports.objKeysToLower(obj[i], exceptions, i); // LowerCase all key names in the child object
+        }
         if (i.toLowerCase() !== i) { obj[i.toLowerCase()] = obj[i]; delete obj[i]; } // LowerCase all key names
     }
     return obj;
 };
 
-// Escape and unexcape feild names so there are no invalid characters for MongoDB
+// Escape and unescape field names so there are no invalid characters for MongoDB
 module.exports.escapeFieldName = function (name) { if ((name.indexOf('%') == -1) && (name.indexOf('.') == -1) && (name.indexOf('$') == -1)) return name; return name.split('%').join('%25').split('.').join('%2E').split('$').join('%24'); };
 module.exports.unEscapeFieldName = function (name) { if (name.indexOf('%') == -1) return name; return name.split('%2E').join('.').split('%24').join('$').split('%25').join('%'); };
 
-// Escape all links
-module.exports.escapeLinksFieldNameEx = function (docx) { if (docx.links == null) { return docx; } var doc = Object.assign({}, docx); doc.links = Object.assign({}, doc.links); for (var i in doc.links) { var ue = module.exports.escapeFieldName(i); if (ue !== i) { doc.links[ue] = doc.links[i]; delete doc.links[i]; } } return doc; };
-module.exports.escapeLinksFieldName = function (docx) { var doc = Object.assign({}, docx); if (doc.links != null) { doc.links = Object.assign({}, doc.links); for (var i in doc.links) { var ue = module.exports.escapeFieldName(i); if (ue !== i) { doc.links[ue] = doc.links[i]; delete doc.links[i]; } } } return doc; };
-module.exports.unEscapeLinksFieldName = function (doc) { if (doc.links != null) { for (var j in doc.links) { var ue = module.exports.unEscapeFieldName(j); if (ue !== j) { doc.links[ue] = doc.links[j]; delete doc.links[j]; } } } return doc; };
+// Escape all links, SSH and RDP usernames
+// This is required for databases like NeDB that don't accept "." as part of a field name.
+module.exports.escapeLinksFieldNameEx = function (docx) { if ((docx.links == null) && (docx.ssh == null) && (docx.rdp == null)) { return docx; } return module.exports.escapeLinksFieldName(docx); };
+module.exports.escapeLinksFieldName = function (docx) {
+    var doc = Object.assign({}, docx);
+    if (doc.links != null) { doc.links = Object.assign({}, doc.links); for (var i in doc.links) { var ue = module.exports.escapeFieldName(i); if (ue !== i) { doc.links[ue] = doc.links[i]; delete doc.links[i]; } } }
+    if (doc.ssh != null) { doc.ssh = Object.assign({}, doc.ssh); for (var i in doc.ssh) { var ue = module.exports.escapeFieldName(i); if (ue !== i) { doc.ssh[ue] = doc.ssh[i]; delete doc.ssh[i]; } } }
+    if (doc.rdp != null) { doc.rdp = Object.assign({}, doc.rdp); for (var i in doc.rdp) { var ue = module.exports.escapeFieldName(i); if (ue !== i) { doc.rdp[ue] = doc.rdp[i]; delete doc.rdp[i]; } } }
+    return doc;
+};
+module.exports.unEscapeLinksFieldName = function (doc) {
+    if (doc.links != null) { for (var j in doc.links) { var ue = module.exports.unEscapeFieldName(j); if (ue !== j) { doc.links[ue] = doc.links[j]; delete doc.links[j]; } } }
+    if (doc.ssh != null) { for (var j in doc.ssh) { var ue = module.exports.unEscapeFieldName(j); if (ue !== j) { doc.ssh[ue] = doc.ssh[j]; delete doc.ssh[j]; } } }
+    if (doc.rdp != null) { for (var j in doc.rdp) { var ue = module.exports.unEscapeFieldName(j); if (ue !== j) { doc.rdp[ue] = doc.rdp[j]; delete doc.rdp[j]; } } }
+    return doc;
+};
 //module.exports.escapeAllLinksFieldName = function (docs) { for (var i in docs) { module.exports.escapeLinksFieldName(docs[i]); } return docs; };
 module.exports.unEscapeAllLinksFieldName = function (docs) { for (var i in docs) { docs[i] = module.exports.unEscapeLinksFieldName(docs[i]); } return docs; };
+
+// Escape field names for aceBase
+var aceEscFields = ['links', 'ssh', 'rdp', 'notify'];
+module.exports.aceEscapeFieldNames = function (docx) { var doc = Object.assign({}, docx); for (var k in aceEscFields) { if (typeof doc[aceEscFields[k]] == 'object') { doc[aceEscFields[k]] = Object.assign({}, doc[aceEscFields[k]]); for (var i in doc[aceEscFields[k]]) { var ue = encodeURIComponent(i); if (ue !== i) { doc[aceEscFields[k]][ue] = doc[aceEscFields[k]][i]; delete doc[aceEscFields[k]][i]; } } } } return doc; };
+module.exports.aceUnEscapeFieldNames = function (doc) { for (var k in aceEscFields) { if (typeof doc[aceEscFields[k]] == 'object') { for (var j in doc[aceEscFields[k]]) { var ue = decodeURIComponent(j); if (ue !== j) { doc[aceEscFields[k]][ue] = doc[aceEscFields[k]][j]; delete doc[aceEscFields[k]][j]; } } } } return doc; };
+module.exports.aceUnEscapeAllFieldNames = function (docs) { for (var i in docs) { docs[i] = module.exports.aceUnEscapeFieldNames(docs[i]); } return docs; };
 
 // Validation methods
 module.exports.validateString = function (str, minlen, maxlen) { return ((str != null) && (typeof str == 'string') && ((minlen == null) || (str.length >= minlen)) && ((maxlen == null) || (str.length <= maxlen))); };
@@ -171,7 +194,28 @@ module.exports.validateEmail = function (email, minlen, maxlen) { if (module.exp
 module.exports.validateUsername = function (username, minlen, maxlen) { return (module.exports.validateString(username, minlen, maxlen) && (username.indexOf(' ') == -1) && (username.indexOf('"') == -1) && (username.indexOf(',') == -1)); };
 module.exports.isAlphaNumeric = function (str) { return (str.match(/^[A-Za-z0-9]+$/) != null); };
 module.exports.validateAlphaNumericArray = function (array, minlen, maxlen) { if (((array != null) && Array.isArray(array)) == false) return false; for (var i in array) { if ((typeof array[i] != 'string') || (module.exports.isAlphaNumeric(array[i]) == false) || ((minlen != null) && (array[i].length < minlen)) || ((maxlen != null) && (array[i].length > maxlen)) ) return false; } return true; };
+module.exports.getEmailDomain = function(email) {
+    if (!module.exports.validateEmail(email, 1, 1024)) {
+        return '';
+    }
+    const i = email.indexOf('@');
+    return email.substring(i + 1).toLowerCase();
+}
 
+module.exports.validateEmailDomain = function(email, allowedDomains) {
+    // Check if this request is for an allows email domain
+    if ((allowedDomains != null) && Array.isArray(allowedDomains)) {
+        const emaildomain = module.exports.getEmailDomain(email);
+        if (emaildomain === '') {
+            return false;
+        }
+        var emailok = false;
+        for (var i in allowedDomains) { if (emaildomain == allowedDomains[i].toLowerCase()) { emailok = true; } }
+        return emailok;
+    }
+
+    return true;
+}
 // Check password requirements
 module.exports.checkPasswordRequirements = function(password, requirements) {
     if ((requirements == null) || (requirements == '') || (typeof requirements != 'object')) return true;
@@ -290,6 +334,11 @@ module.exports.meshServerRightsArrayToNumber = function (val) {
             if (r == 'locked') { newAccRights |= 32; }
             if (r == 'nonewgroups') { newAccRights |= 64; }
             if (r == 'notools') { newAccRights |= 128; }
+            if (r == 'usergroups') { newAccRights |= 256; }
+            if (r == 'recordings') { newAccRights |= 512; }
+            if (r == 'locksettings') { newAccRights |= 1024; }
+            if (r == 'allevents') { newAccRights |= 2048; }
+            if (r == 'nonewdevices') { newAccRights |= 4096; }
         }
         return newAccRights;
     }
@@ -317,4 +366,57 @@ function validateObjectForMongoRec(obj, maxStrLen) {
         if ((typeof obj[i] == 'object') && (Array.isArray(obj[i]) == false) && (validateObjectForMongoRec(obj[i], maxStrLen) == false)) return false;
     }
     return true;
+}
+
+// Parse a version string of the type n.n.n.n
+module.exports.parseVersion = function (verstr) {
+    if (typeof verstr != 'string') return null;
+    const r = [], verstrsplit = verstr.split('.');
+    if (verstrsplit.length != 4) return null;
+    for (var i in verstrsplit) {
+        var n = parseInt(verstrsplit[i]);
+        if (isNaN(n) || (n < 0) || (n > 65535)) return null;
+        r.push(n);
+    }
+    return r;
+}
+
+// Move old files. If we are about to overwrite a file, we can move if first just in case the change needs to be reverted
+module.exports.moveOldFiles = function (filelist) {
+    // Fine an old extension that works for all files in the file list
+    var oldFileExt, oldFileExtCount = 0, extOk;
+    do {
+        extOk = true;
+        if (++oldFileExtCount == 1) { oldFileExt = '-old'; } else { oldFileExt = '-old' + oldFileExtCount; }
+        for (var i in filelist) { if (fs.existsSync(filelist[i] + oldFileExt) == true) { extOk = false; } }
+    } while (extOk == false);
+    for (var i in filelist) { try { fs.renameSync(filelist[i], filelist[i] + oldFileExt); } catch (ex) { } }
+}
+
+// Convert strArray to Array, returns array if strArray or null if any other type
+module.exports.convertStrArray = function (object, split) {
+    if (split && typeof object === 'string') {
+        return object.split(split)
+    } else if (typeof object === 'string') {
+        return Array(object);
+    } else if (Array.isArray(object)) {
+        return object
+    } else {
+        return []
+    }
+}
+
+module.exports.uniqueArray = function (a) {
+    var seen = {};
+    var out = [];
+    var len = a.length;
+    var j = 0;
+    for(var i = 0; i < len; i++) {
+         var item = a[i];
+         if(seen[item] !== 1) {
+               seen[item] = 1;
+               out[j++] = item;
+         }
+    }
+    return out;
 }

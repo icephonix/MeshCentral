@@ -30,8 +30,33 @@ module.exports.CreateDB = function (parent, func) {
     var Datastore = null;
     var expireEventsSeconds = (60 * 60 * 24 * 20);              // By default, expire events after 20 days (1728000). (Seconds * Minutes * Hours * Days)
     var expirePowerEventsSeconds = (60 * 60 * 24 * 10);         // By default, expire power events after 10 days (864000). (Seconds * Minutes * Hours * Days)
-    var expireServerStatsSeconds = (60 * 60 * 24 * 30);         // By default, expire power events after 30 days (2592000). (Seconds * Minutes * Hours * Days)
+    var expireServerStatsSeconds = (60 * 60 * 24 * 30);         // By default, expire server stats after 30 days (2592000). (Seconds * Minutes * Hours * Days)
     const common = require('./common.js');
+    const path = require('path');
+    const fs = require('fs');
+    const DB_NEDB = 1, DB_MONGOJS = 2, DB_MONGODB = 3,DB_MARIADB = 4, DB_MYSQL = 5, DB_POSTGRESQL = 6, DB_ACEBASE = 7, DB_SQLITE = 8;
+    const DB_LIST = ['None', 'NeDB', 'MongoJS', 'MongoDB', 'MariaDB', 'MySQL', 'PostgreSQL', 'AceBase', 'SQLite'];  //for the info command
+    let databaseName = 'meshcentral';
+    let datapathParentPath = path.dirname(parent.datapath);
+    let datapathFoldername = path.basename(parent.datapath);
+    const SQLITE_AUTOVACUUM = ['none', 'full', 'incremental'];
+    const SQLITE_SYNCHRONOUS = ['off', 'normal', 'full', 'extra'];
+    obj.sqliteConfig = {
+        maintenance: '',
+        startupVacuum: false,
+        autoVacuum: 'full',
+        incrementalVacuum: 100,
+        journalMode: 'delete',
+        journalSize: 4096000,
+        synchronous: 'full',
+    };
+    obj.performingBackup = false;
+    const BACKUPFAIL_ZIPCREATE = 0x0001;
+    const BACKUPFAIL_ZIPMODULE = 0x0010;
+    const BACKUPFAIL_DBDUMP = 0x0100;
+    obj.backupStatus = 0x0;
+    obj.newAutoBackupFile = null;
+    obj.newDBDumpFile = null;
     obj.identifier = null;
     obj.dbKey = null;
     obj.dbRecordsEncryptKey = null;
@@ -105,10 +130,41 @@ module.exports.CreateDB = function (parent, func) {
 
     // Perform database maintenance
     obj.maintenance = function () {
-        if (obj.databaseType == 1) { // NeDB will not remove expired records unless we try to access them. This will force the removal.
+        parent.debug('db', 'Entering database maintenance');
+        if (obj.databaseType == DB_NEDB) { // NeDB will not remove expired records unless we try to access them. This will force the removal.
             obj.eventsfile.remove({ time: { '$lt': new Date(Date.now() - (expireEventsSeconds * 1000)) } }, { multi: true }); // Force delete older events
             obj.powerfile.remove({ time: { '$lt': new Date(Date.now() - (expirePowerEventsSeconds * 1000)) } }, { multi: true }); // Force delete older events
             obj.serverstatsfile.remove({ time: { '$lt': new Date(Date.now() - (expireServerStatsSeconds * 1000)) } }, { multi: true }); // Force delete older events
+        } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL)) { // MariaDB or MySQL
+            sqlDbQuery('DELETE FROM events WHERE time < ?', [new Date(Date.now() - (expireEventsSeconds * 1000))], function (doc, err) { }); // Delete events older than expireEventsSeconds
+            sqlDbQuery('DELETE FROM power WHERE time < ?', [new Date(Date.now() - (expirePowerEventsSeconds * 1000))], function (doc, err) { }); // Delete events older than expirePowerSeconds
+            sqlDbQuery('DELETE FROM serverstats WHERE expire < ?', [new Date()], function (doc, err) { }); // Delete events where expiration date is in the past
+            sqlDbQuery('DELETE FROM smbios WHERE expire < ?', [new Date()], function (doc, err) { }); // Delete events where expiration date is in the past
+        } else if (obj.databaseType == DB_ACEBASE) { // AceBase
+            //console.log('Performing AceBase maintenance');
+            obj.file.query('events').filter('time', '<', new Date(Date.now() - (expireEventsSeconds * 1000))).remove().then(function () {
+                obj.file.query('stats').filter('time', '<', new Date(Date.now() - (expireServerStatsSeconds * 1000))).remove().then(function () {
+                    obj.file.query('power').filter('time', '<', new Date(Date.now() - (expirePowerEventsSeconds * 1000))).remove().then(function () {
+                        //console.log('AceBase maintenance done');
+                    });
+                });
+            });
+        } else if (obj.databaseType == DB_SQLITE) { // SQLite3
+            //sqlite does not return rows affected for INSERT, UPDATE or DELETE statements, see https://www.sqlite.org/pragma.html#pragma_count_changes
+            obj.file.serialize(function () {
+                obj.file.run('DELETE FROM events WHERE time < ?', [new Date(Date.now() - (expireEventsSeconds * 1000))]); 
+                obj.file.run('DELETE FROM power WHERE time < ?', [new Date(Date.now() - (expirePowerEventsSeconds * 1000))]);
+                obj.file.run('DELETE FROM serverstats WHERE expire < ?', [new Date()]);
+                obj.file.run('DELETE FROM smbios WHERE expire < ?', [new Date()]);
+                obj.file.exec(obj.sqliteConfig.maintenance, function (err) {
+                    if (err) {console.log('Maintenance error: ' + err.message)};
+                    if (parent.config.settings.debug) {
+                        sqliteGetPragmas(['freelist_count', 'page_size', 'page_count', 'cache_size' ], function (pragma, pragmaValue) {
+                            parent.debug('db', 'SQLite Maintenance: ' + pragma + '=' + pragmaValue);
+                        });
+                    };
+                });
+            });
         }
         obj.removeInactiveDevices();
     }
@@ -120,7 +176,7 @@ module.exports.CreateDB = function (parent, func) {
         for (var i in parent.config.domains) {
             if (typeof parent.config.domains[i].autoremoveinactivedevices == 'number') {
                 var v = parent.config.domains[i].autoremoveinactivedevices;
-                if ((v > 1) && (v <= 2000)) {
+                if ((v >= 1) && (v <= 2000)) {
                     if (v < minRemoveInactiveDevice) { minRemoveInactiveDevice = v; }
                     removeInactiveDevicesPerDomain[i] = v;
                     minRemoveInactiveDevicesPerDomain[i] = v;
@@ -132,7 +188,7 @@ module.exports.CreateDB = function (parent, func) {
         for (var i in parent.webserver.meshes) {
             if (typeof parent.webserver.meshes[i].expireDevs == 'number') {
                 var v = parent.webserver.meshes[i].expireDevs;
-                if ((v > 1) && (v <= 2000)) {
+                if ((v >= 1) && (v <= 2000)) {
                     if (v < minRemoveInactiveDevice) { minRemoveInactiveDevice = v; }
                     if ((minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] == null) || (minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] > v)) {
                         minRemoveInactiveDevicesPerDomain[parent.webserver.meshes[i].domain] = v;
@@ -229,12 +285,18 @@ module.exports.CreateDB = function (parent, func) {
     obj.removeDomain = function (domainName, func) {
         var pendingCalls;
         // Remove all events, power events and SMBIOS data from the main collection. They are all in seperate collections now.
-        if ((obj.databaseType == 4) || (obj.databaseType == 5) || (obj.databaseType == 6)) {
+        if (obj.databaseType == DB_ACEBASE) {
+            // AceBase
+            pendingCalls = 3;
+            obj.file.query('meshcentral').filter('domain', '==', domainName).remove().then(function () { if (--pendingCalls == 0) { func(); } });
+            obj.file.query('events').filter('domain', '==', domainName).remove().then(function () { if (--pendingCalls == 0) { func(); } });
+            obj.file.query('power').filter('domain', '==', domainName).remove().then(function () { if (--pendingCalls == 0) { func(); } });
+        } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL) || (obj.databaseType == DB_POSTGRESQL)) {
             // MariaDB, MySQL or PostgreSQL
             pendingCalls = 2;
             sqlDbQuery('DELETE FROM main WHERE domain = $1', [domainName], function () { if (--pendingCalls == 0) { func(); } });
             sqlDbQuery('DELETE FROM events WHERE domain = $1', [domainName], function () { if (--pendingCalls == 0) { func(); } });
-        } else if (obj.databaseType == 3) {
+        } else if (obj.databaseType == DB_MONGODB) {
             // MongoDB
             pendingCalls = 3;
             obj.file.deleteMany({ domain: domainName }, { multi: true }, function () { if (--pendingCalls == 0) { func(); } });
@@ -254,17 +316,17 @@ module.exports.CreateDB = function (parent, func) {
         // TODO: Remove all meshes that dont have any links
 
         // Remove all events, power events and SMBIOS data from the main collection. They are all in seperate collections now.
-        if ((obj.databaseType == 4) || (obj.databaseType == 5) || (obj.databaseType == 6)) {
+        if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL) || (obj.databaseType == DB_POSTGRESQL)) {
             // MariaDB, MySQL or PostgreSQL
             obj.RemoveAllOfType('event', function () { });
             obj.RemoveAllOfType('power', function () { });
             obj.RemoveAllOfType('smbios', function () { });
-        } else if (obj.databaseType == 3) {
+        } else if (obj.databaseType == DB_MONGODB) {
             // MongoDB
             obj.file.deleteMany({ type: 'event' }, { multi: true });
             obj.file.deleteMany({ type: 'power' }, { multi: true });
             obj.file.deleteMany({ type: 'smbios' }, { multi: true });
-        } else {
+        } else if ((obj.databaseType == DB_NEDB) || (obj.databaseType == DB_MONGOJS)) {
             // NeDB or MongoJS
             obj.file.remove({ type: 'event' }, { multi: true });
             obj.file.remove({ type: 'power' }, { multi: true });
@@ -283,7 +345,7 @@ module.exports.CreateDB = function (parent, func) {
                     validIdentifiers[docs[i]._id] = 1;
                 }
             }
-            
+
             // Fix all of the creating & login to ticks by seconds, not milliseconds.
             obj.GetAllType('user', function (err, docs) {
                 if (err != null) { parent.debug('db', 'ERROR (GetAll user): ' + err); }
@@ -365,13 +427,19 @@ module.exports.CreateDB = function (parent, func) {
                                 if (meshChange) { obj.Set(docs[i]); }
                             }
                         }
-                        if (obj.databaseType == 6) {
+                        if (obj.databaseType == DB_SQLITE) {
+                            // SQLite
+
+                        } else if (obj.databaseType == DB_ACEBASE) {
+                            // AceBase
+
+                        } else if (obj.databaseType == DB_POSTGRESQL) {
                             // Postgres
                             sqlDbQuery('DELETE FROM Main WHERE ((extra != NULL) AND (extra LIKE (\'mesh/%\')) AND (extra != ANY ($1)))', [meshlist], function (err, response) { });
-                        } else if ((obj.databaseType == 4) || (obj.databaseType == 5)) {
+                        } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL)) {
                             // MariaDB
                             sqlDbQuery('DELETE FROM Main WHERE (extra LIKE ("mesh/%") AND (extra NOT IN ?)', [meshlist], function (err, response) { });
-                        } else if (obj.databaseType == 3) {
+                        } else if (obj.databaseType == DB_MONGODB) {
                             // MongoDB
                             obj.file.deleteMany({ meshid: { $exists: true, $nin: meshlist } }, { multi: true });
                         } else {
@@ -389,14 +457,66 @@ module.exports.CreateDB = function (parent, func) {
     };
 
     // Get encryption key
-    obj.getEncryptDataKey = function (password) {
+    obj.getEncryptDataKey = function (password, salt, iterations) {
         if (typeof password != 'string') return null;
-        return parent.crypto.createHash('sha384').update(password).digest("raw").slice(0, 32);
+        let key;
+        try {
+            key = parent.crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha384');
+        } catch (ex) {
+            // If this previous call fails, it's probably because older pbkdf2 did not specify the hashing function, just use the default.
+            key = parent.crypto.pbkdf2Sync(password, salt, iterations, 32);
+        }
+        return key
     }
 
     // Encrypt data 
     obj.encryptData = function (password, plaintext) {
-        var key = obj.getEncryptDataKey(password);
+        let encryptionVersion = 0x01;
+        let iterations = 100000
+        const iv = parent.crypto.randomBytes(16);
+        var key = obj.getEncryptDataKey(password, iv, iterations);
+        if (key == null) return null;
+        const aes = parent.crypto.createCipheriv('aes-256-gcm', key, iv);
+        var ciphertext = aes.update(plaintext);
+        let versionbuf = Buffer.allocUnsafe(2);
+        versionbuf.writeUInt16BE(encryptionVersion);
+        let iterbuf = Buffer.allocUnsafe(4);
+        iterbuf.writeUInt32BE(iterations);
+        let encryptedBuf = aes.final();
+        ciphertext = Buffer.concat([versionbuf, iterbuf, aes.getAuthTag(), iv, ciphertext, encryptedBuf]);
+        return ciphertext.toString('base64');
+    }
+
+    // Decrypt data 
+    obj.decryptData = function (password, ciphertext) {
+        // Adding an encryption version lets us avoid try catching in the future
+        let ciphertextBytes = Buffer.from(ciphertext, 'base64');
+        let encryptionVersion = ciphertextBytes.readUInt16BE(0);
+        try {
+            switch (encryptionVersion) {
+                case 0x01:
+                    let iterations = ciphertextBytes.readUInt32BE(2);
+                    let authTag = ciphertextBytes.slice(6, 22);
+                    const iv = ciphertextBytes.slice(22, 38);
+                    const data = ciphertextBytes.slice(38);
+                    let key = obj.getEncryptDataKey(password, iv, iterations);
+                    if (key == null) return null;
+                    const aes = parent.crypto.createDecipheriv('aes-256-gcm', key, iv);
+                    aes.setAuthTag(authTag);
+                    let plaintextBytes = Buffer.from(aes.update(data));
+                    plaintextBytes = Buffer.concat([plaintextBytes, aes.final()]);
+                    return plaintextBytes;
+                default:
+                    return obj.oldDecryptData(password, ciphertextBytes);
+            }
+        } catch (ex) { return obj.oldDecryptData(password, ciphertextBytes); }
+    }
+
+    // Encrypt data 
+    // The older encryption system uses CBC without integraty checking.
+    // This method is kept only for testing
+    obj.oldEncryptData = function (password, plaintext) {
+        let key = parent.crypto.createHash('sha384').update(password).digest('raw').slice(0, 32);
         if (key == null) return null;
         const iv = parent.crypto.randomBytes(16);
         const aes = parent.crypto.createCipheriv('aes-256-cbc', key, iv);
@@ -405,16 +525,17 @@ module.exports.CreateDB = function (parent, func) {
         return ciphertext.toString('base64');
     }
 
-    // Decrypt data 
-    obj.decryptData = function (password, ciphertext) {
+    // Decrypt data
+    // The older encryption system uses CBC without integraty checking.
+    // This method is kept only to convert the old encryption to the new one.
+    obj.oldDecryptData = function (password, ciphertextBytes) {
+        if (typeof password != 'string') return null;
         try {
-            var key = obj.getEncryptDataKey(password);
-            if (key == null) return null;
-            const ciphertextBytes = Buffer.from(ciphertext, 'base64');
             const iv = ciphertextBytes.slice(0, 16);
             const data = ciphertextBytes.slice(16);
+            let key = parent.crypto.createHash('sha384').update(password).digest('raw').slice(0, 32);
             const aes = parent.crypto.createDecipheriv('aes-256-cbc', key, iv);
-            var plaintextBytes = Buffer.from(aes.update(data));
+            let plaintextBytes = Buffer.from(aes.update(data));
             plaintextBytes = Buffer.concat([plaintextBytes, aes.final()]);
             return plaintextBytes;
         } catch (ex) { return null; }
@@ -423,30 +544,33 @@ module.exports.CreateDB = function (parent, func) {
     // Get the number of records in the database for various types, this is the slow NeDB way.
     // WARNING: This is a terrible query for database performance. Only do this when needed. This query will look at almost every document in the database.
     obj.getStats = function (func) {
-        if (obj.databaseType == 6) {
+        if (obj.databaseType == DB_ACEBASE) {
+            // AceBase
+            // TODO
+        } else if (obj.databaseType == DB_POSTGRESQL) {
             // PostgreSQL
             // TODO
-        } else if (obj.databaseType == 5) {
+        } else if (obj.databaseType == DB_MYSQL) {
             // MySQL
             // TODO
-        } else if (obj.databaseType == 4) {
+        } else if (obj.databaseType == DB_MARIADB) {
             // MariaDB
             // TODO
-        } else if (obj.databaseType == 3) {
+        } else if (obj.databaseType == DB_MONGODB) {
             // MongoDB
             obj.file.aggregate([{ "$group": { _id: "$type", count: { $sum: 1 } } }]).toArray(function (err, docs) {
                 var counters = {}, totalCount = 0;
                 if (err == null) { for (var i in docs) { if (docs[i]._id != null) { counters[docs[i]._id] = docs[i].count; totalCount += docs[i].count; } } }
                 func(counters);
             });
-        } else if (obj.databaseType == 2) {
+        } else if (obj.databaseType == DB_MONGOJS) {
             // MongoJS
             obj.file.aggregate([{ "$group": { _id: "$type", count: { $sum: 1 } } }], function (err, docs) {
                 var counters = {}, totalCount = 0;
                 if (err == null) { for (var i in docs) { if (docs[i]._id != null) { counters[docs[i]._id] = docs[i].count; totalCount += docs[i].count; } } }
                 func(counters);
             });
-        } else if (obj.databaseType == 1) {
+        } else if (obj.databaseType == DB_NEDB) {
             // NeDB version
             obj.file.count({ type: 'node' }, function (err, nodeCount) {
                 obj.file.count({ type: 'mesh' }, function (err, meshCount) {
@@ -486,8 +610,8 @@ module.exports.CreateDB = function (parent, func) {
                 if (err == null) { for (var i in docs) { count++; obj.Set(docs[i]); } }
                 obj.GetAllType('mesh', function (err, docs) {
                     if (err == null) { for (var i in docs) { count++; obj.Set(docs[i]); } }
-                    if (obj.databaseType == 1) { // If we are using NeDB, compact the database.
-                        obj.file.persistence.compactDatafile();
+                    if (obj.databaseType == DB_NEDB) { // If we are using NeDB, compact the database.
+                        obj.file.compactDatafile();
                         obj.file.on('compaction.done', function () { func(count); }); // It's important to wait for compaction to finish before exit, otherwise NeDB may corrupt.
                     } else {
                         func(count); // For all other databases, normal exit.
@@ -501,14 +625,11 @@ module.exports.CreateDB = function (parent, func) {
     function performTypedRecordDecrypt(data) {
         if ((data == null) || (obj.dbRecordsDecryptKey == null) || (typeof data != 'object')) return data;
         for (var i in data) {
-            if (data[i] == null) continue;
-            if (data[i].type == 'user') {
-                data[i] = performPartialRecordDecrypt(data[i]);
-            } else if ((data[i].type == 'node') && (data[i].intelamt != null)) {
-                data[i].intelamt = performPartialRecordDecrypt(data[i].intelamt);
-            } else if ((data[i].type == 'mesh') && (data[i].amt != null)) {
-                data[i].amt = performPartialRecordDecrypt(data[i].amt);
-            }
+            if ((data[i] == null) || (typeof data[i] != 'object')) continue;
+            data[i] = performPartialRecordDecrypt(data[i]);
+            if ((data[i].intelamt != null) && (typeof data[i].intelamt == 'object') && (data[i].intelamt._CRYPT)) { data[i].intelamt = performPartialRecordDecrypt(data[i].intelamt); }
+            if ((data[i].amt != null) && (typeof data[i].amt == 'object') && (data[i].amt._CRYPT)) { data[i].amt = performPartialRecordDecrypt(data[i].amt); }
+            if ((data[i].kvm != null) && (typeof data[i].kvm == 'object') && (data[i].kvm._CRYPT)) { data[i].kvm = performPartialRecordDecrypt(data[i].kvm); }
         }
         return data;
     }
@@ -517,8 +638,18 @@ module.exports.CreateDB = function (parent, func) {
     function performTypedRecordEncrypt(data) {
         if (obj.dbRecordsEncryptKey == null) return data;
         if (data.type == 'user') { return performPartialRecordEncrypt(Clone(data), ['otpkeys', 'otphkeys', 'otpsecret', 'salt', 'hash', 'oldpasswords']); }
-        else if ((data.type == 'node') && (data.intelamt != null)) { var xdata = Clone(data); xdata.intelamt = performPartialRecordEncrypt(xdata.intelamt, ['user', 'pass', 'mpspass']); return xdata; }
-        else if ((data.type == 'mesh') && (data.amt != null)) { var xdata = Clone(data); xdata.amt = performPartialRecordEncrypt(xdata.amt, ['password']); return xdata; }
+        else if ((data.type == 'node') && (data.ssh || data.rdp || data.intelamt)) {
+            var xdata = Clone(data);
+            if (data.ssh || data.rdp) { xdata = performPartialRecordEncrypt(xdata, ['ssh', 'rdp']); }
+            if (data.intelamt) { xdata.intelamt = performPartialRecordEncrypt(xdata.intelamt, ['pass', 'mpspass']); }
+            return xdata;
+        }
+        else if ((data.type == 'mesh') && (data.amt || data.kvm)) {
+            var xdata = Clone(data);
+            if (data.amt) { xdata.amt = performPartialRecordEncrypt(xdata.amt, ['password']); }
+            if (data.kvm) { xdata.kvm = performPartialRecordEncrypt(xdata.kvm, ['pass']); }
+            return xdata;
+        }
         return data;
     }
 
@@ -628,29 +759,128 @@ module.exports.CreateDB = function (parent, func) {
         });
     }
 
-    if (parent.args.mariadb || parent.args.mysql) {
+    if (parent.args.sqlite3) {
+        // SQLite3 database setup
+        obj.databaseType = DB_SQLITE;
+        const sqlite3 = require('sqlite3');
+        let configParams = parent.config.settings.sqlite3;
+        if (typeof configParams == 'string') {databaseName = configParams} else {databaseName = configParams.name ? configParams.name : 'meshcentral';};
+        obj.sqliteConfig.startupVacuum = configParams.startupvacuum ? configParams.startupvacuum : false;
+        obj.sqliteConfig.autoVacuum = configParams.autovacuum ? configParams.autovacuum.toLowerCase() : 'incremental';
+        obj.sqliteConfig.incrementalVacuum = configParams.incrementalvacuum ? configParams.incrementalvacuum : 100;
+        obj.sqliteConfig.journalMode = configParams.journalmode ? configParams.journalmode.toLowerCase() : 'delete';
+        //allowed modes, 'none' excluded because not usefull for this app, maybe also remove 'memory'?
+        if (!(['delete', 'truncate', 'persist', 'memory', 'wal'].includes(obj.sqliteConfig.journalMode))) { obj.sqliteConfig.journalMode = 'delete'};
+        obj.sqliteConfig.journalSize = configParams.journalsize ? configParams.journalsize : 409600;
+        //wal can use the more performant 'normal' mode, see https://www.sqlite.org/pragma.html#pragma_synchronous
+        obj.sqliteConfig.synchronous = (obj.sqliteConfig.journalMode == 'wal') ? 'normal' : 'full';
+        if (obj.sqliteConfig.journalMode == 'wal') {obj.sqliteConfig.maintenance += 'PRAGMA wal_checkpoint(PASSIVE);'};
+        if (obj.sqliteConfig.autoVacuum == 'incremental') {obj.sqliteConfig.maintenance += 'PRAGMA incremental_vacuum(' + obj.sqliteConfig.incrementalVacuum + ');'};
+        obj.sqliteConfig.maintenance += 'PRAGMA optimize;';
+        
+        parent.debug('db', 'SQlite config options: ' + JSON.stringify(obj.sqliteConfig, null, 4));
+        if (obj.sqliteConfig.journalMode == 'memory') { console.log('[WARNING] journal_mode=memory: this can lead to database corruption if there is a crash during a transaction. See https://www.sqlite.org/pragma.html#pragma_journal_mode') };
+        //.cached not usefull
+        obj.file = new sqlite3.Database(parent.path.join(parent.datapath, databaseName + '.sqlite'), sqlite3.OPEN_READWRITE, function (err) {
+            if (err && (err.code == 'SQLITE_CANTOPEN')) {
+                // Database needs to be created
+                obj.file = new sqlite3.Database(parent.path.join(parent.datapath, databaseName + '.sqlite'), function (err) {
+                    if (err) { console.log("SQLite Error: " + err); process.exit(1); }
+                    obj.file.exec(`
+                        CREATE TABLE main (id VARCHAR(256) PRIMARY KEY NOT NULL, type CHAR(32), domain CHAR(64), extra CHAR(255), extraex CHAR(255), doc JSON);
+                        CREATE TABLE events(id INTEGER PRIMARY KEY, time TIMESTAMP, domain CHAR(64), action CHAR(255), nodeid CHAR(255), userid CHAR(255), doc JSON);
+                        CREATE TABLE eventids(fkid INT NOT NULL, target CHAR(255), CONSTRAINT fk_eventid FOREIGN KEY (fkid) REFERENCES events (id) ON DELETE CASCADE ON UPDATE RESTRICT);
+                        CREATE TABLE serverstats (time TIMESTAMP PRIMARY KEY, expire TIMESTAMP, doc JSON);
+                        CREATE TABLE power (id INTEGER PRIMARY KEY, time TIMESTAMP, nodeid CHAR(255), doc JSON);
+                        CREATE TABLE smbios (id CHAR(255) PRIMARY KEY, time TIMESTAMP, expire TIMESTAMP, doc JSON);
+                        CREATE TABLE plugin (id INTEGER PRIMARY KEY, doc JSON);
+                        CREATE INDEX ndxtypedomainextra ON main (type, domain, extra);
+                        CREATE INDEX ndxextra ON main (extra);
+                        CREATE INDEX ndxextraex ON main (extraex);
+                        CREATE INDEX ndxeventstime ON events(time);
+                        CREATE INDEX ndxeventsusername ON events(domain, userid, time);
+                        CREATE INDEX ndxeventsdomainnodeidtime ON events(domain, nodeid, time);
+                        CREATE INDEX ndxeventids ON eventids(target);
+                        CREATE INDEX ndxserverstattime ON serverstats (time);
+                        CREATE INDEX ndxserverstatexpire ON serverstats (expire);
+                        CREATE INDEX ndxpowernodeidtime ON power (nodeid, time);
+                        CREATE INDEX ndxsmbiostime ON smbios (time);
+                        CREATE INDEX ndxsmbiosexpire ON smbios (expire);
+                        `, function (err) {
+                            // Completed DB creation of SQLite3
+                            sqliteSetOptions(func);
+                            //setupFunctions could be put in the sqliteSetupOptions, but left after it for clarity
+                            setupFunctions(func);
+                        }
+                    );
+                });
+                return;
+            } else if (err) { console.log("SQLite Error: " + err); process.exit(0); }
+
+            //for existing db's
+            sqliteSetOptions();
+            //setupFunctions could be put in the sqliteSetupOptions, but left after it for clarity
+            setupFunctions(func);
+        });
+    } else if (parent.args.acebase) {
+        // AceBase database setup
+        obj.databaseType = DB_ACEBASE;
+        const { AceBase } = require('acebase');
+        // For information on AceBase sponsor: https://github.com/appy-one/acebase/discussions/100
+        obj.file = new AceBase('meshcentral', { sponsor: ((typeof parent.args.acebase == 'object') && (parent.args.acebase.sponsor)), logLevel: 'error', storage: { path: parent.datapath } });
+        // Get all the databases ready
+        obj.file.ready(function () {
+            // Create AceBase indexes
+            obj.file.indexes.create('meshcentral', 'type', { include: ['domain', 'meshid'] });
+            obj.file.indexes.create('meshcentral', 'email');
+            obj.file.indexes.create('meshcentral', 'meshid');
+            obj.file.indexes.create('meshcentral', 'intelamt.uuid');
+            obj.file.indexes.create('events', 'userid', { include: ['action'] });
+            obj.file.indexes.create('events', 'domain', { include: ['nodeid', 'time'] });
+            obj.file.indexes.create('events', 'ids', { include: ['time'] });
+            obj.file.indexes.create('events', 'time');
+            obj.file.indexes.create('power', 'nodeid', { include: ['time'] });
+            obj.file.indexes.create('power', 'time');
+            obj.file.indexes.create('stats', 'time');
+            obj.file.indexes.create('stats', 'expire');
+            // Completed setup of AceBase
+            setupFunctions(func);
+        });
+    } else if (parent.args.mariadb || parent.args.mysql) {
         var connectinArgs = (parent.args.mariadb) ? parent.args.mariadb : parent.args.mysql;
-        var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
+        if (typeof connectinArgs == 'string') {
+            const parts = connectinArgs.split(/[:@/]+/);
+            var connectionObject = {
+                "user": parts[1],
+                "password": parts[2],
+                "host": parts[3],
+                "port": parts[4],
+                "database": parts[5]
+            };
+            var dbname = (connectionObject.database != null) ? connectionObject.database : 'meshcentral';
+        } else {
+            var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
 
-        // Including the db name in the connection obj will cause a connection failure if it does not exist
-        var connectionObject = Clone(connectinArgs);
-        delete connectionObject.database;
+            // Including the db name in the connection obj will cause a connection faliure if it does not exist
+            var connectionObject = Clone(connectinArgs);
+            delete connectionObject.database;
 
-        try {
-            if (connectinArgs.ssl) {
-                if (connectinArgs.ssl.dontcheckserveridentity == true) { connectionObject.ssl.checkServerIdentity = function(name, cert) { return undefined; } };
-                if (connectinArgs.ssl.cacertpath) { connectionObject.ssl.ca = [require('fs').readFileSync(connectinArgs.ssl.cacertpath, 'utf8')]; }
-                if (connectinArgs.ssl.clientcertpath) { connectionObject.ssl.cert = [require('fs').readFileSync(connectinArgs.ssl.clientcertpath, 'utf8')]; }
-                if (connectinArgs.ssl.clientkeypath) { connectionObject.ssl.key = [require('fs').readFileSync(connectinArgs.ssl.clientkeypath, 'utf8')]; }
+            try {
+                if (connectinArgs.ssl) {
+                    if (connectinArgs.ssl.dontcheckserveridentity == true) { connectionObject.ssl.checkServerIdentity = function (name, cert) { return undefined; } };
+                    if (connectinArgs.ssl.cacertpath) { connectionObject.ssl.ca = [require('fs').readFileSync(connectinArgs.ssl.cacertpath, 'utf8')]; }
+                    if (connectinArgs.ssl.clientcertpath) { connectionObject.ssl.cert = [require('fs').readFileSync(connectinArgs.ssl.clientcertpath, 'utf8')]; }
+                    if (connectinArgs.ssl.clientkeypath) { connectionObject.ssl.key = [require('fs').readFileSync(connectinArgs.ssl.clientkeypath, 'utf8')]; }
+                }
+            } catch (ex) {
+                console.log('Error loading SQL Connector certificate: ' + ex);
+                process.exit();
             }
-        } catch (ex) {
-            console.log('Error loading SQL Connector certificate: ' + ex);
-            process.exit();
         }
 
         if (parent.args.mariadb) {
             // Use MariaDB
-            obj.databaseType = 4;
+            obj.databaseType = DB_MARIADB;
             var tempDatastore = require('mariadb').createPool(connectionObject);
             tempDatastore.getConnection().then(function (conn) {
                 conn.query('CREATE DATABASE IF NOT EXISTS ' + dbname).then(function (result) {
@@ -664,65 +894,70 @@ module.exports.CreateDB = function (parent, func) {
             createTablesIfNotExist(dbname);
         } else if (parent.args.mysql) {
             // Use MySQL
-            obj.databaseType = 5;
-            var tempDatastore = require('mysql').createPool(connectionObject);
+            obj.databaseType = DB_MYSQL;
+            var tempDatastore = require('mysql2').createPool(connectionObject);
             tempDatastore.query('CREATE DATABASE IF NOT EXISTS ' + dbname, function (error) {
                 if (error != null) {
                     console.log('Auto-create database failed: ' + error);
                 }
                 connectionObject.database = dbname;
-                Datastore = require('mysql').createPool(connectionObject);
+                Datastore = require('mysql2').createPool(connectionObject);
                 createTablesIfNotExist(dbname);
             });
             setTimeout(function () { tempDatastore.end(); }, 2000);
         }
     } else if (parent.args.postgres) {
         // Postgres SQL
-        var connectinArgs = parent.args.postgres;
-        var dbname = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral';
-        obj.databaseType = 6;
-        const pgtools = require('pgtools');
-        pgtools.createdb(connectinArgs, dbname, function (err, res) {
-            const { Pool, Client } = require('pg');
-            connectinArgs.database = dbname;
-            Datastore = new Client(connectinArgs);
-            Datastore.connect();
-            if (err == null) {
-                // Database was created, create the tables
-                parent.debug('db', 'Creating tables...');
-                sqlDbBatchExec([
-                    'CREATE TABLE IF NOT EXISTS main (id VARCHAR(256) PRIMARY KEY NOT NULL, type CHAR(32), domain CHAR(64), extra CHAR(255), extraex CHAR(255), doc JSON)',
-                    'CREATE TABLE IF NOT EXISTS events(id SERIAL PRIMARY KEY, time TIMESTAMP, domain CHAR(64), action CHAR(255), nodeid CHAR(255), userid CHAR(255), doc JSON)',
-                    'CREATE TABLE IF NOT EXISTS eventids(fkid INT NOT NULL, target CHAR(255), CONSTRAINT fk_eventid FOREIGN KEY (fkid) REFERENCES events (id) ON DELETE CASCADE ON UPDATE RESTRICT)',
-                    'CREATE TABLE IF NOT EXISTS serverstats (time TIMESTAMP PRIMARY KEY, expire TIMESTAMP, doc JSON)',
-                    'CREATE TABLE IF NOT EXISTS power (id SERIAL PRIMARY KEY, time TIMESTAMP, nodeid CHAR(255), doc JSON)',
-                    'CREATE TABLE IF NOT EXISTS smbios (id CHAR(255) PRIMARY KEY, time TIMESTAMP, expire TIMESTAMP, doc JSON)',
-                    'CREATE TABLE IF NOT EXISTS plugin (id SERIAL PRIMARY KEY, doc JSON)'
-                ], function (results) {
-                    parent.debug('db', 'Creating indexes...');
-                    sqlDbExec('CREATE INDEX ndxtypedomainextra ON main (type, domain, extra)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxextra ON main (extra)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxextraex ON main (extraex)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxeventstime ON events(time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxeventsusername ON events(domain, userid, time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxeventsdomainnodeidtime ON events(domain, nodeid, time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxeventids ON eventids(target)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxserverstattime ON serverstats (time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxserverstatexpire ON serverstats (expire)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxpowernodeidtime ON power (nodeid, time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxsmbiostime ON smbios (time)', null, function (err, response) { });
-                    sqlDbExec('CREATE INDEX ndxsmbiosexpire ON smbios (expire)', null, function (err, response) { });
-                    setupFunctions(func);
+        let connectinArgs = parent.args.postgres;
+        connectinArgs.database = (databaseName = (connectinArgs.database != null) ? connectinArgs.database : 'meshcentral');
+
+        let DatastoreTest;
+        obj.databaseType = DB_POSTGRESQL;
+        const { Client } = require('pg');
+        Datastore = new Client(connectinArgs);
+        //Connect to and check pg db first to check if own db exists. Otherwise errors out on 'database does not exist'
+        connectinArgs.database = 'postgres';
+        DatastoreTest = new Client(connectinArgs);
+        DatastoreTest.connect();
+
+        DatastoreTest.query('SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1', [databaseName], function (err, res) { // check database exists first before creating
+            if (res.rowCount != 0) { // database exists now check tables exists
+                DatastoreTest.end();
+                Datastore.connect();
+                Datastore.query('SELECT doc FROM main WHERE id = $1', ['DatabaseIdentifier'], function (err, res) {
+                    if (err == null) {
+                      (res.rowCount ==0) ? postgreSqlCreateTables(func) : setupFunctions(func)
+                    } else
+                    if (err.code == '42P01') { //42P01 = undefined table, https://www.postgresql.org/docs/current/errcodes-appendix.html
+                        postgreSqlCreateTables(func);
+                    } else {
+                        console.log('Postgresql database exists, other error: ', err.message); process.exit(0);
+                    };
                 });
-            } else {
-                // Database already existed, skip table and index creation
-                setupFunctions(func);
+            } else { // If not present, create the tables and indexes
+                //not needed, just use a create db statement: const pgtools = require('pgtools'); 
+                DatastoreTest.query('CREATE DATABASE '+ databaseName + ';', [], function (err, res) {
+                    if (err == null) {
+                        // Create the tables and indexes
+                        DatastoreTest.end();
+                        Datastore.connect();
+                        postgreSqlCreateTables(func);
+                    } else {
+                            console.log('Postgresql database create error: ', err.message);
+                            process.exit(0);
+                    }
+                });
             }
         });
     } else if (parent.args.mongodb) {
         // Use MongoDB
-        obj.databaseType = 3;
-        require('mongodb').MongoClient.connect(parent.args.mongodb, { useNewUrlParser: true, useUnifiedTopology: true }, function (err, client) {
+        obj.databaseType = DB_MONGODB;
+
+        // If running an older NodeJS version, TextEncoder/TextDecoder is required
+        if (global.TextEncoder == null) { global.TextEncoder = require('util').TextEncoder; }
+        if (global.TextDecoder == null) { global.TextDecoder = require('util').TextDecoder; }
+
+        require('mongodb').MongoClient.connect(parent.args.mongodb, { useNewUrlParser: true, useUnifiedTopology: true, enableUtf8Validation: false }, function (err, client) {
             if (err != null) { console.log("Unable to connect to database: " + err); process.exit(); return; }
             Datastore = client;
             parent.debug('db', 'Connected to MongoDB database...');
@@ -899,7 +1134,7 @@ module.exports.CreateDB = function (parent, func) {
         });
     } else if (parent.args.xmongodb) {
         // Use MongoJS, this is the old system.
-        obj.databaseType = 2;
+        obj.databaseType = DB_MONGOJS;
         Datastore = require('mongojs');
         var db = Datastore(parent.args.xmongodb);
         var dbcollection = 'meshcentral';
@@ -1003,9 +1238,12 @@ module.exports.CreateDB = function (parent, func) {
         setupFunctions(func); // Completed setup of MongoJS
     } else {
         // Use NeDB (The default)
-        obj.databaseType = 1;
-        try { Datastore = require('@yetzt/nedb'); } catch (ex) { } // This is the NeDB with fixed security dependencies.
-        if (Datastore == null) { Datastore = require('nedb'); } // So not to break any existing installations, if the old NeDB is present, use it.
+        obj.databaseType = DB_NEDB;
+        try { Datastore = require('@seald-io/nedb'); } catch (ex) { } // This is the NeDB with Node 23 support.
+        if (Datastore == null) {
+            try { Datastore = require('@yetzt/nedb'); } catch (ex) { } // This is the NeDB with fixed security dependencies.
+            if (Datastore == null) { Datastore = require('nedb'); } // So not to break any existing installations, if the old NeDB is present, use it.
+        }
         var datastoreOptions = { filename: parent.getConfigFilePath('meshcentral.db'), autoload: true };
 
         // If a DB encryption key is provided, perform database encryption
@@ -1032,7 +1270,7 @@ module.exports.CreateDB = function (parent, func) {
 
         // Start NeDB main collection and setup indexes
         obj.file = new Datastore(datastoreOptions);
-        obj.file.persistence.setAutocompactionInterval(86400000); // Compact once a day
+        obj.file.setAutocompactionInterval(86400000); // Compact once a day
         obj.file.ensureIndex({ fieldName: 'type' });
         obj.file.ensureIndex({ fieldName: 'domain' });
         obj.file.ensureIndex({ fieldName: 'meshid', sparse: true });
@@ -1041,7 +1279,7 @@ module.exports.CreateDB = function (parent, func) {
 
         // Setup the events collection and setup indexes
         obj.eventsfile = new Datastore({ filename: parent.getConfigFilePath('meshcentral-events.db'), autoload: true, corruptAlertThreshold: 1 });
-        obj.eventsfile.persistence.setAutocompactionInterval(86400000); // Compact once a day
+        obj.eventsfile.setAutocompactionInterval(86400000); // Compact once a day
         obj.eventsfile.ensureIndex({ fieldName: 'ids' }); // TODO: Not sure if this is a good index, this is a array field.
         obj.eventsfile.ensureIndex({ fieldName: 'nodeid', sparse: true });
         obj.eventsfile.ensureIndex({ fieldName: 'time', expireAfterSeconds: expireEventsSeconds });
@@ -1049,7 +1287,7 @@ module.exports.CreateDB = function (parent, func) {
 
         // Setup the power collection and setup indexes
         obj.powerfile = new Datastore({ filename: parent.getConfigFilePath('meshcentral-power.db'), autoload: true, corruptAlertThreshold: 1 });
-        obj.powerfile.persistence.setAutocompactionInterval(86400000); // Compact once a day
+        obj.powerfile.setAutocompactionInterval(86400000); // Compact once a day
         obj.powerfile.ensureIndex({ fieldName: 'nodeid' });
         obj.powerfile.ensureIndex({ fieldName: 'time', expireAfterSeconds: expirePowerEventsSeconds });
         obj.powerfile.remove({ time: { '$lt': new Date(Date.now() - (expirePowerEventsSeconds * 1000)) } }, { multi: true }); // Force delete older events
@@ -1060,7 +1298,7 @@ module.exports.CreateDB = function (parent, func) {
 
         // Setup the server stats collection and setup indexes
         obj.serverstatsfile = new Datastore({ filename: parent.getConfigFilePath('meshcentral-stats.db'), autoload: true, corruptAlertThreshold: 1 });
-        obj.serverstatsfile.persistence.setAutocompactionInterval(86400000); // Compact once a day
+        obj.serverstatsfile.setAutocompactionInterval(86400000); // Compact once a day
         obj.serverstatsfile.ensureIndex({ fieldName: 'time', expireAfterSeconds: expireServerStatsSeconds });
         obj.serverstatsfile.ensureIndex({ fieldName: 'expire', expireAfterSeconds: 0 }); // Auto-expire events
         obj.serverstatsfile.remove({ time: { '$lt': new Date(Date.now() - (expireServerStatsSeconds * 1000)) } }, { multi: true }); // Force delete older events
@@ -1068,10 +1306,79 @@ module.exports.CreateDB = function (parent, func) {
         // Setup plugin info collection
         if (obj.pluginsActive) {
             obj.pluginsfile = new Datastore({ filename: parent.getConfigFilePath('meshcentral-plugins.db'), autoload: true });
-            obj.pluginsfile.persistence.setAutocompactionInterval(86400000); // Compact once a day
+            obj.pluginsfile.setAutocompactionInterval(86400000); // Compact once a day
         }
 
         setupFunctions(func); // Completed setup of NeDB
+    }
+
+    function sqliteSetOptions(func) {
+        //get current auto_vacuum mode for comparison
+        obj.file.get('PRAGMA auto_vacuum;', function(err, current){
+            let pragma = 'PRAGMA journal_mode=' + obj.sqliteConfig.journalMode + ';' + 
+                'PRAGMA synchronous='+ obj.sqliteConfig.synchronous + ';' +
+                'PRAGMA journal_size_limit=' + obj.sqliteConfig.journalSize + ';' +
+                'PRAGMA auto_vacuum=' + obj.sqliteConfig.autoVacuum + ';' +
+                'PRAGMA incremental_vacuum=' + obj.sqliteConfig.incrementalVacuum + ';' +
+                'PRAGMA optimize=0x10002;';
+            //check new autovacuum mode, if changing from or to 'none', a VACUUM needs to be done to activate it. See https://www.sqlite.org/pragma.html#pragma_auto_vacuum
+            if ( obj.sqliteConfig.startupVacuum
+                || (current.auto_vacuum == 0 && obj.sqliteConfig.autoVacuum !='none')
+                || (current.auto_vacuum != 0 && obj.sqliteConfig.autoVacuum =='none'))
+                {
+                    pragma += 'VACUUM;';
+                };
+            parent.debug ('db', 'Config statement: ' + pragma);
+            
+            obj.file.exec( pragma,
+                function (err) {
+                if (err) { parent.debug('db', 'Config pragma error: ' + (err.message)) };
+                sqliteGetPragmas(['journal_mode', 'journal_size_limit', 'freelist_count', 'auto_vacuum', 'page_size', 'wal_autocheckpoint', 'synchronous'], function (pragma, pragmaValue) {
+                    parent.debug('db', 'PRAGMA: ' + pragma + '=' + pragmaValue);
+                });
+            });
+        });
+        //setupFunctions(func);
+    }
+
+    function sqliteGetPragmas (pragmas, func){
+        //pragmas can only be gotting one by one
+        pragmas.forEach (function (pragma) {
+            obj.file.get('PRAGMA ' + pragma + ';', function(err, res){
+                if (pragma == 'auto_vacuum') { res[pragma] = SQLITE_AUTOVACUUM[res[pragma]] };
+                if (pragma == 'synchronous') { res[pragma] = SQLITE_SYNCHRONOUS[res[pragma]] };
+                if (func) { func (pragma, res[pragma]); }
+            });
+        });
+    }
+    // Create the PostgreSQL tables
+    function postgreSqlCreateTables(func) {
+        // Database was created, create the tables
+        parent.debug('db', 'Creating tables...');
+        sqlDbBatchExec([
+            'CREATE TABLE IF NOT EXISTS main (id VARCHAR(256) PRIMARY KEY NOT NULL, type CHAR(32), domain CHAR(64), extra CHAR(255), extraex CHAR(255), doc JSON)',
+            'CREATE TABLE IF NOT EXISTS events(id SERIAL PRIMARY KEY, time TIMESTAMP, domain CHAR(64), action CHAR(255), nodeid CHAR(255), userid CHAR(255), doc JSON)',
+            'CREATE TABLE IF NOT EXISTS eventids(fkid INT NOT NULL, target CHAR(255), CONSTRAINT fk_eventid FOREIGN KEY (fkid) REFERENCES events (id) ON DELETE CASCADE ON UPDATE RESTRICT)',
+            'CREATE TABLE IF NOT EXISTS serverstats (time TIMESTAMP PRIMARY KEY, expire TIMESTAMP, doc JSON)',
+            'CREATE TABLE IF NOT EXISTS power (id SERIAL PRIMARY KEY, time TIMESTAMP, nodeid CHAR(255), doc JSON)',
+            'CREATE TABLE IF NOT EXISTS smbios (id CHAR(255) PRIMARY KEY, time TIMESTAMP, expire TIMESTAMP, doc JSON)',
+            'CREATE TABLE IF NOT EXISTS plugin (id SERIAL PRIMARY KEY, doc JSON)'
+        ], function (results) {
+            parent.debug('db', 'Creating indexes...');
+            sqlDbExec('CREATE INDEX ndxtypedomainextra ON main (type, domain, extra)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxextra ON main (extra)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxextraex ON main (extraex)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxeventstime ON events(time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxeventsusername ON events(domain, userid, time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxeventsdomainnodeidtime ON events(domain, nodeid, time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxeventids ON eventids(target)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxserverstattime ON serverstats (time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxserverstatexpire ON serverstats (expire)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxpowernodeidtime ON power (nodeid, time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxsmbiostime ON smbios (time)', null, function (err, response) { });
+            sqlDbExec('CREATE INDEX ndxsmbiosexpire ON smbios (expire)', null, function (err, response) { });
+            setupFunctions(func);
+        });
     }
 
     // Check the object names for a "."
@@ -1084,39 +1391,82 @@ module.exports.CreateDB = function (parent, func) {
     }
 
     // Query the database
-    function sqlDbQuery(query, args, func) {
-        if (obj.databaseType == 4) { // MariaDB
+    function sqlDbQuery(query, args, func, debug) {
+        if (obj.databaseType == DB_SQLITE) { // SQLite
+            if (args == null) { args = []; }
+            obj.file.all(query, args, function (err, docs) {
+                if (err != null) { console.log(query, args, err, docs); }
+                if (docs != null) {
+                    for (var i in docs) {
+                        if (typeof docs[i].doc == 'string') {
+                            try { docs[i] = JSON.parse(docs[i].doc); } catch (ex) {
+                                console.log(query, args, docs[i]);
+                            }
+                        }
+                    }
+                }
+                if (func) { func(err, docs); }
+            });
+        } else if (obj.databaseType == DB_MARIADB) { // MariaDB
             Datastore.getConnection()
                 .then(function (conn) {
                     conn.query(query, args)
                         .then(function (rows) {
                             conn.release();
-                            const docs = [];
-                            for (var i in rows) { if (rows[i].doc) { docs.push(performTypedRecordDecrypt((typeof rows[i].doc == 'object') ? rows[i].doc : JSON.parse(rows[i].doc))); } }
+                            var docs = [];
+                            for (var i in rows) {
+                                if (rows[i].doc) {
+                                    docs.push(performTypedRecordDecrypt((typeof rows[i].doc == 'object') ? rows[i].doc : JSON.parse(rows[i].doc)));
+                                } else if ((rows.length == 1) && (rows[i]['COUNT(doc)'] != null)) {
+                                    // This is a SELECT COUNT() operation
+                                    docs = parseInt(rows[i]['COUNT(doc)']);
+                                }
+                            }
                             if (func) try { func(null, docs); } catch (ex) { console.log('SQLERR1', ex); }
                         })
                         .catch(function (err) { conn.release(); if (func) try { func(err); } catch (ex) { console.log('SQLERR2', ex); } });
                 }).catch(function (err) { if (func) { try { func(err); } catch (ex) { console.log('SQLERR3', ex); } } });
-        } else if (obj.databaseType == 5) { // MySQL
+        } else if (obj.databaseType == DB_MYSQL) { // MySQL
             Datastore.query(query, args, function (error, results, fields) {
                 if (error != null) {
                     if (func) try { func(error); } catch (ex) { console.log('SQLERR4', ex); }
                 } else {
                     var docs = [];
-                    for (var i in results) { if (results[i].doc) { docs.push(JSON.parse(results[i].doc)); } }
+                    for (var i in results) {
+                        if (results[i].doc) {
+                            if (typeof results[i].doc == 'string') {
+                                docs.push(JSON.parse(results[i].doc));
+                            } else {
+                                docs.push(results[i].doc);
+                            }
+                        } else if ((results.length == 1) && (results[i]['COUNT(doc)'] != null)) {
+                            // This is a SELECT COUNT() operation
+                            docs = results[i]['COUNT(doc)'];
+                        }
+                    }
                     if (func) { try { func(null, docs); } catch (ex) { console.log('SQLERR5', ex); } }
                 }
             });
-        } else if (obj.databaseType == 6) { // Postgres SQL
+        } else if (obj.databaseType == DB_POSTGRESQL) { // Postgres SQL
             Datastore.query(query, args, function (error, results) {
                 if (error != null) {
-                    console.log(query, args, error);
                     if (func) try { func(error); } catch (ex) { console.log('SQLERR4', ex); }
                 } else {
                     var docs = [];
                     if ((results.command == 'INSERT') && (results.rows != null) && (results.rows.length == 1)) { docs = results.rows[0]; }
                     else if (results.command == 'SELECT') {
-                        for (var i in results.rows) { if (results.rows[i].doc) { if (typeof results.rows[i].doc == 'string') { docs.push(JSON.parse(results.rows[i].doc)); } else { docs.push(results.rows[i].doc); } } }
+                        for (var i in results.rows) {
+                            if (results.rows[i].doc) {
+                                if (typeof results.rows[i].doc == 'string') {
+                                    docs.push(JSON.parse(results.rows[i].doc));
+                                } else {
+                                    docs.push(results.rows[i].doc);
+                                }
+                            } else if (results.rows[i].count && (results.rows.length == 1)) {
+                                // This is a SELECT COUNT() operation
+                                docs = parseInt(results.rows[i].count);
+                            }
+                        }
                     }
                     if (func) { try { func(null, docs, results); } catch (ex) { console.log('SQLERR5', ex); } }
                 }
@@ -1126,7 +1476,7 @@ module.exports.CreateDB = function (parent, func) {
 
     // Exec on the database
     function sqlDbExec(query, args, func) {
-        if (obj.databaseType == 4) { // MariaDB
+        if (obj.databaseType == DB_MARIADB) { // MariaDB
             Datastore.getConnection()
                 .then(function (conn) {
                     conn.query(query, args)
@@ -1136,7 +1486,7 @@ module.exports.CreateDB = function (parent, func) {
                         })
                         .catch(function (err) { conn.release(); if (func) try { func(err); } catch (ex) { console.log(ex); } });
                 }).catch(function (err) { if (func) { try { func(err); } catch (ex) { console.log(ex); } } });
-        } else if ((obj.databaseType == 5) || (obj.databaseType == 6)) { // MySQL or Postgres SQL
+        } else if ((obj.databaseType == DB_MYSQL) || (obj.databaseType == DB_POSTGRESQL)) { // MySQL or Postgres SQL
             Datastore.query(query, args, function (error, results, fields) {
                 if (func) try { func(error, results ? results[0] : null); } catch (ex) { console.log(ex); }
             });
@@ -1145,7 +1495,7 @@ module.exports.CreateDB = function (parent, func) {
 
     // Execute a batch of commands on the database
     function sqlDbBatchExec(queries, func) {
-        if (obj.databaseType == 4) { // MariaDB
+        if (obj.databaseType == DB_MARIADB) { // MariaDB
             Datastore.getConnection()
                 .then(function (conn) {
                     var Promises = [];
@@ -1155,7 +1505,16 @@ module.exports.CreateDB = function (parent, func) {
                         .catch(function (err) { conn.release(); if (func) { try { func(err); } catch (ex) { console.log(ex); } } });
                 })
                 .catch(function (err) { if (func) { try { func(err); } catch (ex) { console.log(ex); } } });
-        } else if ((obj.databaseType == 5) || (obj.databaseType == 6)) { // MySQL
+        } else if (obj.databaseType == DB_MYSQL) { // MySQL
+            Datastore.getConnection(function(err, connection) {
+                if (err) { if (func) { try { func(err); } catch (ex) { console.log(ex); } } return; }
+                var Promises = [];
+                for (var i in queries) { if (typeof queries[i] == 'string') { Promises.push(connection.promise().query(queries[i])); } else { Promises.push(connection.promise().query(queries[i][0], queries[i][1])); } }
+                Promise.all(Promises)
+                    .then(function (error, results, fields) { connection.release(); if (func) { try { func(error, results); } catch (ex) { console.log(ex); } } })
+                    .catch(function (error, results, fields) { connection.release(); if (func) { try { func(error); } catch (ex) { console.log(ex); } } });
+            });
+        } else if (obj.databaseType == DB_POSTGRESQL) { // Postgres
             var Promises = [];
             for (var i in queries) { if (typeof queries[i] == 'string') { Promises.push(Datastore.query(queries[i])); } else { Promises.push(Datastore.query(queries[i][0], queries[i][1])); } }
             Promise.all(Promises)
@@ -1165,7 +1524,625 @@ module.exports.CreateDB = function (parent, func) {
     }
 
     function setupFunctions(func) {
-        if (obj.databaseType == 6) {
+        if (obj.databaseType == DB_SQLITE) {
+            // Database actions on the main collection. SQLite3: https://www.linode.com/docs/guides/getting-started-with-nodejs-sqlite/
+            obj.Set = function (value, func) {
+                obj.dbCounters.fileSet++;
+                var extra = null, extraex = null;
+                value = common.escapeLinksFieldNameEx(value);
+                if (value.meshid) { extra = value.meshid; } else if (value.email) { extra = 'email/' + value.email; } else if (value.nodeid) { extra = value.nodeid; }
+                if ((value.type == 'node') && (value.intelamt != null) && (value.intelamt.uuid != null)) { extraex = 'uuid/' + value.intelamt.uuid; }
+                if (value._id == null) { value._id = require('crypto').randomBytes(16).toString('hex'); }
+                sqlDbQuery('INSERT INTO main VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET type = $2, domain = $3, extra = $4, extraex = $5, doc = $6;', [value._id, (value.type ? value.type : null), ((value.domain != null) ? value.domain : null), extra, extraex, JSON.stringify(performTypedRecordEncrypt(value))], func);
+            }
+            obj.SetRaw = function (value, func) {
+                obj.dbCounters.fileSet++;
+                var extra = null, extraex = null;
+                if (value.meshid) { extra = value.meshid; } else if (value.email) { extra = 'email/' + value.email; } else if (value.nodeid) { extra = value.nodeid; }
+                if ((value.type == 'node') && (value.intelamt != null) && (value.intelamt.uuid != null)) { extraex = 'uuid/' + value.intelamt.uuid; }
+                if (value._id == null) { value._id = require('crypto').randomBytes(16).toString('hex'); }
+                sqlDbQuery('INSERT INTO main VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET type = $2, domain = $3, extra = $4, extraex = $5, doc = $6;', [value._id, (value.type ? value.type : null), ((value.domain != null) ? value.domain : null), extra, extraex, JSON.stringify(performTypedRecordEncrypt(value))], func);
+            }
+            obj.Get = function (_id, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE id = $1', [_id], function (err, docs) {
+                    if ((docs != null) && (docs.length > 0)) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetAll = function (func) {
+                sqlDbQuery('SELECT domain, doc FROM main', null, function (err, docs) {
+                    if ((docs != null) && (docs.length > 0)) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetHash = function (id, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE id = $1', [id], function (err, docs) {
+                    if ((docs != null) && (docs.length > 0)) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetAllTypeNoTypeField = function (type, domain, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE type = $1 AND domain = $2', [type, domain], function (err, docs) {
+                    if ((docs != null) && (docs.length > 0)) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            };
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
+                if (limit == 0) { limit = -1; } // In SQLite, no limit is -1
+                if (id && (id != '')) {
+                    sqlDbQuery('SELECT doc FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra IN (' + dbMergeSqlArray(meshes) + ')) LIMIT $4 OFFSET $5', [id, type, domain, limit, skip], function (err, docs) {
+                        if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                        func(err, performTypedRecordDecrypt(docs));
+                    });
+                } else {
+                    if (extrasids == null) {
+                        sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND (extra IN (' + dbMergeSqlArray(meshes) + ')) LIMIT $3 OFFSET $4', [type, domain, limit, skip], function (err, docs) {
+                            if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                            func(err, performTypedRecordDecrypt(docs));
+                        });
+                    } else {
+                        sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND ((extra IN (' + dbMergeSqlArray(meshes) + ')) OR (id IN (' + dbMergeSqlArray(extrasids) + '))) LIMIT $3 OFFSET $4', [type, domain, limit, skip], function (err, docs) {
+                            if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                            func(err, performTypedRecordDecrypt(docs));
+                        });
+                    }
+                }
+            };
+            obj.CountAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+                if (id && (id != '')) {
+                    sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra IN (' + dbMergeSqlArray(meshes) + '))', [id, type, domain], function (err, docs) {
+                        func(err, (err == null) ? docs[0]['COUNT(doc)'] : null);
+                    });
+                } else {
+                    if (extrasids == null) {
+                        sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (type = $1) AND (domain = $2) AND (extra IN (' + dbMergeSqlArray(meshes) + '))', [type, domain], function (err, docs) {
+                            func(err, (err == null) ? docs[0]['COUNT(doc)'] : null);
+                        });
+                    } else {
+                        sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (type = $1) AND (domain = $2) AND ((extra IN (' + dbMergeSqlArray(meshes) + ')) OR (id IN (' + dbMergeSqlArray(extrasids) + ')))', [type, domain], function (err, docs) {
+                            func(err, (err == null) ? docs[0]['COUNT(doc)'] : null);
+                        });
+                    }
+                }
+            };
+            obj.GetAllTypeNodeFiltered = function (nodes, domain, type, id, func) {
+                if (id && (id != '')) {
+                    sqlDbQuery('SELECT doc FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra IN (' + dbMergeSqlArray(nodes) + '))', [id, type, domain], function (err, docs) {
+                        if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                        func(err, performTypedRecordDecrypt(docs));
+                    });
+                } else {
+                    sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND (extra IN (' + dbMergeSqlArray(nodes) + '))', [type, domain], function (err, docs) {
+                        if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                        func(err, performTypedRecordDecrypt(docs));
+                    });
+                }
+            };
+            obj.GetAllType = function (type, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE type = $1', [type], function (err, docs) {
+                    if (docs != null) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetAllIdsOfType = function (ids, domain, type, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE (id IN (' + dbMergeSqlArray(ids) + ')) AND domain = $1 AND type = $2', [domain, type], function (err, docs) {
+                    if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetUserWithEmail = function (domain, email, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE domain = $1 AND extra = $2', [domain, 'email/' + email], function (err, docs) {
+                    if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.GetUserWithVerifiedEmail = function (domain, email, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE domain = $1 AND extra = $2', [domain, 'email/' + email], function (err, docs) {
+                    if (docs != null) { for (var i in docs) { delete docs[i].type; if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, performTypedRecordDecrypt(docs));
+                });
+            }
+            obj.Remove = function (id, func) { sqlDbQuery('DELETE FROM main WHERE id = $1', [id], func); };
+            obj.RemoveAll = function (func) { sqlDbQuery('DELETE FROM main', null, func); };
+            obj.RemoveAllOfType = function (type, func) { sqlDbQuery('DELETE FROM main WHERE type = $1', [type], func); };
+            obj.InsertMany = function (data, func) { var pendingOps = 0; for (var i in data) { pendingOps++; obj.SetRaw(data[i], function () { if (--pendingOps == 0) { func(); } }); } }; // Insert records directly, no link escaping
+            obj.RemoveMeshDocuments = function (id, func) { sqlDbQuery('DELETE FROM main WHERE extra = $1', [id], function () { sqlDbQuery('DELETE FROM main WHERE id = $1', ['nt' + id], func); }); };
+            obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
+            obj.DeleteDomain = function (domain, func) { sqlDbQuery('DELETE FROM main WHERE domain = $1', [domain], func); };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
+            obj.getLocalAmtNodes = function (func) {
+                sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NULL)', null, function (err, docs) {
+                    if (docs != null) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r);
+                });
+            };
+            obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) {
+                sqlDbQuery('SELECT doc FROM main WHERE domain = $1 AND extraex = $2', [domainid, 'uuid/' + uuid], function (err, docs) {
+                    if (docs != null) { for (var i in docs) { if (docs[i].links != null) { docs[i] = common.unEscapeLinksFieldName(docs[i]); } } }
+                    func(err, docs);
+                });
+            };
+            obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { sqlDbExec('SELECT COUNT(id) FROM main WHERE domain = $1 AND type = $2', [domainid, type], function (err, response) { func((response['COUNT(id)'] == null) || (response['COUNT(id)'] > max), response['COUNT(id)']) }); } }
+
+            // Database actions on the events collection
+            obj.GetAllEvents = function (func) {
+                sqlDbQuery('SELECT doc FROM events', null, func);
+            };
+            obj.StoreEvent = function (event, func) {
+                obj.dbCounters.eventsSet++;
+                sqlDbQuery('INSERT INTO events VALUES (NULL, $1, $2, $3, $4, $5, $6) RETURNING id', [event.time, ((typeof event.domain == 'string') ? event.domain : null), event.action, event.nodeid ? event.nodeid : null, event.userid ? event.userid : null, JSON.stringify(event)], function (err, docs) {
+                    if(func){ func(); }
+                    if ((err == null) && (docs[0].id)) {
+                        for (var i in event.ids) {
+                            if (event.ids[i] != '*') {
+                                obj.pendingTransfer++;
+                                sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs[0].id, event.ids[i]], function(){ if(func){ func(); } });
+                            }
+                        }
+                    }
+                });
+            };
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
+                if (ids.indexOf('*') >= 0) {
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
+                } else {
+                    query = query + 'JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (' + dbMergeSqlArray(ids) + '))';
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC ";
+                }
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
+                if (ids.indexOf('*') >= 0) {
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2) ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $2";
+                    }
+                } else {
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target IN (" + dbMergeSqlArray(ids) + "))";
+                    if (filter != null) {
+                        query = query + " AND action = $2) GROUP BY id ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $2";
+                    }
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);                
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
+                if (ids.indexOf('*') >= 0) {
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
+                } else {
+                    query = query + 'JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (' + dbMergeSqlArray(ids) + '))';
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
+                }
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
+                if (ids.indexOf('*') >= 0) {
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
+                } else {
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target IN (" + dbMergeSqlArray(ids) + "))";
+                    if (filter != null) {
+                        query = query + " AND action = $3) GROUP BY id ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $3";
+                    }
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
+                if (ids.indexOf('*') >= 0) {
+                    sqlDbQuery('SELECT doc FROM events WHERE ((domain = $1) AND (time BETWEEN $2 AND $3)) ORDER BY time', [domain, start, end], func);
+                } else {
+                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE ((domain = $1) AND (target IN (' + dbMergeSqlArray(ids) + ')) AND (time BETWEEN $2 AND $3)) GROUP BY id ORDER BY time', [domain, start, end], func);
+                }
+            };
+            //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $3";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) AND ((userid = $3) OR (userid IS NULL)) ";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + "AND (action = $4) ORDER BY time DESC LIMIT $5";
+                    dataarray.push(filter);
+                } else {
+                    query = query + "ORDER BY time DESC LIMIT $4";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
+            obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND nodeid = $2', [domain, nodeid], function (err, docs) { }); };
+            obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND userid = $2', [domain, userid], function (err, docs) { }); };
+            obj.GetFailedLoginCount = function (userid, domainid, lastlogin, func) { sqlDbQuery('SELECT COUNT(*) FROM events WHERE action = \'authfail\' AND domain = $1 AND userid = $2 AND time > $3', [domainid, userid, lastlogin], function (err, response) { func(err == null ? response[0]['COUNT(*)'] : 0); }); }
+
+            // Database actions on the power collection
+            obj.getAllPower = function (func) { sqlDbQuery('SELECT doc FROM power', null, func); };
+            obj.storePowerEvent = function (event, multiServer, func) { obj.dbCounters.powerSet++; if (multiServer != null) { event.server = multiServer.serverid; } sqlDbQuery('INSERT INTO power VALUES (NULL, $1, $2, $3)', [event.time, event.nodeid ? event.nodeid : null, JSON.stringify(event)], func); };
+            obj.getPowerTimeline = function (nodeid, func) { sqlDbQuery('SELECT doc FROM power WHERE ((nodeid = $1) OR (nodeid = \'*\')) ORDER BY time ASC', [nodeid], func); };
+            obj.removeAllPowerEvents = function () { sqlDbQuery('DELETE FROM power', null, function (err, docs) { }); };
+            obj.removeAllPowerEventsForNode = function (nodeid) { if (nodeid == null) return; sqlDbQuery('DELETE FROM power WHERE nodeid = $1', [nodeid], function (err, docs) { }); };
+
+            // Database actions on the SMBIOS collection
+            obj.GetAllSMBIOS = function (func) { sqlDbQuery('SELECT doc FROM smbios', null, func); };
+            obj.SetSMBIOS = function (smbios, func) { var expire = new Date(smbios.time); expire.setMonth(expire.getMonth() + 6); sqlDbQuery('INSERT INTO smbios VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET time = $2, expire = $3, doc = $4', [smbios._id, smbios.time, expire, JSON.stringify(smbios)], func); };
+            obj.RemoveSMBIOS = function (id) { sqlDbQuery('DELETE FROM smbios WHERE id = $1', [id], function (err, docs) { }); };
+            obj.GetSMBIOS = function (id, func) { sqlDbQuery('SELECT doc FROM smbios WHERE id = $1', [id], func); };
+
+            // Database actions on the Server Stats collection
+            obj.SetServerStats = function (data, func) { sqlDbQuery('INSERT INTO serverstats VALUES ($1, $2, $3) ON CONFLICT (time) DO UPDATE SET expire = $2, doc = $3', [data.time, data.expire, JSON.stringify(data)], func); };
+            obj.GetServerStats = function (hours, func) { var t = new Date(); t.setTime(t.getTime() - (60 * 60 * 1000 * hours)); sqlDbQuery('SELECT doc FROM serverstats WHERE time > $1', [t], func); }; // TODO: Expire old entries
+
+            // Read a configuration file from the database
+            obj.getConfigFile = function (path, func) { obj.Get('cfile/' + path, func); }
+
+            // Write a configuration file to the database
+            obj.setConfigFile = function (path, data, func) { obj.Set({ _id: 'cfile/' + path, type: 'cfile', data: data.toString('base64') }, func); }
+
+            // List all configuration files
+            obj.listConfigFiles = function (func) { sqlDbQuery('SELECT doc FROM main WHERE type = "cfile" ORDER BY id', func); }
+
+            // Get database information (TODO: Complete this)
+            obj.getDbStats = function (func) {
+                obj.stats = { c: 4 };
+                sqlDbQuery('SELECT COUNT(*) FROM main', null, function (err, response) { obj.stats.meshcentral = (err == null ? response[0]['COUNT(*)'] : 0); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbQuery('SELECT COUNT(*) FROM serverstats', null, function (err, response) { obj.stats.serverstats = (err == null ? response[0]['COUNT(*)'] : 0); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbQuery('SELECT COUNT(*) FROM power', null, function (err, response) { obj.stats.power = (err == null ? response[0]['COUNT(*)'] : 0); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbQuery('SELECT COUNT(*) FROM smbios', null, function (err, response) { obj.stats.smbios = (err == null ? response[0]['COUNT(*)'] : 0); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+            }
+
+            // Plugin operations
+            if (obj.pluginsActive) {
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (NULL, $1)', [JSON.stringify(plugin)], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin', null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin WHERE id = $1', [id], func); }; // Get plugin
+                obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = $1', [id], func); }; // Delete plugin
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery('UPDATE plugin SET doc=JSON_SET(doc,"$.status",$1) WHERE id=$2', [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE plugin SET doc=json_patch(doc,$1) WHERE id=$2', [JSON.stringify(args),id], func); };
+            }
+        } else if (obj.databaseType == DB_ACEBASE) {
+            // Database actions on the main collection. AceBase: https://github.com/appy-one/acebase
+            obj.Set = function (data, func) {
+                data = common.escapeLinksFieldNameEx(data);
+                var xdata = performTypedRecordEncrypt(data);
+                obj.dbCounters.fileSet++;
+                obj.file.ref('meshcentral').child(encodeURIComponent(xdata._id)).set(common.aceEscapeFieldNames(xdata)).then(function (ref) { if (func) { func(); } })
+            };
+            obj.Get = function (id, func) {
+                obj.file.ref('meshcentral').child(encodeURIComponent(id)).get(function (snapshot) {
+                    if (snapshot.exists()) { func(null, performTypedRecordDecrypt([common.aceUnEscapeFieldNames(snapshot.val())])); } else { func(null, []); }
+                });
+            };
+            obj.GetAll = function (func) {
+                obj.file.ref('meshcentral').get(function(snapshot) {
+                    const val = snapshot.val();
+                    const docs = Object.keys(val).map(function(key) { return val[key]; });
+                    func(null, common.aceUnEscapeAllFieldNames(docs));
+                });
+            };
+            obj.GetHash = function (id, func) {
+                obj.file.ref('meshcentral').child(encodeURIComponent(id)).get({ include: ['hash'] }, function (snapshot) {
+                    if (snapshot.exists()) { func(null, snapshot.val()); } else { func(null, null); }
+                });
+            };
+            obj.GetAllTypeNoTypeField = function (type, domain, func) {
+                obj.file.query('meshcentral').filter('type', '==', type).filter('domain', '==', domain).get({ exclude: ['type'] }, function (snapshots) {
+                    const docs = [];
+                    for (var i in snapshots) { const x = snapshots[i].val(); docs.push(x); }
+                    func(null, common.aceUnEscapeAllFieldNames(docs));
+                });
+            }
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
+                if (meshes.length == 0) { func(null, []); return; }
+                var query = obj.file.query('meshcentral').skip(skip).take(limit).filter('type', '==', type).filter('domain', '==', domain);
+                if (id) { query = query.filter('_id', '==', id); }
+                if (extrasids == null) {
+                    query = query.filter('meshid', 'in', meshes);
+                    query.get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); });
+                } else {
+                    // TODO: This is a slow query as we did not find a filter-or-filter, so we query everything and filter manualy.
+                    query.get(function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) { const x = snapshots[i].val(); if ((extrasids.indexOf(x._id) >= 0) || (meshes.indexOf(x.meshid) >= 0)) { docs.push(x); } }
+                        func(null, performTypedRecordDecrypt(docs));
+                    });
+                }
+            };
+            obj.GetAllTypeNodeFiltered = function (nodes, domain, type, id, func) {
+                var query = obj.file.query('meshcentral').filter('type', '==', type).filter('domain', '==', domain).filter('nodeid', 'in', nodes);
+                if (id) { query = query.filter('_id', '==', id); }
+                query.get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); });
+            };
+            obj.GetAllType = function (type, func) {
+                obj.file.query('meshcentral').filter('type', '==', type).get(function (snapshots) {
+                    const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); }
+                    func(null, common.aceUnEscapeAllFieldNames(performTypedRecordDecrypt(docs)));
+                });
+            };
+            obj.GetAllIdsOfType = function (ids, domain, type, func) { obj.file.query('meshcentral').filter('_id', 'in', ids).filter('domain', '==', domain).filter('type', '==', type).get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); }); };
+            obj.GetUserWithEmail = function (domain, email, func) { obj.file.query('meshcentral').filter('type', '==', 'user').filter('domain', '==', domain).filter('email', '==', email).get({ exclude: ['type'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); }); };
+            obj.GetUserWithVerifiedEmail = function (domain, email, func) { obj.file.query('meshcentral').filter('type', '==', 'user').filter('domain', '==', domain).filter('email', '==', email).filter('emailVerified', '==', true).get({ exclude: ['type'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); }); };
+            obj.Remove = function (id, func) { obj.file.ref('meshcentral').child(encodeURIComponent(id)).remove().then(function () { if (func) { func(); } }); };
+            obj.RemoveAll = function (func) { obj.file.query('meshcentral').remove().then(function () { if (func) { func(); } }); };
+            obj.RemoveAllOfType = function (type, func) { obj.file.query('meshcentral').filter('type', '==', type).remove().then(function () { if (func) { func(); } }); };
+            obj.InsertMany = function (data, func) { var r = {}; for (var i in data) { const ref = obj.file.ref('meshcentral').child(encodeURIComponent(data[i]._id)); r[ref.key] = common.aceEscapeFieldNames(data[i]); } obj.file.ref('meshcentral').set(r).then(function (ref) { func(); }); }; // Insert records directly, no link escaping
+            obj.RemoveMeshDocuments = function (id) { obj.file.query('meshcentral').filter('meshid', '==', id).remove(); obj.file.ref('meshcentral').child(encodeURIComponent('nt' + id)).remove(); };
+            obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
+            obj.DeleteDomain = function (domain, func) { obj.file.query('meshcentral').filter('domain', '==', domain).remove().then(function () { if (func) { func(); } }); };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
+            obj.getLocalAmtNodes = function (func) { obj.file.query('meshcentral').filter('type', '==', 'node').filter('host', 'exists').filter('host', '!=', null).filter('intelamt', 'exists').get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); }); };
+            obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { obj.file.query('meshcentral').filter('type', '==', 'node').filter('domain', '==', domainid).filter('mtype', '!=', mtype).filter('intelamt.uuid', '==', uuid).get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, performTypedRecordDecrypt(docs)); }); };
+            obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { obj.file.query('meshcentral').filter('type', '==', type).filter('domain', '==', domainid).get({ snapshots: false }, function (snapshots) { func((snapshots.length > max), snapshots.length); }); } }
+
+            // Database actions on the events collection
+            obj.GetAllEvents = function (func) { 
+                obj.file.ref('events').get(function (snapshot) { 
+                    const val = snapshot.val();
+                    const docs = Object.keys(val).map(function(key) { return val[key]; });
+                    func(null, docs);
+                })
+            };
+            obj.StoreEvent = function (event, func) {
+                if (typeof event.account == 'object') { event = Object.assign({}, event); event.account = common.aceEscapeFieldNames(event.account); }
+                obj.dbCounters.eventsSet++;
+                obj.file.ref('events').push(event).then(function (userRef) { if (func) { func(); } });
+            };
+            obj.GetEvents = function (ids, domain, filter, func) {
+                // This request is slow since we have not found a .filter() that will take two arrays and match a single item.
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                }
+            };
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                // This request is slow since we have not found a .filter() that will take two arrays and match a single item.
+                // TODO: Request a new AceBase feature for a 'array:contains-one-of' filter:
+                // obj.file.indexes.create('events', 'ids', { type: 'array' });
+                // db.query('events').filter('ids', 'array:contains-one-of', ids)
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('action', '==', filter).take(limit).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).take(limit).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type'] }, function (snapshots) {
+                        const docs = [];
+                        for (var i in snapshots) {
+                            const doc = snapshots[i].val();
+                            if ((doc.ids == null) || (!Array.isArray(doc.ids))) continue;
+                            var found = false;
+                            for (var j in doc.ids) { if (ids.indexOf(doc.ids[j]) >= 0) { found = true; } } // Check if one of the items in both arrays matches
+                            if (found) { delete doc.ids; if (typeof doc.account == 'object') { doc.account = common.aceUnEscapeFieldNames(doc.account); } docs.push(doc); }
+                        }
+                        func(null, docs);
+                    });
+                }
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).filter('action', '==', filter).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('userid', 'in', userid).filter('ids', 'in', ids).sort('time', false).get({ exclude: ['_id', 'domain', 'node', 'type', 'ids'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
+            };
+            obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
+                obj.file.query('events').filter('domain', '==', domain).filter('ids', 'in', ids).filter('msgid', 'in', msgids).filter('time', 'between', [start, end]).sort('time', false).get({ exclude: ['type', '_id', 'domain', 'node'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            };
+            obj.GetUserLoginEvents = function (domain, userid, func) {
+                obj.file.query('events').filter('domain', '==', domain).filter('action', 'in', ['authfail', 'login']).filter('userid', '==', userid).filter('msgArgs', 'exists').sort('time', false).get({ include: ['action', 'time', 'msgid', 'msgArgs', 'tokenName'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('action', '==', filter).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                if (filter != null) {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).filter('action', '==', filter).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                } else {
+                    obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                }
+                obj.file.query('events').take(limit).filter('domain', '==', domain).filter('nodeid', '==', nodeid).filter('userid', '==', userid).sort('time', false).get({ exclude: ['type', 'etype', '_id', 'domain', 'ids', 'node', 'nodeid'] }, function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+            };
+            obj.RemoveAllEvents = function (domain) {
+                obj.file.query('events').filter('domain', '==', domain).remove().then(function () { if (func) { func(); } });;
+            };
+            obj.RemoveAllNodeEvents = function (domain, nodeid) {
+                if ((domain == null) || (nodeid == null)) return;
+                obj.file.query('events').filter('domain', '==', domain).filter('nodeid', '==', nodeid).remove().then(function () { if (func) { func(); } });;
+            };
+            obj.RemoveAllUserEvents = function (domain, userid) {
+                if ((domain == null) || (userid == null)) return;
+                obj.file.query('events').filter('domain', '==', domain).filter('userid', '==', userid).remove().then(function () { if (func) { func(); } });;
+            };
+            obj.GetFailedLoginCount = function (userid, domainid, lastlogin, func) {
+                obj.file.query('events').filter('domain', '==', domainid).filter('userid', '==', userid).filter('time', '>', lastlogin).sort('time', false).get({ snapshots: false }, function (snapshots) { func(null, snapshots.length); });
+            }
+
+            // Database actions on the power collection
+            obj.getAllPower = function (func) {
+                obj.file.ref('power').get(function (snapshot) {
+                    const val = snapshot.val(); 
+                    const docs = Object.keys(val).map(function(key) { return val[key]; }); 
+                    func(null, docs); 
+                });
+            };
+            obj.storePowerEvent = function (event, multiServer, func) {
+                if (multiServer != null) { event.server = multiServer.serverid; }
+                obj.file.ref('power').push(event).then(function (userRef) { if (func) { func(); } });
+            };
+            obj.getPowerTimeline = function (nodeid, func) {
+                obj.file.query('power').filter('nodeid', 'in', ['*', nodeid]).sort('time').get({ exclude: ['_id', 'nodeid', 's'] }, function (snapshots) {
+                    const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs);
+                });
+            };
+            obj.removeAllPowerEvents = function () {
+                obj.file.ref('power').remove().then(function () { if (func) { func(); } });
+            };
+            obj.removeAllPowerEventsForNode = function (nodeid) {
+                if (nodeid == null) return;
+                obj.file.query('power').filter('nodeid', '==', nodeid).remove().then(function () { if (func) { func(); } });
+            };
+
+            // Database actions on the SMBIOS collection
+            if (obj.smbiosfile != null) {
+                obj.GetAllSMBIOS = function (func) {
+                    obj.file.ref('smbios').get(function (snapshot) { 
+                        const val = snapshot.val(); 
+                        const docs = Object.keys(val).map(function(key) { return val[key]; }); 
+                        func(null, docs); 
+                    });
+                };
+                obj.SetSMBIOS = function (smbios, func) {
+                    obj.file.ref('meshcentral/' + encodeURIComponent(smbios._id)).set(smbios).then(function (ref) { if (func) { func(); } })
+                };
+                obj.RemoveSMBIOS = function (id) {
+                    obj.file.query('smbios').filter('_id', '==', id).remove().then(function () { if (func) { func(); } });
+                };
+                obj.GetSMBIOS = function (id, func) {
+                    obj.file.query('smbios').filter('_id', '==', id).get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); });
+                };
+            }
+
+            // Database actions on the Server Stats collection
+            obj.SetServerStats = function (data, func) {
+                obj.file.ref('stats').push(data).then(function (userRef) { if (func) { func(); } });
+            };
+            obj.GetServerStats = function (hours, func) {
+                var t = new Date();
+                t.setTime(t.getTime() - (60 * 60 * 1000 * hours));
+                obj.file.query('stats').filter('time', '>', t).get({ exclude: ['_id', 'cpu'] }, function (snapshots) {
+                    const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs);
+                });
+            };
+
+            // Read a configuration file from the database
+            obj.getConfigFile = function (path, func) { obj.Get('cfile/' + path, func); }
+
+            // Write a configuration file to the database
+            obj.setConfigFile = function (path, data, func) { obj.Set({ _id: 'cfile/' + path, type: 'cfile', data: data.toString('base64') }, func); }
+
+            // List all configuration files
+            obj.listConfigFiles = function (func) {
+                obj.file.query('meshcentral').filter('type', '==', 'cfile').sort('_id').get(function (snapshots) {
+                    const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs);
+                });
+            }
+
+            // Get database information
+            obj.getDbStats = function (func) {
+                obj.stats = { c: 5 };
+                obj.file.ref('meshcentral').count().then(function (count) { obj.stats.meshcentral = count; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.file.ref('events').count().then(function (count) { obj.stats.events = count; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.file.ref('power').count().then(function (count) { obj.stats.power = count; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.file.ref('smbios').count().then(function (count) { obj.stats.smbios = count; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.file.ref('stats').count().then(function (count) { obj.stats.serverstats = count; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+            }
+
+            // Plugin operations
+            if (obj.pluginsActive) {
+                obj.addPlugin = function (plugin, func) { plugin.type = 'plugin'; obj.file.ref('plugin').child(encodeURIComponent(plugin._id)).set(plugin).then(function (ref) { if (func) { func(); } }) }; // Add a plugin
+                obj.getPlugins = function (func) { 
+                    obj.file.ref('plugin').get({ exclude: ['type'] }, function (snapshot) {
+                        const val = snapshot.val();
+                        const docs = Object.keys(val).map(function(key) { return val[key]; }).sort(function(a, b) { return a.name < b.name ? -1 : 1 }); 
+                        func(null, docs); 
+                    });
+                }; // Get all plugins
+                obj.getPlugin = function (id, func) { obj.file.query('plugin').filter('_id', '==', id).get(function (snapshots) { const docs = []; for (var i in snapshots) { docs.push(snapshots[i].val()); } func(null, docs); }); }; // Get plugin
+                obj.deletePlugin = function (id, func) { obj.file.ref('plugin').child(encodeURIComponent(id)).remove().then(function () { if (func) { func(); } }); }; // Delete plugin
+                obj.setPluginStatus = function (id, status, func) { obj.file.ref('plugin').child(encodeURIComponent(id)).update({ status: status }).then(function (ref) { if (func) { func(); } }) };
+                obj.updatePlugin = function (id, args, func) { delete args._id; obj.file.ref('plugin').child(encodeURIComponent(id)).set(args).then(function (ref) { if (func) { func(); } }) };
+            }
+        } else if (obj.databaseType == DB_POSTGRESQL) {
             // Database actions on the main collection (Postgres)
             obj.Set = function (value, func) {
                 obj.dbCounters.fileSet++;
@@ -1188,25 +2165,34 @@ module.exports.CreateDB = function (parent, func) {
             obj.GetAll = function (func) { sqlDbQuery('SELECT domain, doc FROM main', null, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.GetHash = function (id, func) { sqlDbQuery('SELECT doc FROM main WHERE id = $1', [id], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.GetAllTypeNoTypeField = function (type, domain, func) { sqlDbQuery('SELECT doc FROM main WHERE type = $1 AND domain = $2', [type, domain], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); }); };
-            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
+                if (limit == 0) { limit = 0xFFFFFFFF; }
                 if (id && (id != '')) {
-                    sqlDbQuery('SELECT doc FROM main WHERE id = $1 AND type = $2 AND domain = $3 AND (extra = ANY ($4))', [id, type, domain, meshes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                    sqlDbQuery('SELECT doc FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra = ANY ($4)) LIMIT $5 OFFSET $6', [id, type, domain, meshes, limit, skip], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
                 } else {
                     if (extrasids == null) {
-                        sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND (extra = ANY ($3))', [type, domain, meshes], function (err, docs) {
-                            if (err == null) { for (var i in docs) { delete docs[i].type } }
-                            func(err, performTypedRecordDecrypt(docs));
-                        }, true);
+                        sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND (extra = ANY ($3)) LIMIT $4 OFFSET $5', [type, domain, meshes, limit, skip], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); }, true);
                     } else {
-                        sqlDbQuery('SELECT doc FROM main WHERE type = $1 AND domain = $2 AND ((extra = ANY ($3)) OR (id = ANY ($4)))', [type, domain, meshes, extrasids], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                        sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND ((extra = ANY ($3)) OR (id = ANY ($4))) LIMIT $5 OFFSET $6', [type, domain, meshes, extrasids, limit, skip], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                    }
+                }
+            };
+            obj.CountAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+                if (id && (id != '')) {
+                    sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra = ANY ($4))', [id, type, domain, meshes], function (err, docs) { func(err, docs); });
+                } else {
+                    if (extrasids == null) {
+                        sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (type = $1) AND (domain = $2) AND (extra = ANY ($3))', [type, domain, meshes], function (err, docs) { func(err, docs); }, true);
+                    } else {
+                        sqlDbQuery('SELECT COUNT(doc) FROM main WHERE (type = $1) AND (domain = $2) AND ((extra = ANY ($3)) OR (id = ANY ($4)))', [type, domain, meshes, extrasids], function (err, docs) { func(err, docs); });
                     }
                 }
             };
             obj.GetAllTypeNodeFiltered = function (nodes, domain, type, id, func) {
                 if (id && (id != '')) {
-                    sqlDbQuery('SELECT doc FROM main WHERE id = $1 AND type = $2 AND domain = $3 AND (extra = ANY ($4))', [id, type, domain, nodes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                    sqlDbQuery('SELECT doc FROM main WHERE (id = $1) AND (type = $2) AND (domain = $3) AND (extra = ANY ($4))', [id, type, domain, nodes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
                 } else {
-                    sqlDbQuery('SELECT doc FROM main WHERE type = $1 AND domain = $2 AND (extra = ANY ($3))', [type, domain, nodes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                    sqlDbQuery('SELECT doc FROM main WHERE (type = $1) AND (domain = $2) AND (extra = ANY ($3))', [type, domain, nodes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
                 }
             };
             obj.GetAllType = function (type, func) { sqlDbQuery('SELECT doc FROM main WHERE type = $1', [type], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
@@ -1220,9 +2206,9 @@ module.exports.CreateDB = function (parent, func) {
             obj.RemoveMeshDocuments = function (id, func) { sqlDbQuery('DELETE FROM main WHERE extra = $1', [id], function () { sqlDbQuery('DELETE FROM main WHERE id = $1', ['nt' + id], func); }); };
             obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
             obj.DeleteDomain = function (domain, func) { sqlDbQuery('DELETE FROM main WHERE domain = $1', [domain], func); };
-            obj.SetUser = function (user) { if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
-            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NOT NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null) { r.push(docs[i]); } } } func(err, r); }); };
+            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = \'node\') AND (extraex IS NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r); }); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = $1 AND extraex = $2', [domainid, 'uuid/' + uuid], func); };
             obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { sqlDbExec('SELECT COUNT(id) FROM main WHERE domain = $1 AND type = $2', [domainid, type], function (err, response) { func((response['COUNT(id)'] == null) || (response['COUNT(id)'] > max), response['COUNT(id)']) }); } }
 
@@ -1231,47 +2217,142 @@ module.exports.CreateDB = function (parent, func) {
             obj.StoreEvent = function (event, func) {
                 obj.dbCounters.eventsSet++;
                 sqlDbQuery('INSERT INTO events VALUES (DEFAULT, $1, $2, $3, $4, $5, $6) RETURNING id', [event.time, ((typeof event.domain == 'string') ? event.domain : null), event.action, event.nodeid ? event.nodeid : null, event.userid ? event.userid : null, event], function (err, docs) {
-                    if (docs.id) { for (var i in event.ids) { if (event.ids[i] != '*') { sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs.id, event.ids[i]]); } } }
+                    if(func){ func(); }
+                    if (docs.id) {
+                        for (var i in event.ids) {
+                            if (event.ids[i] != '*') {
+                                obj.pendingTransfer++;
+                                sqlDbQuery('INSERT INTO eventids VALUES ($1, $2)', [docs.id, event.ids[i]], function(){ if(func){ func(); } });
+                            }
+                        }
+                    }
                 });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain]; 
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC', [domain], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))) GROUP BY id ORDER BY time DESC', [domain, ids], func);
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1) ORDER BY time DESC LIMIT $2', [domain, limit], func);
+                    query = query + "WHERE (domain = $1";
+                    if (filter != null) {
+                        query = query + " AND action = $2) ORDER BY time DESC LIMIT $3";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $2";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))) GROUP BY id ORDER BY time DESC LIMIT $3', [domain, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND (target = ANY ($2))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC', [domain, userid], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))) GROUP BY id ORDER BY time DESC', [domain, userid, ids], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $4";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = $1 AND userid = $2) ORDER BY time DESC LIMIT $3', [domain, userid, limit], func);
+                    query = query + "WHERE (domain = $1 AND userid = $2";
+                    if (filter != null) {
+                        query = query + " AND action = $3) ORDER BY time DESC LIMIT $4 ";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") ORDER BY time DESC LIMIT $3";
+                    }
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))) GROUP BY id ORDER BY time DESC LIMIT $4', [domain, userid, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = $1 AND userid = $2 AND (target = ANY ($3))";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = $4) GROUP BY id ORDER BY time DESC LIMIT $5";
+                        dataarray.push(filter);
+                    } else {
+                        query = query + ") GROUP BY id ORDER BY time DESC LIMIT $4";
+                    }
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE ((domain = $1) AND (time BETWEEN $2 AND ?)) ORDER BY time', [domain, start, end], func);
+                    sqlDbQuery('SELECT doc FROM events WHERE ((domain = $1) AND (time BETWEEN $2 AND $3)) ORDER BY time', [domain, start, end], func);
                 } else {
                     sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE ((domain = $1) AND (target = ANY ($2)) AND (time BETWEEN $3 AND $4)) GROUP BY id ORDER BY time', [domain, ids, start, end], func);
                 }
             };
             //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) ORDER BY time DESC LIMIT $3', [nodeid, domain, limit], func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = $1) AND (domain = $2) AND ((userid = $3) OR (userid IS NULL)) ORDER BY time DESC LIMIT $4', [nodeid, domain, userid, limit], func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + " AND action = $3) ORDER BY time DESC LIMIT $4";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $3";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = $1 AND domain = $2 AND ((userid = $3) OR (userid IS NULL))";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + "  AND action = $4) ORDER BY time DESC LIMIT $5";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT $4";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
             obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND nodeid = $2', [domain, nodeid], function (err, docs) { }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = $1 AND userid = $2', [domain, userid], function (err, docs) { }); };
@@ -1303,20 +2384,6 @@ module.exports.CreateDB = function (parent, func) {
             // List all configuration files
             obj.listConfigFiles = function (func) { sqlDbQuery('SELECT doc FROM main WHERE type = "cfile" ORDER BY id', func); }
 
-            // Get all configuration files
-            obj.getAllConfigFiles = function (password, func) {
-                obj.file.find({ type: 'cfile' }).toArray(function (err, docs) {
-                    if (err != null) { func(null); return; }
-                    var r = null;
-                    for (var i = 0; i < docs.length; i++) {
-                        var name = docs[i]._id.split('/')[1];
-                        var data = obj.decryptData(password, docs[i].data);
-                        if (data != null) { if (r == null) { r = {}; } r[name] = data; }
-                    }
-                    func(r);
-                });
-            }
-
             // Get database information (TODO: Complete this)
             obj.getDbStats = function (func) {
                 obj.stats = { c: 4 };
@@ -1328,14 +2395,14 @@ module.exports.CreateDB = function (parent, func) {
 
             // Plugin operations
             if (obj.pluginsActive) {
-                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (DEFAULT, $2)', [value], func); }; // Add a plugin
-                obj.getPlugins = function (func) { sqlDbQuery('SELECT doc FROM plugin', null, func); }; // Get all plugins
-                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT doc FROM plugin WHERE id = $1', [id], func); }; // Get plugin
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUES (DEFAULT, $1)', [plugin], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery("SELECT doc::jsonb || ('{\"_id\":' || plugin.id || '}')::jsonb as doc FROM plugin", null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery("SELECT doc::jsonb || ('{\"_id\":' || plugin.id || '}')::jsonb as  doc FROM plugin WHERE id = $1", [id], func); }; // Get plugin
                 obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = $1', [id], func); }; // Delete plugin
-                obj.setPluginStatus = function (id, status, func) { obj.getPlugin(id, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].status = status; obj.updatePlugin(id, docs[0], func); } }); };
-                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('INSERT INTO plugin VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET doc = $2', [id, args], func); };
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery("UPDATE plugin SET doc= jsonb_set(doc::jsonb,'{status}',$1) WHERE id=$2", [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE plugin SET doc= doc::jsonb || ($1) WHERE id=$2', [args,id], func); };
             }
-        } else if ((obj.databaseType == 4) || (obj.databaseType == 5)) {
+        } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL)) {
             // Database actions on the main collection (MariaDB or MySQL)
             obj.Set = function (value, func) {
                 obj.dbCounters.fileSet++;
@@ -1358,18 +2425,27 @@ module.exports.CreateDB = function (parent, func) {
             obj.GetAll = function (func) { sqlDbQuery('SELECT domain, doc FROM main', null, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.GetHash = function (id, func) { sqlDbQuery('SELECT doc FROM main WHERE id = ?', [id], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.GetAllTypeNoTypeField = function (type, domain, func) { sqlDbQuery('SELECT doc FROM main WHERE type = ? AND domain = ?', [type, domain], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); }); };
-            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
+                if (limit == 0) { limit = 0xFFFFFFFF; }
+                if ((meshes == null) || (meshes.length == 0)) { meshes = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                if ((extrasids == null) || (extrasids.length == 0)) { extrasids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
                 if (id && (id != '')) {
-                    sqlDbQuery('SELECT doc FROM main WHERE id = ? AND type = ? AND domain = ? AND extra IN (?)', [id, type, domain, meshes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                    sqlDbQuery('SELECT doc FROM main WHERE id = ? AND type = ? AND domain = ? AND extra IN (?) LIMIT ? OFFSET ?', [id, type, domain, meshes, limit, skip], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
                 } else {
-                    if (extrasids == null) {
-                        sqlDbQuery('SELECT doc FROM main WHERE type = ? AND domain = ? AND extra IN (?)', [type, domain, meshes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
-                    } else {
-                        sqlDbQuery('SELECT doc FROM main WHERE type = ? AND domain = ? AND (extra IN (?) OR id IN (?))', [type, domain, meshes, extrasids], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
-                    }
+                    sqlDbQuery('SELECT doc FROM main WHERE type = ? AND domain = ? AND (extra IN (?) OR id IN (?)) LIMIT ? OFFSET ?', [type, domain, meshes, extrasids, limit, skip], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
+                }
+            };
+            obj.CountAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+                if ((meshes == null) || (meshes.length == 0)) { meshes = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                if ((extrasids == null) || (extrasids.length == 0)) { extrasids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                if (id && (id != '')) {
+                    sqlDbQuery('SELECT COUNT(doc) FROM main WHERE id = ? AND type = ? AND domain = ? AND extra IN (?)', [id, type, domain, meshes], function (err, docs) { func(err, docs); });
+                } else {
+                    sqlDbQuery('SELECT COUNT(doc) FROM main WHERE type = ? AND domain = ? AND (extra IN (?) OR id IN (?))', [type, domain, meshes, extrasids], function (err, docs) { func(err, docs); });
                 }
             };
             obj.GetAllTypeNodeFiltered = function (nodes, domain, type, id, func) {
+                if ((nodes == null) || (nodes.length == 0)) { nodes = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
                 if (id && (id != '')) {
                     sqlDbQuery('SELECT doc FROM main WHERE id = ? AND type = ? AND domain = ? AND extra IN (?)', [id, type, domain, nodes], function (err, docs) { if (err == null) { for (var i in docs) { delete docs[i].type } } func(err, performTypedRecordDecrypt(docs)); });
                 } else {
@@ -1377,7 +2453,10 @@ module.exports.CreateDB = function (parent, func) {
                 }
             };
             obj.GetAllType = function (type, func) { sqlDbQuery('SELECT doc FROM main WHERE type = ?', [type], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
-            obj.GetAllIdsOfType = function (ids, domain, type, func) { sqlDbQuery('SELECT doc FROM main WHERE id IN (?) AND domain = ? AND type = ?', [ids, domain, type], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
+            obj.GetAllIdsOfType = function (ids, domain, type, func) {
+                if ((ids == null) || (ids.length == 0)) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                sqlDbQuery('SELECT doc FROM main WHERE id IN (?) AND domain = ? AND type = ?', [ids, domain, type], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
+            }
             obj.GetUserWithEmail = function (domain, email, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = ? AND extra = ?', [domain, 'email/' + email], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.GetUserWithVerifiedEmail = function (domain, email, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = ? AND extra = ?', [domain, 'email/' + email], function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); }
             obj.Remove = function (id, func) { sqlDbQuery('DELETE FROM main WHERE id = ?', [id], func); };
@@ -1387,9 +2466,9 @@ module.exports.CreateDB = function (parent, func) {
             obj.RemoveMeshDocuments = function (id, func) { sqlDbQuery('DELETE FROM main WHERE extra = ?', [id], function () { sqlDbQuery('DELETE FROM main WHERE id = ?', ['nt' + id], func); } ); };
             obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
             obj.DeleteDomain = function (domain, func) { sqlDbQuery('DELETE FROM main WHERE domain = ?', [domain], func); };
-            obj.SetUser = function (user) { if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
-            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = "node") AND (extraex IS NOT NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null) { r.push(docs[i]); } } } func(err, r); }); };
+            obj.getLocalAmtNodes = function (func) { sqlDbQuery('SELECT doc FROM main WHERE (type = "node") AND (extraex IS NULL)', null, function (err, docs) { var r = []; if (err == null) { for (var i in docs) { if (docs[i].host != null && docs[i].intelamt != null) { r.push(docs[i]); } } } func(err, r); }); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { sqlDbQuery('SELECT doc FROM main WHERE domain = ? AND extraex = ?', [domainid, 'uuid/' + uuid], func); };
             obj.isMaxType = function (max, type, domainid, func) { if (max == null) { func(false); } else { sqlDbExec('SELECT COUNT(id) FROM main WHERE domain = ? AND type = ?', [domainid, type], function (err, response) { func((response['COUNT(id)'] == null) || (response['COUNT(id)'] > max), response['COUNT(id)']) }); } }
 
@@ -1401,44 +2480,129 @@ module.exports.CreateDB = function (parent, func) {
                 for (var i in event.ids) { if (event.ids[i] != '*') { batchQuery.push(['INSERT INTO eventids VALUE (LAST_INSERT_ID(), ?)', [event.ids[i]]]); } }
                 sqlDbBatchExec(batchQuery, function (err, docs) { if (func != null) { func(err, docs); } });
             };
-            obj.GetEvents = function (ids, domain, func) {
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ?) ORDER BY time DESC', [domain], func);
+                    query = query + "WHERE (domain = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)) GROUP BY id ORDER BY time DESC', [domain, ids], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) {
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ?) ORDER BY time DESC LIMIT ?', [domain, limit], func);
+                    query = query + "WHERE (domain = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ? ";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC LIMIT ?";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)) GROUP BY id ORDER BY time DESC LIMIT ?', [domain, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC LIMIT ?";
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ? AND userid = ?) ORDER BY time DESC', [domain, userid], func);
+                    query = query + "WHERE (domain = ? AND userid = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)) GROUP BY id ORDER BY time DESC', [domain, userid, ids], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC";
                 }
+                sqlDbQuery(query, dataarray, func);
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events ";
+                var dataarray = [domain, userid];
                 if (ids.indexOf('*') >= 0) {
-                    sqlDbQuery('SELECT doc FROM events WHERE (domain = ? AND userid = ?) ORDER BY time DESC LIMIT ?', [domain, userid, limit], func);
+                    query = query + "WHERE (domain = ? AND userid = ?";
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") ORDER BY time DESC LIMIT ?";
                 } else {
-                    sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)) GROUP BY id ORDER BY time DESC LIMIT ?', [domain, userid, ids, limit], func);
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
+                    query = query + "JOIN eventids ON id = fkid WHERE (domain = ? AND userid = ? AND target IN (?)";
+                    dataarray.push(ids);
+                    if (filter != null) {
+                        query = query + " AND action = ?";
+                        dataarray.push(filter);
+                    }
+                    query = query + ") GROUP BY id ORDER BY time DESC LIMIT ?";
                 }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
                 if (ids.indexOf('*') >= 0) {
                     sqlDbQuery('SELECT doc FROM events WHERE ((domain = ?) AND (time BETWEEN ? AND ?)) ORDER BY time', [domain, start, end], func);
                 } else {
+                    if (ids.length == 0) { ids = ''; } // MySQL can't handle a query with IN() on an empty array, we have to use an empty string instead.
                     sqlDbQuery('SELECT doc FROM events JOIN eventids ON id = fkid WHERE ((domain = ?) AND (target IN (?)) AND (time BETWEEN ? AND ?)) GROUP BY id ORDER BY time', [domain, ids, start, end], func);
                 }
             };
             //obj.GetUserLoginEvents = function (domain, userid, func) { } // TODO
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = ?) AND (domain = ?) ORDER BY time DESC LIMIT ?', [nodeid, domain, limit], func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { sqlDbQuery('SELECT doc FROM events WHERE (nodeid = ?) AND (domain = ?) AND ((userid = ?) OR (userid IS NULL)) ORDER BY time DESC LIMIT ?', [nodeid, domain, userid, limit], func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = ? AND domain = ?";
+                var dataarray = [nodeid, domain];
+                if (filter != null) {
+                    query = query + " AND action = ?) ORDER BY time DESC LIMIT ?";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT ?";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var query = "SELECT doc FROM events WHERE (nodeid = ? AND domain = ? AND ((userid = ?) OR (userid IS NULL))";
+                var dataarray = [nodeid, domain, userid];
+                if (filter != null) {
+                    query = query + " AND action = ?) ORDER BY time DESC LIMIT ?";
+                    dataarray.push(filter);
+                } else {
+                    query = query + ") ORDER BY time DESC LIMIT ?";
+                }
+                dataarray.push(limit);
+                sqlDbQuery(query, dataarray, func);
+            };
             obj.RemoveAllEvents = function (domain) { sqlDbQuery('DELETE FROM events', null, function (err, docs) { }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = ? AND nodeid = ?', [domain, nodeid], function (err, docs) { }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; sqlDbQuery('DELETE FROM events WHERE domain = ? AND userid = ?', [domain, userid], function (err, docs) { }); };
@@ -1459,7 +2623,7 @@ module.exports.CreateDB = function (parent, func) {
 
             // Database actions on the Server Stats collection
             obj.SetServerStats = function (data, func) { sqlDbQuery('REPLACE INTO serverstats VALUE (?, ?, ?)', [data.time, data.expire, JSON.stringify(data)], func); };
-            obj.GetServerStats = function (hours, func) { var t = new Date(); t.setTime(t.getTime() - (60 * 60 * 1000 * hours)); sqlDbQuery('SELECT doc FROM serverstats WHERE time > ?', [t], func); }; // TODO: Expire old entries
+            obj.GetServerStats = function (hours, func) { var t = new Date(); t.setTime(t.getTime() - (60 * 60 * 1000 * hours)); sqlDbQuery('SELECT doc FROM serverstats WHERE time > ?', [t], func); };
 
             // Read a configuration file from the database
             obj.getConfigFile = function (path, func) { obj.Get('cfile/' + path, func); }
@@ -1469,40 +2633,26 @@ module.exports.CreateDB = function (parent, func) {
 
             // List all configuration files
             obj.listConfigFiles = function (func) { sqlDbQuery('SELECT doc FROM main WHERE type = "cfile" ORDER BY id', func); }
-
-            // Get all configuration files
-            obj.getAllConfigFiles = function (password, func) {
-                obj.file.find({ type: 'cfile' }).toArray(function (err, docs) {
-                    if (err != null) { func(null); return; }
-                    var r = null;
-                    for (var i = 0; i < docs.length; i++) {
-                        var name = docs[i]._id.split('/')[1];
-                        var data = obj.decryptData(password, docs[i].data);
-                        if (data != null) { if (r == null) { r = {}; } r[name] = data; }
-                    }
-                    func(r);
-                });
-            }
             
             // Get database information (TODO: Complete this)
             obj.getDbStats = function (func) {
                 obj.stats = { c: 4 };
-                sqlDbExec('SELECT COUNT(id) FROM main', null, function (err, response) { obj.stats.meshcentral = response['COUNT(id)']; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                sqlDbExec('SELECT COUNT(time) FROM serverstats', null, function (err, response) { obj.stats.serverstats = response['COUNT(time)']; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                sqlDbExec('SELECT COUNT(id) FROM power', null, function (err, response) { obj.stats.power = response['COUNT(id)']; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                sqlDbExec('SELECT COUNT(id) FROM smbios', null, function (err, response) { obj.stats.smbios = response['COUNT(id)']; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbExec('SELECT COUNT(id) FROM main', null, function (err, response) { obj.stats.meshcentral = Number(response['COUNT(id)']); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbExec('SELECT COUNT(time) FROM serverstats', null, function (err, response) { obj.stats.serverstats = Number(response['COUNT(time)']); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbExec('SELECT COUNT(id) FROM power', null, function (err, response) { obj.stats.power = Number(response['COUNT(id)']); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                sqlDbExec('SELECT COUNT(id) FROM smbios', null, function (err, response) { obj.stats.smbios = Number(response['COUNT(id)']); if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
             }
 
             // Plugin operations
             if (obj.pluginsActive) {
-                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUE (?, ?)', [null, JSON.stringify(value)], func); }; // Add a plugin
-                obj.getPlugins = function (func) { sqlDbQuery('SELECT doc FROM plugin', null, func); }; // Get all plugins
-                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT doc FROM plugin WHERE id = ?', [id], func); }; // Get plugin
+                obj.addPlugin = function (plugin, func) { sqlDbQuery('INSERT INTO plugin VALUE (?, ?)', [null, JSON.stringify(plugin)], func); }; // Add a plugin
+                obj.getPlugins = function (func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin', null, func); }; // Get all plugins
+                obj.getPlugin = function (id, func) { sqlDbQuery('SELECT JSON_INSERT(doc, "$._id", id) as doc FROM plugin WHERE id = ?', [id], func); }; // Get plugin
                 obj.deletePlugin = function (id, func) { sqlDbQuery('DELETE FROM plugin WHERE id = ?', [id], func); }; // Delete plugin
-                obj.setPluginStatus = function (id, status, func) { obj.getPlugin(id, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].status = status; obj.updatePlugin(id, docs[0], func); } }); };
-                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('REPLACE INTO plugin VALUE (?, ?)', [id, JSON.stringify(args)], func); };
+                obj.setPluginStatus = function (id, status, func) { sqlDbQuery('UPDATE meshcentral.plugin SET doc=JSON_SET(doc,"$.status",?) WHERE id=?', [status,id], func); };
+                obj.updatePlugin = function (id, args, func) { delete args._id; sqlDbQuery('UPDATE meshcentral.plugin SET doc=JSON_MERGE_PATCH(doc,?) WHERE id=?', [JSON.stringify(args),id], func); };
             }
-        } else if (obj.databaseType == 3) {
+        } else if (obj.databaseType == DB_MONGODB) {
             // Database actions on the main collection (MongoDB)
 
             // Bulk operations
@@ -1581,15 +2731,34 @@ module.exports.CreateDB = function (parent, func) {
             obj.GetAll = function (func) { obj.file.find({}).toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); };
             obj.GetHash = function (id, func) { obj.file.find({ _id: id }).project({ _id: 0, hash: 1 }).toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); };
             obj.GetAllTypeNoTypeField = function (type, domain, func) { obj.file.find({ type: type, domain: domain }).project({ type: 0 }).toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); };
-            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
                 if (extrasids == null) {
-                    var x = { type: type, domain: domain, meshid: { $in: meshes } };
+                    const x = { type: type, domain: domain, meshid: { $in: meshes } };
                     if (id) { x._id = id; }
-                    obj.file.find(x, { type: 0 }).toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
+                    var f = obj.file.find(x, { type: 0 });
+                    if (skip > 0) f = f.skip(skip); // Skip records
+                    if (limit > 0) f = f.limit(limit); // Limit records
+                    f.toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
                 } else {
-                    var x = { type: type, domain: domain, $or: [ { meshid: { $in: meshes } }, { _id: { $in: extrasids } } ] };
+                    const x = { type: type, domain: domain, $or: [ { meshid: { $in: meshes } }, { _id: { $in: extrasids } } ] };
                     if (id) { x._id = id; }
-                    obj.file.find(x, { type: 0 }).toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
+                    var f = obj.file.find(x, { type: 0 });
+                    if (skip > 0) f = f.skip(skip); // Skip records
+                    if (limit > 0) f = f.limit(limit); // Limit records
+                    f.toArray(function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
+                }
+            };
+            obj.CountAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+                if (extrasids == null) {
+                    const x = { type: type, domain: domain, meshid: { $in: meshes } };
+                    if (id) { x._id = id; }
+                    var f = obj.file.find(x, { type: 0 });
+                    f.count(function (err, count) { func(err, count); });
+                } else {
+                    const x = { type: type, domain: domain, $or: [{ meshid: { $in: meshes } }, { _id: { $in: extrasids } }] };
+                    if (id) { x._id = id; }
+                    var f = obj.file.find(x, { type: 0 });
+                    f.count(function (err, count) { func(err, count); });
                 }
             };
             obj.GetAllTypeNodeFiltered = function (nodes, domain, type, id, func) {
@@ -1628,7 +2797,7 @@ module.exports.CreateDB = function (parent, func) {
             obj.RemoveMeshDocuments = function (id) { obj.file.deleteMany({ meshid: id }, { multi: true }); obj.file.deleteOne({ _id: 'nt' + id }); };
             obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
             obj.DeleteDomain = function (domain, func) { obj.file.deleteMany({ domain: domain }, { multi: true }, func); };
-            obj.SetUser = function (user) { if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
             obj.getLocalAmtNodes = function (func) { obj.file.find({ type: 'node', host: { $exists: true, $ne: null }, intelamt: { $exists: true } }).toArray(func); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { obj.file.find({ type: 'node', domain: domainid, mtype: mtype, 'intelamt.uuid': uuid }).toArray(func); };
@@ -1668,14 +2837,38 @@ module.exports.CreateDB = function (parent, func) {
                 obj.StoreEvent = function (event, func) { obj.dbCounters.eventsSet++; obj.eventsfile.insertOne(event, func); };
             }
 
-            obj.GetEvents = function (ids, domain, func) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func); };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
-            obj.GetUserEvents = function (ids, domain, userid, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func); };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var finddata = { domain: domain,  ids: { $in: ids } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func);
+            };
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).toArray(func);
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                obj.eventsfile.find(finddata).project({ type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) { obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }], msgid: { $in: msgids }, time: { $gte: start, $lte: end } }).project({ type: 0, _id: 0, domain: 0, node: 0 }).sort({ time: 1 }).toArray(func); };
             obj.GetUserLoginEvents = function (domain, userid, func) { obj.eventsfile.find({ domain: domain, action: { $in: ['authfail', 'login'] }, userid: userid, msgArgs: { $exists: true } }).project({ action: 1, time: 1, msgid: 1, msgArgs: 1, tokenName: 1 }).sort({ time: -1 }).toArray(func); };
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { obj.eventsfile.find({ domain: domain, nodeid: nodeid }).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { obj.eventsfile.find({ domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } }).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func); };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } };
+                if (filter != null) finddata.action = filter;
+                obj.eventsfile.find(finddata).project({ type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).toArray(func);
+            };
             obj.RemoveAllEvents = function (domain) { obj.eventsfile.deleteMany({ domain: domain }, { multi: true }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; obj.eventsfile.deleteMany({ domain: domain, nodeid: nodeid }, { multi: true }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; obj.eventsfile.deleteMany({ domain: domain, userid: userid }, { multi: true }); };
@@ -1735,29 +2928,26 @@ module.exports.CreateDB = function (parent, func) {
             // List all configuration files
             obj.listConfigFiles = function (func) { obj.file.find({ type: 'cfile' }).sort({ _id: 1 }).toArray(func); }
 
-            // Get all configuration files
-            obj.getAllConfigFiles = function (password, func) {
-                obj.file.find({ type: 'cfile' }).toArray(function (err, docs) {
-                    if (err != null) { func(null); return; }
-                    var r = null;
-                    for (var i = 0; i < docs.length; i++) {
-                        var name = docs[i]._id.split('/')[1];
-                        var data = obj.decryptData(password, docs[i].data);
-                        if (data != null) { if (r == null) { r = {}; } r[name] = data; }
-                    }
-                    func(r);
-                });
-            }
-
             // Get database information
             obj.getDbStats = function (func) {
                 obj.stats = { c: 6 };
-                obj.getStats(function (r) { obj.stats.recordTypes = r; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } })
-                obj.file.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.eventsfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.powerfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.smbiosfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.serverstatsfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.getStats(function (r) { obj.stats.recordTypes = r; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } })
+                obj.file.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.eventsfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.powerfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.smbiosfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.serverstatsfile.stats().then(function (stats) { obj.stats[stats.ns] = { size: stats.size, count: stats.count, avgObjSize: stats.avgObjSize, capped: stats.capped }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } }, function () { if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+            }
+
+            // Correct database information of obj.getDbStats before returning it
+            function getDbStatsEx(data) {
+                var r = {};
+                if (data.recordTypes != null) { r = data.recordTypes; }
+                try { r.smbios = data['meshcentral.smbios'].count; } catch (ex) { }
+                try { r.power = data['meshcentral.power'].count; } catch (ex) { }
+                try { r.events = data['meshcentral.events'].count; } catch (ex) { }
+                try { r.serverstats = data['meshcentral.serverstats'].count; } catch (ex) { }
+                return r;
             }
 
             // Plugin operations
@@ -1802,18 +2992,18 @@ module.exports.CreateDB = function (parent, func) {
             obj.GetAll = function (func) { obj.file.find({}, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); };
             obj.GetHash = function (id, func) { obj.file.find({ _id: id }, { _id: 0, hash: 1 }, func); };
             obj.GetAllTypeNoTypeField = function (type, domain, func) { obj.file.find({ type: type, domain: domain }, { type: 0 }, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); }); };
-            //obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, domain, type, id, func) {
+            //obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, domain, type, id, skip, limit, func) {
                 //var x = { type: type, domain: domain, meshid: { $in: meshes } };
                 //if (id) { x._id = id; }
                 //obj.file.find(x, { type: 0 }, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
             //};
-            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, func) {
+            obj.GetAllTypeNoTypeFieldMeshFiltered = function (meshes, extrasids, domain, type, id, skip, limit, func) {
                 if (extrasids == null) {
-                    var x = { type: type, domain: domain, meshid: { $in: meshes } };
+                    const x = { type: type, domain: domain, meshid: { $in: meshes } };
                     if (id) { x._id = id; }
                     obj.file.find(x, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
                 } else {
-                    var x = { type: type, domain: domain, $or: [{ meshid: { $in: meshes } }, { _id: { $in: extrasids } }] };
+                    const x = { type: type, domain: domain, $or: [{ meshid: { $in: meshes } }, { _id: { $in: extrasids } }] };
                     if (id) { x._id = id; }
                     obj.file.find(x, function (err, docs) { func(err, performTypedRecordDecrypt(docs)); });
                 }
@@ -1834,7 +3024,7 @@ module.exports.CreateDB = function (parent, func) {
             obj.RemoveMeshDocuments = function (id) { obj.file.remove({ meshid: id }, { multi: true }); obj.file.remove({ _id: 'nt' + id }); };
             obj.MakeSiteAdmin = function (username, domain) { obj.Get('user/' + domain + '/' + username, function (err, docs) { if ((err == null) && (docs.length == 1)) { docs[0].siteadmin = 0xFFFFFFFF; obj.Set(docs[0]); } }); };
             obj.DeleteDomain = function (domain, func) { obj.file.remove({ domain: domain }, { multi: true }, func); };
-            obj.SetUser = function (user) { if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
+            obj.SetUser = function (user) { if (user == null) return; if (user.subscriptions != null) { var u = Clone(user); if (u.subscriptions) { delete u.subscriptions; } obj.Set(u); } else { obj.Set(user); } };
             obj.dispose = function () { for (var x in obj) { if (obj[x].close) { obj[x].close(); } delete obj[x]; } };
             obj.getLocalAmtNodes = function (func) { obj.file.find({ type: 'node', host: { $exists: true, $ne: null }, intelamt: { $exists: true } }, func); };
             obj.getAmtUuidMeshNode = function (domainid, mtype, uuid, func) { obj.file.find({ type: 'node', domain: domainid, mtype: mtype, 'intelamt.uuid': uuid }, func); };
@@ -1843,38 +3033,74 @@ module.exports.CreateDB = function (parent, func) {
             // Database actions on the events collection
             obj.GetAllEvents = function (func) { obj.eventsfile.find({}, func); };
             obj.StoreEvent = function (event, func) { obj.eventsfile.insert(event, func); };
-            obj.GetEvents = function (ids, domain, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func); } else { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func); } };
-            obj.GetEventsWithLimit = function (ids, domain, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, ids: { $in: ids } }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func); } };
-            obj.GetUserEvents = function (ids, domain, userid, func) {
-                if (obj.databaseType == 1) {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
+            obj.GetEvents = function (ids, domain, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
                 } else {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
                 }
             };
-            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, func) {
-                if (obj.databaseType == 1) {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+            obj.GetEventsWithLimit = function (ids, domain, limit, filter, func) {
+                var finddata = { domain: domain, ids: { $in: ids } };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
                 } else {
-                    obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] }, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
+            obj.GetUserEvents = function (ids, domain, userid, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }, func);
+                }
+            };
+            obj.GetUserEventsWithLimit = function (ids, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, $or: [{ ids: { $in: ids } }, { userid: userid }] };
+                if (filter != null) finddata.action = filter; 
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, _id: 0, domain: 0, ids: 0, node: 0 }).sort({ time: -1 }).limit(limit, func);
                 }
             };
             obj.GetEventsTimeRange = function (ids, domain, msgids, start, end, func) {
-                if (obj.databaseType == 1) {
+                if (obj.databaseType == DB_NEDB) {
                     obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }], msgid: { $in: msgids }, time: { $gte: start, $lte: end } }, { type: 0, _id: 0, domain: 0, node: 0 }).sort({ time: 1 }).exec(func);
                 } else {
                     obj.eventsfile.find({ domain: domain, $or: [{ ids: { $in: ids } }], msgid: { $in: msgids }, time: { $gte: start, $lte: end } }, { type: 0, _id: 0, domain: 0, node: 0 }).sort({ time: 1 }, func);
                 }
             };
             obj.GetUserLoginEvents = function (domain, userid, func) {
-                if (obj.databaseType == 1) {
+                if (obj.databaseType == DB_NEDB) {
                     obj.eventsfile.find({ domain: domain, action: { $in: ['authfail', 'login'] }, userid: userid, msgArgs: { $exists: true } }, { action: 1, time: 1, msgid: 1, msgArgs: 1, tokenName: 1 }).sort({ time: -1 }).exec(func);
                 } else {
                     obj.eventsfile.find({ domain: domain, action: { $in: ['authfail', 'login'] }, userid: userid, msgArgs: { $exists: true } }, { action: 1, time: 1, msgid: 1, msgArgs: 1, tokenName: 1 }).sort({ time: -1 }, func);
                 }
             };
-            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func); } };
-            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, func) { if (obj.databaseType == 1) { obj.eventsfile.find({ domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func); } else { obj.eventsfile.find({ domain: domain, nodeid: nodeid }, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func); } };
+            obj.GetNodeEventsWithLimit = function (nodeid, domain, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid };
+                if (filter != null) finddata.action = filter;
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
+            obj.GetNodeEventsSelfWithLimit = function (nodeid, domain, userid, limit, filter, func) {
+                var finddata = { domain: domain, nodeid: nodeid, userid: { $in: [userid, null] } };
+                if (filter != null) finddata.action = filter;
+                if (obj.databaseType == DB_NEDB) {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit).exec(func);
+                } else {
+                    obj.eventsfile.find(finddata, { type: 0, etype: 0, _id: 0, domain: 0, ids: 0, node: 0, nodeid: 0 }).sort({ time: -1 }).limit(limit, func);
+                }
+            };
             obj.RemoveAllEvents = function (domain) { obj.eventsfile.remove({ domain: domain }, { multi: true }); };
             obj.RemoveAllNodeEvents = function (domain, nodeid) { if ((domain == null) || (nodeid == null)) return; obj.eventsfile.remove({ domain: domain, nodeid: nodeid }, { multi: true }); };
             obj.RemoveAllUserEvents = function (domain, userid) { if ((domain == null) || (userid == null)) return; obj.eventsfile.remove({ domain: domain, userid: userid }, { multi: true }); };
@@ -1883,7 +3109,7 @@ module.exports.CreateDB = function (parent, func) {
             // Database actions on the power collection
             obj.getAllPower = function (func) { obj.powerfile.find({}, func); };
             obj.storePowerEvent = function (event, multiServer, func) { if (multiServer != null) { event.server = multiServer.serverid; } obj.powerfile.insert(event, func); };
-            obj.getPowerTimeline = function (nodeid, func) { if (obj.databaseType == 1) { obj.powerfile.find({ nodeid: { $in: ['*', nodeid] } }, { _id: 0, nodeid: 0, s: 0 }).sort({ time: 1 }).exec(func); } else { obj.powerfile.find({ nodeid: { $in: ['*', nodeid] } }, { _id: 0, nodeid: 0, s: 0 }).sort({ time: 1 }, func); } };
+            obj.getPowerTimeline = function (nodeid, func) { if (obj.databaseType == DB_NEDB) { obj.powerfile.find({ nodeid: { $in: ['*', nodeid] } }, { _id: 0, nodeid: 0, s: 0 }).sort({ time: 1 }).exec(func); } else { obj.powerfile.find({ nodeid: { $in: ['*', nodeid] } }, { _id: 0, nodeid: 0, s: 0 }).sort({ time: 1 }, func); } };
             obj.removeAllPowerEvents = function () { obj.powerfile.remove({}, { multi: true }); };
             obj.removeAllPowerEventsForNode = function (nodeid) { if (nodeid == null) return; obj.powerfile.remove({ nodeid: nodeid }, { multi: true }); };
 
@@ -1908,28 +3134,25 @@ module.exports.CreateDB = function (parent, func) {
             // List all configuration files
             obj.listConfigFiles = function (func) { obj.file.find({ type: 'cfile' }).sort({ _id: 1 }).exec(func); }
 
-            // Get all configuration files
-            obj.getAllConfigFiles = function (password, func) {
-                obj.file.find({ type: 'cfile' }, function (err, docs) {
-                    if (err != null) { func(null); return; }
-                    var r = null;
-                    for (var i = 0; i < docs.length; i++) {
-                        var name = docs[i]._id.split('/')[1];
-                        var data = obj.decryptData(password, docs[i].data);
-                        if (data != null) { if (r == null) { r = {}; } r[name] = data; }
-                    }
-                    func(r);
-                });
-            }
-
             // Get database information
             obj.getDbStats = function (func) {
                 obj.stats = { c: 5 };
-                obj.getStats(function (r) { obj.stats.recordTypes = r; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } })
-                obj.file.count({}, function (err, count) { obj.stats.meshcentral = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.eventsfile.count({}, function (err, count) { obj.stats.events = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.powerfile.count({}, function (err, count) { obj.stats.power = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
-                obj.serverstatsfile.count({}, function (err, count) { obj.stats.serverstats = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(obj.stats); } });
+                obj.getStats(function (r) { obj.stats.recordTypes = r; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } })
+                obj.file.count({}, function (err, count) { obj.stats.meshcentral = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.eventsfile.count({}, function (err, count) { obj.stats.events = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.powerfile.count({}, function (err, count) { obj.stats.power = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+                obj.serverstatsfile.count({}, function (err, count) { obj.stats.serverstats = { count: count }; if (--obj.stats.c == 0) { delete obj.stats.c; func(getDbStatsEx(obj.stats)); } });
+            }
+
+            // Correct database information of obj.getDbStats before returning it
+            function getDbStatsEx(data) {
+                var r = {};
+                if (data.recordTypes != null) { r = data.recordTypes; }
+                try { r.smbios = data['smbios'].count; } catch (ex) { }
+                try { r.power = data['power'].count; } catch (ex) { }
+                try { r.events = data['events'].count; } catch (ex) { }
+                try { r.serverstats = data['serverstats'].count; } catch (ex) { }
+                return r;
             }
 
             // Plugin operations
@@ -1944,6 +3167,20 @@ module.exports.CreateDB = function (parent, func) {
 
         }
 
+        // Get all configuration files
+        obj.getAllConfigFiles = function (password, func) {
+            obj.GetAllType('cfile', function (err, docs) {
+                if (err != null) { func(null); return; }
+                var r = null;
+                for (var i = 0; i < docs.length; i++) {
+                    var name = docs[i]._id.split('/')[1];
+                    var data = obj.decryptData(password, docs[i].data);
+                    if (data != null) { if (r == null) { r = {}; } r[name] = data; }
+                }
+                func(r);
+            });
+        }
+
         func(obj); // Completed function setup
     }
 
@@ -1952,56 +3189,94 @@ module.exports.CreateDB = function (parent, func) {
         var r = '', backupPath = parent.backuppath;
         if (parent.config.settings.autobackup && parent.config.settings.autobackup.backuppath) { backupPath = parent.config.settings.autobackup.backuppath; }
 
-        var dbname = 'meshcentral';
+        let dbname = 'meshcentral';
         if (parent.args.mongodbname) { dbname = parent.args.mongodbname; }
         else if ((typeof parent.args.mariadb == 'object') && (typeof parent.args.mariadb.database == 'string')) { dbname = parent.args.mariadb.database; }
         else if ((typeof parent.args.mysql == 'object') && (typeof parent.args.mysql.database == 'string')) { dbname = parent.args.mysql.database; }
+        else if (typeof parent.config.settings.sqlite3 == 'string') {dbname = parent.config.settings.sqlite3 + '.sqlite'};
 
         const currentDate = new Date();
         const fileSuffix = currentDate.getFullYear() + '-' + padNumber(currentDate.getMonth() + 1, 2) + '-' + padNumber(currentDate.getDate(), 2) + '-' + padNumber(currentDate.getHours(), 2) + '-' + padNumber(currentDate.getMinutes(), 2);
-        const newAutoBackupFile = 'meshcentral-autobackup-' + fileSuffix;
-        const newAutoBackupPath = parent.path.join(backupPath, newAutoBackupFile);
+        obj.newAutoBackupFile = ((typeof parent.config.settings.autobackup.backupname == 'string') ? parent.config.settings.autobackup.backupname : 'meshcentral-autobackup-') + fileSuffix;
 
         r += 'DB Name: ' + dbname + '\r\n';
-        r += 'DB Type: ' + ['None', 'NeDB', 'MongoJS', 'MongoDB', 'MariaDB', 'MySQL'][obj.databaseType] + '\r\n';
+        r += 'DB Type: ' + DB_LIST[obj.databaseType] + '\r\n';
         r += 'BackupPath: ' + backupPath + '\r\n';
-        r += 'newAutoBackupFile: ' + newAutoBackupFile + '\r\n';
-        r += 'newAutoBackupPath: ' + newAutoBackupPath + '\r\n';
+        r += 'BackupFile: ' + obj.newAutoBackupFile + '.zip\r\n';
 
         if (parent.config.settings.autobackup == null) {
             r += 'No Settings/AutoBackup\r\n';
         } else {
             if (parent.config.settings.autobackup.backupintervalhours != null) {
+                r += 'Backup Interval (Hours): ';
                 if (typeof parent.config.settings.autobackup.backupintervalhours != 'number') { r += 'Bad backupintervalhours type\r\n'; }
-                else { r += 'Backup Interval (Hours): ' + parent.config.settings.autobackup.backupintervalhours + '\r\n'; }
+                else { r += parent.config.settings.autobackup.backupintervalhours + '\r\n'; }
             }
             if (parent.config.settings.autobackup.keeplastdaysbackup != null) {
+                r += 'Keep Last Backups (Days): ';
                 if (typeof parent.config.settings.autobackup.keeplastdaysbackup != 'number') { r += 'Bad keeplastdaysbackup type\r\n'; }
-                else { r += 'Keep Last Backups (Days): ' + parent.config.settings.autobackup.keeplastdaysbackup + '\r\n'; }
+                else { r += parent.config.settings.autobackup.keeplastdaysbackup + '\r\n'; }
             }
             if (parent.config.settings.autobackup.zippassword != null) {
-                if (typeof parent.config.settings.autobackup.zippassword != 'string') { r += 'Bad zippassword type\r\n'; }
-                else { r += 'ZIP Password Set\r\n'; }
+                r += 'ZIP Password: ';
+                if (typeof parent.config.settings.autobackup.zippassword != 'string') { r += 'Bad zippassword type, Backups will not be encrypted\r\n'; }
+                else if (parent.config.settings.autobackup.zippassword == "") { r += 'Blank zippassword, Backups will fail\r\n'; }
+                else { r += 'Set\r\n'; }
             }
             if (parent.config.settings.autobackup.mongodumppath != null) {
+                r += 'MongoDump Path: ';
                 if (typeof parent.config.settings.autobackup.mongodumppath != 'string') { r += 'Bad mongodumppath type\r\n'; }
-                else { r += 'MongoDump Path: ' + parent.config.settings.autobackup.mongodumppath + '\r\n'; }
+                else { r += parent.config.settings.autobackup.mongodumppath + '\r\n'; }
             }
             if (parent.config.settings.autobackup.mysqldumppath != null) {
+                r += 'MySqlDump Path: ';
                 if (typeof parent.config.settings.autobackup.mysqldumppath != 'string') { r += 'Bad mysqldump type\r\n'; }
-                else { r += 'MySqlDump Path: ' + parent.config.settings.autobackup.mysqldumppath + '\r\n'; }
+                else { r += parent.config.settings.autobackup.mysqldumppath + '\r\n'; }
             }
+            if (parent.config.settings.autobackup.backupotherfolders) {
+                r += 'Backup other folders: ';
+                r += parent.filespath + ', ' + parent.recordpath + '\r\n';
+            }
+            if (parent.config.settings.autobackup.backupwebfolders) {
+                r += 'Backup webfolders: ';
+                if (parent.webViewsOverridePath) {r += parent.webViewsOverridePath };
+                if (parent.webPublicOverridePath) {r += ', '+ parent.webPublicOverridePath};
+                if (parent.webEmailsOverridePath) {r += ',' + parent.webEmailsOverridePath};
+                r+= '\r\n';
+            }
+            if (parent.config.settings.autobackup.backupignorefilesglob != []) {
+                r += 'Backup IgnoreFilesGlob: ';
+                { r += parent.config.settings.autobackup.backupignorefilesglob + '\r\n'; }
+            }
+            if (parent.config.settings.autobackup.backupskipfoldersglob != []) {
+                r += 'Backup SkipFoldersGlob: ';
+                { r += parent.config.settings.autobackup.backupskipfoldersglob + '\r\n'; }
+            }
+
+            if (typeof parent.config.settings.autobackup.s3 == 'object') {
+                r += 'S3 Backups: Enabled\r\n';
+            }
+            if (typeof parent.config.settings.autobackup.webdav == 'object') {
+                r += 'WebDAV Backups: Enabled\r\n';
+                r += 'WebDAV backup path: ' + ((typeof parent.config.settings.autobackup.webdav.foldername == 'string') ? parent.config.settings.autobackup.webdav.foldername : 'MeshCentral-Backups') + '\r\n';
+                r += 'WebDAV maximum files: '+ ((typeof parent.config.settings.autobackup.webdav.maxfiles == 'number') ? parent.config.settings.autobackup.webdav.maxfiles : 'no limit') + '\r\n';
+            }
+            if (typeof parent.config.settings.autobackup.googledrive == 'object') {
+                r += 'Google Drive Backups: Enabled\r\n';
+            }
+
+
         }
 
         return r;
     }
 
     function buildSqlDumpCommand() {
-        var props = (obj.databaseType == 4) ? parent.args.mariadb : parent.args.mysql;
+        var props = (obj.databaseType == DB_MARIADB) ? parent.args.mariadb : parent.args.mysql;
 
         var mysqldumpPath = 'mysqldump';
         if (parent.config.settings.autobackup && parent.config.settings.autobackup.mysqldumppath) { 
-            mysqldumpPath = parent.config.settings.autobackup.mysqldumppath;
+            mysqldumpPath = path.normalize(parent.config.settings.autobackup.mysqldumppath);
         }
 
         var cmd = '\"' + mysqldumpPath + '\" --user=\'' + props.user + '\'';
@@ -2014,11 +3289,11 @@ module.exports.CreateDB = function (parent, func) {
 
         // SSL options different on mariadb/mysql
         var sslOptions = '';
-        if (obj.databaseType == 4) {
+        if (obj.databaseType == DB_MARIADB) {
             if (props.ssl) {
                 sslOptions = ' --ssl';
                 if (props.ssl.cacertpath) sslOptions = ' --ssl-ca=' + props.ssl.cacertpath;
-                if (props.ssl.dontcheckserveridentity != true) sslOptions += ' --ssl-verify-server-cert';
+                if (props.ssl.dontcheckserveridentity != true) {sslOptions += ' --ssl-verify-server-cert'} else {sslOptions += ' --ssl-verify-server-cert=false'};
                 if (props.ssl.clientcertpath) sslOptions += ' --ssl-cert=' + props.ssl.clientcertpath;
                 if (props.ssl.clientkeypath) sslOptions += ' --ssl-key=' + props.ssl.clientkeypath;
             } 
@@ -2045,7 +3320,7 @@ module.exports.CreateDB = function (parent, func) {
 
         var mongoDumpPath = 'mongodump';
         if (parent.config.settings.autobackup && parent.config.settings.autobackup.mongodumppath) {
-            mongoDumpPath = parent.config.settings.autobackup.mongodumppath;
+            mongoDumpPath = path.normalize(parent.config.settings.autobackup.mongodumppath);
         }
 
         var cmd = '"' + mongoDumpPath + '"';
@@ -2056,22 +3331,20 @@ module.exports.CreateDB = function (parent, func) {
 
     // Check that the server is capable of performing a backup
     obj.checkBackupCapability = function (func) {
-        if ((parent.config.settings.autobackup == null) || (parent.config.settings.autobackup == false)) { func(); }
-        if ((obj.databaseType == 2) || (obj.databaseType == 3)) {
-            // Check that we have access to MongoDump
-            var backupPath = parent.backuppath;
-            if (parent.config.settings.autobackup && parent.config.settings.autobackup.backuppath) { backupPath = parent.config.settings.autobackup.backuppath; }
-            try { parent.fs.mkdirSync(backupPath); } catch (e) { }
+        if ((parent.config.settings.autobackup == null) || (parent.config.settings.autobackup == false)) { func(); return; };
+        let backupPath = parent.backuppath;
+        if (parent.config.settings.autobackup && parent.config.settings.autobackup.backuppath) { backupPath = parent.config.settings.autobackup.backuppath; }
+        try { parent.fs.mkdirSync(backupPath); } catch (e) { }
+        if (parent.fs.existsSync(backupPath) == false) { func(1, "Backup folder \"" + backupPath + "\" does not exist, auto-backup will not be performed."); return; }
 
+        if ((obj.databaseType == DB_MONGOJS) || (obj.databaseType == DB_MONGODB)) {
+            // Check that we have access to MongoDump
             var cmd = buildMongoDumpCommand();
             cmd += (parent.platform == 'win32') ? ' --archive=\"nul\"' : ' --archive=\"/dev/null\"';
             const child_process = require('child_process');
             child_process.exec(cmd, { cwd: backupPath }, function (error, stdout, stderr) {
                 try {
                     if ((error != null) && (error != '')) {
-
-                        console.log(error);
-
                         if (parent.platform == 'win32') {
                             func(1, "Unable to find mongodump.exe, MongoDB database auto-backup will not be performed.");
                         } else {
@@ -2082,12 +3355,8 @@ module.exports.CreateDB = function (parent, func) {
                     }
                 } catch (ex) { console.log(ex); }
             });
-        } else if ((obj.databaseType == 4) || (obj.databaseType == 5)) {
+        } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL)) {
             // Check that we have access to mysqldump
-            var backupPath = parent.backuppath;
-            if (parent.config.settings.autobackup && parent.config.settings.autobackup.backuppath) { backupPath = parent.config.settings.autobackup.backuppath; }
-            try { parent.fs.mkdirSync(backupPath); } catch (e) { }
-
             var cmd = buildSqlDumpCommand();
             cmd += ' > ' + ((parent.platform == 'win32') ? '\"nul\"' : '\"/dev/null\"');
             const child_process = require('child_process');
@@ -2104,6 +3373,23 @@ module.exports.CreateDB = function (parent, func) {
                     }
                 } catch (ex) { console.log(ex); }
             });
+        } else if (obj.databaseType == DB_POSTGRESQL) {
+            // Check that we have access to pg_dump
+            parent.config.settings.autobackup.pgdumppath = path.normalize(parent.config.settings.autobackup.pgdumppath ? parent.config.settings.autobackup.pgdumppath : 'pg_dump');
+            let cmd = '"' + parent.config.settings.autobackup.pgdumppath + '"'
+                    + ' --dbname=postgresql://' + parent.config.settings.postgres.user + ":" +parent.config.settings.postgres.password
+                    + "@" + parent.config.settings.postgres.host + ":" + parent.config.settings.postgres.port + "/" + databaseName
+                    + ' > ' + ((parent.platform == 'win32') ? '\"nul\"' : '\"/dev/null\"');
+            const child_process = require('child_process');
+            child_process.exec(cmd, { cwd: backupPath }, function(error, stdout, stdin) {
+                try {
+                    if ((error != null) && (error != '')) {
+                            func(1, "Unable to find pg_dump, PostgreSQL database auto-backup will not be performed.");
+                    } else {
+                        func();
+                    }
+                } catch (ex) { console.log(ex); }
+            });        
         } else {
             func();
         }
@@ -2219,149 +3505,227 @@ module.exports.CreateDB = function (parent, func) {
     }
 
     // Perform a server backup
-    obj.performingBackup = false;
     obj.performBackup = function (func) {
+        parent.debug('db','Entering performBackup');
         try {
-            if (obj.performingBackup) return 1;
+            if (obj.performingBackup) return 'Backup alreay in progress.';
+            if (parent.config.settings.autobackup.backupintervalhours == -1) { if (func) { func('Unable to create backup if backuppath is set to the data folder.'); return 'Backup aborted.' }};
             obj.performingBackup = true;
-            //console.log('Performing backup...');
+            let backupPath = parent.backuppath;
+            let dataPath = parent.datapath;
 
-            var backupPath = parent.backuppath;
             if (parent.config.settings.autobackup && parent.config.settings.autobackup.backuppath) { backupPath = parent.config.settings.autobackup.backuppath; }
             try { parent.fs.mkdirSync(backupPath); } catch (e) { }
-            const dbname = (parent.args.mongodbname) ? (parent.args.mongodbname) : 'meshcentral';
-            const dburl = parent.args.mongodb;
             const currentDate = new Date();
             const fileSuffix = currentDate.getFullYear() + '-' + padNumber(currentDate.getMonth() + 1, 2) + '-' + padNumber(currentDate.getDate(), 2) + '-' + padNumber(currentDate.getHours(), 2) + '-' + padNumber(currentDate.getMinutes(), 2);
-            const newAutoBackupFile = 'meshcentral-autobackup-' + fileSuffix;
-            const newAutoBackupPath = parent.path.join(backupPath, newAutoBackupFile);
+            obj.newAutoBackupFile = path.join(backupPath, ((typeof parent.config.settings.autobackup.backupname == 'string') ? parent.config.settings.autobackup.backupname : 'meshcentral-autobackup-') + fileSuffix + '.zip');
 
-            if ((obj.databaseType == 2) || (obj.databaseType == 3)) {
-                // Perform a MongoDump backup
-                const newBackupFile = 'mongodump-' + fileSuffix;
-                var newBackupPath = parent.path.join(backupPath, newBackupFile);
+            if ((obj.databaseType == DB_MONGOJS) || (obj.databaseType == DB_MONGODB)) {
+                // Perform a MongoDump
+                const dbname = (parent.args.mongodbname) ? (parent.args.mongodbname) : 'meshcentral';
+                const dburl = parent.args.mongodb;
+    
+                obj.newDBDumpFile = path.join(backupPath, (dbname + '-mongodump-' + fileSuffix + '.archive'));
 
                 var cmd = buildMongoDumpCommand();
-                cmd += (dburl) ? ' --archive=\"' + newBackupPath + '.archive\"' :
-                                 ' --db=\"' + dbname + '\" --archive=\"' + newBackupPath + '.archive\"';
+                cmd += (dburl) ? ' --archive=\"' + obj.newDBDumpFile + '\"' :
+                                 ' --db=\"' + dbname + '\" --archive=\"' + obj.newDBDumpFile + '\"';
 
                 const child_process = require('child_process');
-                var backupProcess = child_process.exec(cmd, { cwd: backupPath }, function (error, stdout, stderr) {
-                    try {
-                        var mongoDumpSuccess = true;
-                        backupProcess = null;
-                        if ((error != null) && (error != '')) { mongoDumpSuccess = false; console.log('ERROR: Unable to perform MongoDB backup: ' + error + '\r\n'); }
+                const dumpProcess = child_process.exec(
+                    cmd,
+                    { cwd: parent.parentpath },
+                    (error)=> {if (error) {obj.backupStatus |= BACKUPFAIL_DBDUMP; console.log('ERROR: Unable to perform MongoDB backup: ' + error + '\r\n'); obj.createBackupfile(func);}}
+                );
+                dumpProcess.on('exit', (code) => {
+                    if (code != 0) {console.log(`Mongodump child process exited with code ${code}`); obj.backupStatus |= BACKUPFAIL_DBDUMP;}
+                    obj.createBackupfile(func);
+                  });
 
-                        // Perform archive compression
-                        var archiver = require('archiver');
-                        var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
-                        var archive = null;
-                        if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                            try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                            archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
-                        } else {
-                            archive = archiver('zip', { zlib: { level: 9 } });
-                        }
-                        output.on('close', function () {
-                            obj.performingBackup = false;
-                            if (func) { if (mongoDumpSuccess) { func('Auto-backup completed.'); } else { func('Auto-backup completed without mongodb database: ' + error); } }
-                            obj.performCloudBackup(newAutoBackupPath + '.zip', func);
-                            setTimeout(function () { try { parent.fs.unlink(newBackupPath + '.archive', function () { }); } catch (ex) { console.log(ex); } }, 5000);
-                        });
-                        output.on('end', function () { });
-                        output.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                        archive.on('warning', function (err) { console.log('Backup warning: ' + err); if (func) { func('Backup warning: ' + err); } });
-                        archive.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                        archive.pipe(output);
-                        if (mongoDumpSuccess == true) { archive.file(newBackupPath + '.archive', { name: newBackupFile + '.archive' }); }
-                        archive.directory(parent.datapath, 'meshcentral-data');
-                        archive.finalize();
-                    } catch (ex) { console.log(ex); }
-                });
-            } else if ((obj.databaseType == 4) || (obj.databaseType == 5)) {
+            } else if ((obj.databaseType == DB_MARIADB) || (obj.databaseType == DB_MYSQL)) {
                 // Perform a MySqlDump backup
                 const newBackupFile = 'mysqldump-' + fileSuffix;
-                var newBackupPath = parent.path.join(backupPath, newBackupFile);
+                obj.newDBDumpFile = path.join(backupPath, newBackupFile + '.sql');
            
                 var cmd = buildSqlDumpCommand();
-                cmd += ' --result-file=\"' + newBackupPath + '.sql\"';
-                const child_process = require('child_process');
-                var backupProcess = child_process.exec(cmd, { cwd: backupPath }, function (error, stdout, stderr) {
-                    try {
-                        var sqlDumpSuccess = true;
-                        backupProcess = null;
-                        if ((error != null) && (error != '')) { sqlDumpSuccess = false; console.log('ERROR: Unable to perform MySQL/MariaDB backup: ' + error + '\r\n'); }
+                cmd += ' --result-file=\"' + obj.newDBDumpFile + '\"';
 
-                        var archiver = require('archiver');
-                        var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
-                        var archive = null;
-                        if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                            try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                            archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
-                        } else {
-                            archive = archiver('zip', { zlib: { level: 9 } });
-                        }
-                        output.on('close', function () {
-                            obj.performingBackup = false;
-                            if (func) { if (sqlDumpSuccess) { func('Auto-backup completed.'); } else { func('Auto-backup completed without MySQL/MariaDB database: ' + error); } }
-                            obj.performCloudBackup(newAutoBackupPath + '.zip', func);
-                            setTimeout(function () { try { parent.fs.unlink(newBackupPath + '.sql', function () { }); } catch (ex) { console.log(ex); } }, 5000);
-                        });
-                        output.on('end', function () { });
-                        output.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                        archive.on('warning', function (err) { console.log('Backup warning: ' + err); if (func) { func('Backup warning: ' + err); } });
-                        archive.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                        archive.pipe(output);
-                        if (sqlDumpSuccess == true) { archive.file(newBackupPath + '.sql', { name: newBackupFile + '.sql' }); }
-                        archive.directory(parent.datapath, 'meshcentral-data');
-                        archive.finalize();
-                    } catch (ex) { console.log(ex); }
+                const child_process = require('child_process');
+                const dumpProcess = child_process.exec(
+                    cmd,
+                    { cwd: parent.parentpath },
+                    (error)=> {if (error) {obj.backupStatus |= BACKUPFAIL_DBDUMP; console.log('ERROR: Unable to perform MySQL backup: ' + error + '\r\n'); obj.createBackupfile(func);}}
+                );
+                dumpProcess.on('exit', (code) => {
+                    if (code != 0) {console.log(`MySQLdump child process exited with code ${code}`); obj.backupStatus |= BACKUPFAIL_DBDUMP;}
+                    obj.createBackupfile(func);
+                  });
+
+            } else if (obj.databaseType == DB_SQLITE) {
+                //.db3 suffix to escape escape backupfile glob to exclude the sqlite db files
+                obj.newDBDumpFile = path.join(backupPath, databaseName + '-sqlitedump-' + fileSuffix + '.db3');
+                // do a VACUUM INTO in favor of the backup API to compress the export, see https://www.sqlite.org/backup.html
+                obj.file.exec('VACUUM INTO \'' + obj.newDBDumpFile + '\'', function (err) {
+                    if (err) { console.log('SQLite start-backup error: ' + err); obj.backupStatus |=BACKUPFAIL_DBDUMP;};
+                    //always finish/clean up
+                    obj.createBackupfile(func);
+                });
+            } else if (obj.databaseType == DB_POSTGRESQL) {
+                // Perform a PostgresDump backup
+                const newBackupFile = databaseName + '-pgdump-' + fileSuffix + '.sql';
+                obj.newDBDumpFile = path.join(backupPath, newBackupFile);
+                let cmd = '"' + parent.config.settings.autobackup.pgdumppath + '"'
+                    + ' --dbname=postgresql://' + parent.config.settings.postgres.user + ":" +parent.config.settings.postgres.password
+                    + "@" + parent.config.settings.postgres.host + ":" + parent.config.settings.postgres.port + "/" + databaseName
+                    + " --file=" + obj.newDBDumpFile;
+                const child_process = require('child_process');
+                const dumpProcess = child_process.exec(
+                    cmd,
+                    { cwd: dataPath },
+                    (error)=> {if (error) {obj.backupStatus |= BACKUPFAIL_DBDUMP; console.log('ERROR: Unable to perform PostgreSQL dump: ' + error.message + '\r\n'); obj.createBackupfile(func);}}
+                );
+                dumpProcess.on('exit', (code) => {
+                    if (code != 0) {console.log(`PostgreSQLdump child process exited with code: ` + code); obj.backupStatus |= BACKUPFAIL_DBDUMP;}
+                    obj.createBackupfile(func);
                 });
             } else {
-                // Perform a NeDB backup
-                var archiver = require('archiver');
-                var output = parent.fs.createWriteStream(newAutoBackupPath + '.zip');
-                var archive = null;
-                if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
-                    try { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); } catch (ex) { }
-                    archive = archiver.create('zip-encrypted', { zlib: { level: 9 }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
-                } else {
-                    archive = archiver('zip', { zlib: { level: 9 } });
-                }
-                output.on('close', function () { obj.performingBackup = false; if (func) { func('Auto-backup completed.'); } obj.performCloudBackup(newAutoBackupPath + '.zip', func); });
-                output.on('end', function () { });
-                output.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                archive.on('warning', function (err) { console.log('Backup warning: ' + err); if (func) { func('Backup warning: ' + err); } });
-                archive.on('error', function (err) { console.log('Backup error: ' + err); if (func) { func('Backup error: ' + err); } });
-                archive.pipe(output);
-                archive.directory(parent.datapath, 'meshcentral-data');
-                archive.finalize();
+                //NeDB backup, no db dump needed, just make a file backup
+                obj.createBackupfile(func);
             }
+        } catch (ex) { console.log(ex); };
+        return 'Starting auto-backup...';
+    };
 
-            // Remove old backups
-            if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.keeplastdaysbackup == 'number')) {
-                var cutoffDate = new Date();
-                cutoffDate.setDate(cutoffDate.getDate() - parent.config.settings.autobackup.keeplastdaysbackup);
-                parent.fs.readdir(parent.backuppath, function (err, dir) {
-                    try {
-                        if ((err == null) && (dir.length > 0)) {
-                            for (var i in dir) {
-                                var name = dir[i];
-                                if (name.startsWith('meshcentral-autobackup-') && name.endsWith('.zip')) {
-                                    var timex = name.substring(23, name.length - 4).split('-');
-                                    if (timex.length == 5) {
-                                        var fileDate = new Date(parseInt(timex[0]), parseInt(timex[1]) - 1, parseInt(timex[2]), parseInt(timex[3]), parseInt(timex[4]));
-                                        if (fileDate && (cutoffDate > fileDate)) { try { parent.fs.unlink(parent.path.join(parent.backuppath, name), function () { }); } catch (ex) { } }
+    obj.createBackupfile = function(func) {
+        parent.debug('db', 'Entering createFileBackup');
+        let archiver = require('archiver');
+        let archive = null;
+        let zipLevel = Math.min(Math.max(Number(parent.config.settings.autobackup.zipcompression ? parent.config.settings.autobackup.zipcompression : 5),1),9);
+
+        //if password defined, create encrypted zip
+        if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.zippassword == 'string')) {
+            try {
+                //Only register format once, otherwise it triggers an error
+                if (archiver.isRegisteredFormat('zip-encrypted') == false) { archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted')); }
+                archive = archiver.create('zip-encrypted', { zlib: { level: zipLevel }, encryptionMethod: 'aes256', password: parent.config.settings.autobackup.zippassword });
+                if (func) { func('Creating encrypted ZIP'); }
+            } catch (ex) { // registering encryption failed, do not fall back to non-encrypted, fail backup and skip old backup removal as a precaution to not lose any backups
+                obj.backupStatus |= BACKUPFAIL_ZIPMODULE;
+                if (func) { func('Zipencryptionmodule failed, aborting'); }
+                console.log('Zipencryptionmodule failed, aborting');
+            }
+        } else {
+            if (func) { func('Creating a NON-ENCRYPTED ZIP'); }
+            archive = archiver('zip', { zlib: { level: zipLevel } });
+        }
+
+        //original behavior, just a filebackup if dbdump fails : (obj.backupStatus == 0 || obj.backupStatus == BACKUPFAIL_DBDUMP)
+        if (obj.backupStatus == 0) {
+            // Zip the data directory with the dbdump|NeDB files
+            let output = parent.fs.createWriteStream(obj.newAutoBackupFile);
+            output.on('close', function () { 
+                if (obj.backupStatus == 0) {
+                    //remove dump archive file, because zipped and otherwise fills up
+                    if (obj.databaseType != DB_NEDB) {
+                        try { parent.fs.unlink(obj.newDBDumpFile, function () { }); } catch (ex) {console.log('Failed to clean up dbdump file')};
+                    };
+                    obj.performCloudBackup(obj.newAutoBackupFile, func);
+                    // Remove old backups
+                    if (parent.config.settings.autobackup && (typeof parent.config.settings.autobackup.keeplastdaysbackup == 'number')) {
+                        let cutoffDate = new Date();
+                        cutoffDate.setDate(cutoffDate.getDate() - parent.config.settings.autobackup.keeplastdaysbackup);
+                        parent.fs.readdir(parent.backuppath, function (err, dir) {
+                            try {
+                                if ((err == null) && (dir.length > 0)) {
+                                    let fileName = (typeof parent.config.settings.autobackup.backupname == 'string') ? parent.config.settings.autobackup.backupname : 'meshcentral-autobackup-';
+                                    for (var i in dir) {
+                                        var name = dir[i];
+                                        if (name.startsWith(fileName) && name.endsWith('.zip')) {
+                                            var timex = name.substring(23, name.length - 4).split('-');
+                                            if (timex.length == 5) {
+                                                var fileDate = new Date(parseInt(timex[0]), parseInt(timex[1]) - 1, parseInt(timex[2]), parseInt(timex[3]), parseInt(timex[4]));
+                                                if (fileDate && (cutoffDate > fileDate)) { try { parent.fs.unlink(parent.path.join(parent.backuppath, name), function () { }); } catch (ex) { } }
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                    } catch (ex) { console.log(ex); }
+                            } catch (ex) { console.log(ex); }
+                        });
+                    }
+                    console.log('Auto-backup completed.');
+                    if (func) { func('Auto-backup completed.'); };
+                } else {
+                    console.log('Zipbackup failed ('+ (+obj.backupStatus).toString(16).slice(-4) + '), deleting incomplete backup: ' + obj.newAutoBackupFile );
+                    if (func) { func('Zipbackup failed ('+ (+obj.backupStatus).toString(16).slice(-4) + '), deleting incomplete backup: ' + obj.newAutoBackupFile) };
+                    try { parent.fs.unlink(obj.newAutoBackupFile, function () { }); parent.fs.unlink(obj.newDBDumpFile, function () { }); } catch (ex) {console.log('Failed to delete incomplete backup files')};
+                };
+                obj.performingBackup = false;
+                obj.backupStatus = 0x0;
+            });
+            output.on('end', function () { });
+            output.on('error', function (err) {
+                if ((obj.backupStatus & BACKUPFAIL_ZIPCREATE) == 0) {
+                    console.log('Output error: ' + err);
+                    if (func) { func('Output error: ' + err); };
+                    obj.backupStatus |= BACKUPFAIL_ZIPCREATE;
+                    archive.abort();
+                };
+            });
+            archive.on('warning', function (err) {
+                //if files added to the archiver object aren't reachable anymore (e.g. sqlite-journal files)
+                //an ENOENT warning is given, but the archiver module has no option to/does not skip/resume
+                //so the backup needs te be aborted as it otherwise leaves an incomplete zip and never 'ends'
+                if ((obj.backupStatus & BACKUPFAIL_ZIPCREATE) == 0) {
+                    console.log('Zip warning: ' + err); 
+                    if (func) { func('Zip warning: ' + err); };
+                    obj.backupStatus |= BACKUPFAIL_ZIPCREATE;
+                    archive.abort();
+                };
+            });
+            archive.on('error', function (err) {
+                if ((obj.backupStatus & BACKUPFAIL_ZIPCREATE) == 0) {
+                    console.log('Zip error: ' + err);
+                    if (func) { func('Zip error: ' + err); };
+                    obj.backupStatus |= BACKUPFAIL_ZIPCREATE;
+                    archive.abort();
+                }
                 });
-            }
-        } catch (ex) { console.log(ex); }
-        return 0;
-    }
+            archive.pipe(output);
+
+            let globIgnoreFiles;
+            //slice in case exclusion gets pushed
+            globIgnoreFiles = parent.config.settings.autobackup.backupignorefilesglob ? parent.config.settings.autobackup.backupignorefilesglob.slice() : [];
+            if (parent.config.settings.sqlite3) { globIgnoreFiles.push (datapathFoldername + '/' + databaseName + '.sqlite*'); }; //skip sqlite database file, and temp files with ext -journal, -wal & -shm
+            //archiver.glob doesn't seem to use the third param, archivesubdir. Bug?
+            //workaround: go up a dir and add data dir explicitly to keep the zip tidy
+            archive.glob((datapathFoldername + '/**'), {
+                cwd: datapathParentPath,
+                ignore: globIgnoreFiles,
+                skip: (parent.config.settings.autobackup.backupskipfoldersglob ? parent.config.settings.autobackup.backupskipfoldersglob : [])
+            });
+
+            if (parent.config.settings.autobackup.backupwebfolders) {
+                if (parent.webViewsOverridePath) { archive.directory(parent.webViewsOverridePath, 'meshcentral-views'); }
+                if (parent.webPublicOverridePath) { archive.directory(parent.webPublicOverridePath, 'meshcentral-public'); }
+                if (parent.webEmailsOverridePath) { archive.directory(parent.webEmailsOverridePath, 'meshcentral-emails'); }
+            };
+            if (parent.config.settings.autobackup.backupotherfolders) {
+                archive.directory(parent.filespath, 'meshcentral-files');
+                archive.directory(parent.recordpath, 'meshcentral-recordings');
+            };
+            //add dbdump to the root of the zip
+            if (obj.newDBDumpFile != null) archive.file(obj.newDBDumpFile, { name: path.basename(obj.newDBDumpFile) });
+            archive.finalize();
+        } else {
+            //failed somewhere before zipping
+            console.log('Backup failed ('+ (+obj.backupStatus).toString(16).slice(-4) + ')');
+            if (func) { func('Backup failed ('+ (+obj.backupStatus).toString(16).slice(-4) + ')') };
+            //Just in case something's there
+            try { parent.fs.unlink(obj.newDBDumpFile, function () { }); } catch (ex) { };
+            obj.backupStatus = 0x0;
+            obj.performingBackup = false;
+        };
+    };
 
     // Perform cloud backup
     obj.performCloudBackup = function (filename, func) {
@@ -2377,7 +3741,9 @@ module.exports.CreateDB = function (parent, func) {
             // Clean up our WebDAV folder
             function performWebDavCleanup(client) {
                 if ((typeof parent.config.settings.autobackup.webdav.maxfiles == 'number') && (parent.config.settings.autobackup.webdav.maxfiles > 1)) {
-                    var directoryItems = client.getDirectoryContents(webdavfolderName);
+                    let fileName = (typeof parent.config.settings.autobackup.backupname == 'string') ? parent.config.settings.autobackup.backupname : 'meshcentral-autobackup-';
+                    //only files matching our backupfilename
+                    let directoryItems = client.getDirectoryContents(webdavfolderName, { deep: false, glob: "/**/" + fileName + "*.zip" });
                     directoryItems.then(
                         function (files) {
                             for (var i in files) { files[i].xdate = new Date(files[i].lastmod); }
@@ -2398,39 +3764,37 @@ module.exports.CreateDB = function (parent, func) {
 
             // Upload to the WebDAV folder
             function performWebDavUpload(client, filepath) {
-                var fileStream = require('fs').createReadStream(filepath);
-                fileStream.on('close', function () { if (func) { func('WebDAV upload completed'); } })
-                fileStream.on('error', function (err) { if (func) { func('WebDAV (fileUpload) error: ' + err); } })
-                fileStream.pipe(client.createWriteStream('/' + webdavfolderName + '/' + require('path').basename(filepath)));
-                if (func) { func('Uploading using WebDAV...'); }
+                require('fs').stat(filepath, function(err,stat){
+                    var fileStream = require('fs').createReadStream(filepath);
+                    fileStream.on('close', function () { if (func) { func('WebDAV upload completed'); } })
+                    fileStream.on('error', function (err) { if (func) { func('WebDAV (fileUpload) error: ' + err); } })
+                    fileStream.pipe(client.createWriteStream('/' + webdavfolderName + '/' + require('path').basename(filepath), { headers: { "Content-Length": stat.size } }));
+                    if (func) { func('Uploading using WebDAV...'); }
+                });
             }
 
             if (func) { func('Attempting WebDAV upload...'); }
             const { createClient } = require('webdav');
-            const client = createClient(parent.config.settings.autobackup.webdav.url, { username: parent.config.settings.autobackup.webdav.username, password: parent.config.settings.autobackup.webdav.password });
-            var directoryItems = client.getDirectoryContents('/');
-            directoryItems.then(
-                function (files) {
-                    var folderFound = false;
-                    for (var i in files) { if ((files[i].basename == webdavfolderName) && (files[i].type == 'directory')) { folderFound = true; } }
-                    if (folderFound == false) {
-                        client.createDirectory(webdavfolderName).then(function (a) {
-                            if (a.statusText == 'Created') {
-                                if (func) { func('WebDAV folder created'); }
-                                performWebDavUpload(client, filename);
-                            } else {
-                                if (func) { func('WebDAV (createDirectory) status: ' + a.statusText); }
-                            }
-                        }).catch(function (err) {
-                            if (func) { func('WebDAV (createDirectory) error: ' + err); }
-                        });
-                    } else {
-                        performWebDavCleanup(client);
+            const client = createClient(parent.config.settings.autobackup.webdav.url, {
+                username: parent.config.settings.autobackup.webdav.username,
+                password: parent.config.settings.autobackup.webdav.password,
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity
+            });
+            client.exists(webdavfolderName).then(function(a){
+                if(a){
+                    performWebDavCleanup(client);
+                    performWebDavUpload(client, filename);
+                }else{
+                    client.createDirectory(webdavfolderName, {recursive: true}).then(function (a) {
+                        if (func) { func('WebDAV folder created'); }
                         performWebDavUpload(client, filename);
-                    }
+                    }).catch(function (err) {
+                        if (func) { func('WebDAV (createDirectory) error: ' + err); }
+                    });
                 }
-            ).catch(function (err) {
-                if (func) { func('WebDAV (getDirectoryContents) error: ' + err); }
+            }).catch(function (err) {
+                if (func) { func('WebDAV (exists) error: ' + err); }
             });
         }
 
@@ -2511,11 +3875,110 @@ module.exports.CreateDB = function (parent, func) {
                 });
             });
         }
+
+        // S3 Backup
+        if ((typeof parent.config.settings.autobackup == 'object') && (typeof parent.config.settings.autobackup.s3 == 'object')) {
+            var s3folderName = 'MeshCentral-Backups';
+            if (typeof parent.config.settings.autobackup.s3.foldername == 'string') { s3folderName = parent.config.settings.autobackup.s3.foldername; }
+            // Construct the config object
+            var accessKey = parent.config.settings.autobackup.s3.accesskey,
+                secretKey = parent.config.settings.autobackup.s3.secretkey,
+                endpoint = parent.config.settings.autobackup.s3.endpoint ? parent.config.settings.autobackup.s3.endpoint : 's3.amazonaws.com',
+                port = parent.config.settings.autobackup.s3.port ? parent.config.settings.autobackup.s3.port : 443,
+                useSsl = parent.config.settings.autobackup.s3.ssl ? parent.config.settings.autobackup.s3.ssl : true,
+                bucketName = parent.config.settings.autobackup.s3.bucketname,
+                pathPrefix = s3folderName,
+                threshold = parent.config.settings.autobackup.s3.maxfiles ? parent.config.settings.autobackup.s3.maxfiles : 0,
+                fileToUpload = filename;
+            // Create a MinIO client
+            const Minio = require('minio');
+            var minioClient = new Minio.Client({
+                endPoint: endpoint,
+                port: port,
+                useSSL: useSsl,
+                accessKey: accessKey,
+                secretKey: secretKey
+            });
+            // List objects in the specified bucket and path prefix
+            var listObjectsPromise = new Promise(function(resolve, reject) {
+                var items = [];
+                var stream = minioClient.listObjects(bucketName, pathPrefix, true);
+                stream.on('data', function(item) {
+                    if (!item.name.endsWith('/')) { // Exclude directories
+                        items.push(item);
+                    }
+                });
+                stream.on('end', function() {
+                    resolve(items);
+                });
+                stream.on('error', function(err) {
+                    reject(err);
+                });
+            });
+            listObjectsPromise.then(function(objects) {
+                // Count the number of files
+                var fileCount = objects.length;
+                 // Return if no files to carry on uploading
+                if (fileCount === 0) { return Promise.resolve(); }
+                // Sort the files by LastModified date (oldest first)
+                objects.sort(function(a, b) { return new Date(a.lastModified) - new Date(b.lastModified); });
+                // Check if the threshold is zero and return if 
+                if (threshold === 0) { return Promise.resolve(); }
+                // Check if the number of files exceeds the threshold (maxfiles) is 0
+                if (fileCount >= threshold) {
+                    // Calculate how many files need to be deleted to make space for the new file
+                    var filesToDelete = fileCount - threshold + 1; // +1 to make space for the new file
+                    if (func) { func('Deleting ' + filesToDelete + ' older ' + (filesToDelete == 1 ? 'file' : 'files') + ' from S3 ...'); }
+                    // Create an array of promises for deleting files
+                    var deletePromises = objects.slice(0, filesToDelete).map(function(fileToDelete) {
+                        return new Promise(function(resolve, reject) {
+                            minioClient.removeObject(bucketName, fileToDelete.name, function(err) {
+                                if (err) {
+                                    reject(err);
+                                } else {
+                                    if (func) { func('Deleted file: ' + fileToDelete.name + ' from S3'); }
+                                    resolve();
+                                }
+                            });
+                        });
+                    });
+                    // Wait for all deletions to complete
+                    return Promise.all(deletePromises);
+                } else {
+                    return Promise.resolve(); // No deletion needed
+                }
+            }).then(function() {
+                // Determine the upload path by combining the pathPrefix with the filename
+                var fileName = require('path').basename(fileToUpload);
+                var uploadPath = require('path').join(pathPrefix, fileName);
+                // Upload a new file
+                var uploadPromise = new Promise(function(resolve, reject) {
+                    if (func) { func('Uploading file ' + uploadPath + ' to S3'); }
+                    minioClient.fPutObject(bucketName, uploadPath, fileToUpload, function(err, etag) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        if (func) { func('Uploaded file: ' + uploadPath + ' to S3'); }
+                        resolve(etag);
+                    }
+                    });
+                });
+                return uploadPromise;
+            }).catch(function(error) {
+                if (func) { func('Error managing files in S3: ' + error); }
+            });
+        }
     }
 
     // Transfer NeDB data into the current database
     obj.nedbtodb = function (func) {
-        var nedbDatastore = require('nedb');
+        var nedbDatastore = null;
+        try { nedbDatastore = require('@seald-io/nedb'); } catch (ex) { } // This is the NeDB with Node 23 support.
+        if (nedbDatastore == null) {
+            try { nedbDatastore = require('@yetzt/nedb'); } catch (ex) { } // This is the NeDB with fixed security dependencies.
+            if (nedbDatastore == null) { nedbDatastore = require('nedb'); } // So not to break any existing installations, if the old NeDB is present, use it.
+        }
+
         var datastoreOptions = { filename: parent.getConfigFilePath('meshcentral.db'), autoload: true };
 
         // If a DB encryption key is provided, perform database encryption
@@ -2551,16 +4014,16 @@ module.exports.CreateDB = function (parent, func) {
         var eventRecordsTransferCount = 0;
         var powerRecordsTransferCount = 0;
         var statsRecordsTransferCount = 0;
-        var pendingTransfer = 0;
+        obj.pendingTransfer = 0;
 
         // Transfer the data from main database
         nedbfile.find({}, function (err, docs) {
             if ((err == null) && (docs.length > 0)) {
                 performTypedRecordDecrypt(docs)
                 for (var i in docs) {
-                    pendingTransfer++;
+                    obj.pendingTransfer++;
                     normalRecordsTransferCount++;
-                    obj.Set(common.unEscapeLinksFieldName(docs[i]), function () { pendingTransfer--; });
+                    obj.Set(common.unEscapeLinksFieldName(docs[i]), function () { obj.pendingTransfer--; });
                 }
             }
 
@@ -2568,9 +4031,9 @@ module.exports.CreateDB = function (parent, func) {
             nedbeventsfile.find({}, function (err, docs) {
                 if ((err == null) && (docs.length > 0)) {
                     for (var i in docs) {
-                        pendingTransfer++;
+                        obj.pendingTransfer++;
                         eventRecordsTransferCount++;
-                        obj.StoreEvent(docs[i], function () { pendingTransfer--; });
+                        obj.StoreEvent(docs[i], function () { obj.pendingTransfer--; });
                     }
                 }
 
@@ -2578,9 +4041,9 @@ module.exports.CreateDB = function (parent, func) {
                 nedbpowerfile.find({}, function (err, docs) {
                     if ((err == null) && (docs.length > 0)) {
                         for (var i in docs) {
-                            pendingTransfer++;
+                            obj.pendingTransfer++;
                             powerRecordsTransferCount++;
-                            obj.storePowerEvent(docs[i], null, function () { pendingTransfer--; });
+                            obj.storePowerEvent(docs[i], null, function () { obj.pendingTransfer--; });
                         }
                     }
 
@@ -2588,15 +4051,15 @@ module.exports.CreateDB = function (parent, func) {
                     nedbserverstatsfile.find({}, function (err, docs) {
                         if ((err == null) && (docs.length > 0)) {
                             for (var i in docs) {
-                                pendingTransfer++;
+                                obj.pendingTransfer++;
                                 statsRecordsTransferCount++;
-                                obj.SetServerStats(docs[i], function () { pendingTransfer--; });
+                                obj.SetServerStats(docs[i], function () { obj.pendingTransfer--; });
                             }
                         }
 
                         // Only exit when all the records are stored.
                         setInterval(function () {
-                            if (pendingTransfer == 0) { func("Done. " + normalRecordsTransferCount + " record(s), " + eventRecordsTransferCount + " event(s), " + powerRecordsTransferCount + " power change(s), " + statsRecordsTransferCount + " stat(s)."); }
+                            if (obj.pendingTransfer == 0) { func("Done. " + normalRecordsTransferCount + " record(s), " + eventRecordsTransferCount + " event(s), " + powerRecordsTransferCount + " power change(s), " + statsRecordsTransferCount + " stat(s)."); }
                         }, 200)
                     });
                 });
@@ -2608,6 +4071,7 @@ module.exports.CreateDB = function (parent, func) {
 
     // Called when a node has changed
     function dbNodeChange(nodeChange, added) {
+        if (parent.webserver == null) return;
         common.unEscapeLinksFieldName(nodeChange.fullDocument);
         const node = performTypedRecordDecrypt([nodeChange.fullDocument])[0];
         parent.DispatchEvent(['*', node.meshid], obj, { etype: 'node', action: (added ? 'addnode' : 'changenode'), node: parent.webserver.CloneSafeNode(node), nodeid: node._id, domain: node.domain, nolog: 1 });
@@ -2621,16 +4085,23 @@ module.exports.CreateDB = function (parent, func) {
 
         // Update the mesh object in memory
         const mmesh = parent.webserver.meshes[mesh._id];
-        for (var i in mesh) { mmesh[i] = mesh[i]; }
-        for (var i in mmesh) { if (mesh[i] == null) { delete mmesh[i]; } }
+        if (mmesh != null) {
+            // Update an existing device group
+            for (var i in mesh) { mmesh[i] = mesh[i]; }
+            for (var i in mmesh) { if (mesh[i] == null) { delete mmesh[i]; } }
+        } else {
+            // Device group not present, create it.
+            parent.webserver.meshes[mesh._id] = mesh;
+        }
 
         // Send the mesh update
-        if (mesh.deleted) { mesh.action = 'deletemesh'; } else { mesh.action = (added ? 'createmesh' : 'meshchange'); }
-        mesh.meshid = mesh._id;
-        mesh.nolog = 1;
-        delete mesh.type;
-        delete mesh._id;
-        parent.DispatchEvent(['*', mesh.meshid], obj, parent.webserver.CloneSafeMesh(mesh));
+        var mesh2 = Object.assign({}, mesh); // Shallow clone
+        if (mesh2.deleted) { mesh2.action = 'deletemesh'; } else { mesh2.action = (added ? 'createmesh' : 'meshchange'); }
+        mesh2.meshid = mesh2._id;
+        mesh2.nolog = 1;
+        delete mesh2.type;
+        delete mesh2._id;
+        parent.DispatchEvent(['*', mesh2.meshid], obj, parent.webserver.CloneSafeMesh(mesh2));
     }
 
     // Called when a user account has changed
@@ -2638,11 +4109,17 @@ module.exports.CreateDB = function (parent, func) {
         if (parent.webserver == null) return;
         common.unEscapeLinksFieldName(userChange.fullDocument);
         const user = performTypedRecordDecrypt([userChange.fullDocument])[0];
-
+        
         // Update the user object in memory
         const muser = parent.webserver.users[user._id];
-        for (var i in user) { muser[i] = user[i]; }
-        for (var i in muser) { if (user[i] == null) { delete muser[i]; } }
+        if (muser != null) {
+            // Update an existing user
+            for (var i in user) { muser[i] = user[i]; }
+            for (var i in muser) { if (user[i] == null) { delete muser[i]; } }
+        } else {
+            // User not present, create it.
+            parent.webserver.users[user._id] = user;
+        }
 
         // Send the user update
         var targets = ['*', 'server-users', user._id];
@@ -2658,16 +4135,29 @@ module.exports.CreateDB = function (parent, func) {
 
         // Update the user group object in memory
         const uusergroup = parent.webserver.userGroups[usergroup._id];
-        for (var i in usergroup) { uusergroup[i] = usergroup[i]; }
-        for (var i in uusergroup) { if (usergroup[i] == null) { delete uusergroup[i]; } }
+        if (uusergroup != null) {
+            // Update an existing user group
+            for (var i in usergroup) { uusergroup[i] = usergroup[i]; }
+            for (var i in uusergroup) { if (usergroup[i] == null) { delete uusergroup[i]; } }
+        } else {
+            // Usergroup not present, create it.
+            parent.webserver.userGroups[usergroup._id] = usergroup;
+        }
 
         // Send the user group update
-        usergroup.action = (added ? 'createusergroup' : 'usergroupchange');
-        usergroup.ugrpid = usergroup._id;
-        usergroup.nolog = 1;
-        delete usergroup.type;
-        delete usergroup._id;
-        parent.DispatchEvent(['*', usergroup.ugrpid], obj, usergroup);
+        var usergroup2 = Object.assign({}, usergroup); // Shallow clone
+        usergroup2.action = (added ? 'createusergroup' : 'usergroupchange');
+        usergroup2.ugrpid = usergroup2._id;
+        usergroup2.nolog = 1;
+        delete usergroup2.type;
+        delete usergroup2._id;
+        parent.DispatchEvent(['*', usergroup2.ugrpid], obj, usergroup2);
+    }
+
+    function dbMergeSqlArray(arr) {
+        var x = '';
+        for (var i in arr) { if (x != '') { x += ','; } x += '\'' + arr[i] + '\''; }
+        return x;
     }
 
     return obj;

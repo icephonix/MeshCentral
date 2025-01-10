@@ -23,6 +23,7 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
     obj.ctrlMsgAllowed = true;
     obj.attemptWebRTC = false;
     obj.webRtcActive = false;
+    obj.webrtcconfig = null;
     obj.webSwitchOk = false;
     obj.webchannel = null;
     obj.webrtc = null;
@@ -81,6 +82,17 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
     obj.xxOnSocketConnected = function () {
         if (obj.debugmode == 1) { console.log('onSocketConnected'); }
         //obj.debug('Agent Redir Socket Connected');
+        if (!obj.latency.lastSend){ 
+            obj.latency.lastSend = setInterval(function(){
+                if (obj.latency.current == -1) {
+                    clearInterval(obj.latency.lastSend);
+                    obj.latency.lastSend = null;
+                } else {
+                    obj.sendCtrlMsg(JSON.stringify({ctrlChannel:102938,type:"rtt",time:(new Date().getTime())}));
+                }
+            }, 10000);
+        }
+        obj.sendCtrlMsg(JSON.stringify({ctrlChannel:102938,type:"rtt",time:(new Date().getTime())}));
         obj.xxStateChange(2);
     }
 
@@ -97,7 +109,7 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
             if (obj.onMetadataChange) obj.onMetadataChange(obj.metadata);
         } else if ((controlMsg.type == 'rtt') && (typeof controlMsg.time == 'number')) {
             obj.latency.current = (new Date().getTime()) - controlMsg.time;
-            if (obj.latency.callbacks != null) { obj.latency.callback(obj.latency.current); }
+            if (obj.latency.callback != null) { obj.latency.callback(obj.latency.current); }
         } else if (obj.webrtc != null) {
             if (controlMsg.type == 'answer') {
                 obj.webrtc.setRemoteDescription(new RTCSessionDescription(controlMsg), function () { /*console.log('WebRTC remote ok');*/ }, obj.xxCloseWebRTC);
@@ -109,6 +121,8 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
             } else if (controlMsg.type == 'webrtc2') {
                 // TODO: Resume/Start sending data over WebRTC
             }
+        } else if (controlMsg.type == 'ping') { // if we get a ping, respond with a pong.
+            obj.sendCtrlMsg('{"ctrlChannel":"102938","type":"pong"}');
         }
     }
 
@@ -145,7 +159,7 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
 
                 if (obj.attemptWebRTC == true) {
                     // Try to get WebRTC setup
-                    var configuration = null; //{ "iceServers": [ { 'urls': 'stun:stun.services.mozilla.com' }, { 'urls': 'stun:stun.l.google.com:19302' } ] };
+                    var configuration = obj.webrtcconfig; //{ "iceServers": [ { 'urls': 'stun:stun.cloudflare.com:3478' }, { 'urls': 'stun:stun.l.google.com:19302' } ] };
                     if (typeof RTCPeerConnection !== 'undefined') { obj.webrtc = new RTCPeerConnection(configuration); }
                     else if (typeof webkitRTCPeerConnection !== 'undefined') { obj.webrtc = new webkitRTCPeerConnection(configuration); }
                     if ((obj.webrtc != null) && (obj.webrtc.createDataChannel)) {
@@ -290,11 +304,15 @@ var CreateAgentRedirect = function (meshserver, module, serverPublicNamePort, au
 
         // Clean up WebRTC
         obj.xxCloseWebRTC();
+        
+        // clear RTT timer
+        obj.latency.current = -1;
 
         //obj.debug('Agent Redir Socket Stopped');
         obj.connectstate = -1;
         if (obj.socket != null) {
-            try { if (obj.socket.readyState == 1) { obj.sendCtrlMsg('{"ctrlChannel":"102938","type":"close"}'); obj.socket.close(); } } catch (e) { }
+            try { if (obj.socket.readyState == 1) { obj.sendCtrlMsg('{"ctrlChannel":"102938","type":"close"}'); } } catch (ex) { } // If connected, send the close command
+            try { if (obj.socket.readyState <= 1) { obj.socket.close(); } } catch (ex) { } // If connecting or connected, close the websocket
             obj.socket = null;
         }
         obj.xxStateChange(0);

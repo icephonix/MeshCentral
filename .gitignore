@@ -3,7 +3,6 @@
 [Tt]yping/
 [Ii]mages-spare/
 [Dd]aemon/
-[Bb]in/
 [Aa]gent/
 [Aa]gents/modules_meshcmd_min/
 [Aa]gents/modules_meshcore_min/
@@ -11,12 +10,12 @@
 [Aa]gents/meshcore.min.js
 [Pp]ublic/translations/
 [Vv]iews/translations/
+[Ee]mails/translations/
 [Pp]ublic/*-min.htm
 [Vv]iews/*-min.handlebars
 meshcentral.db
 meshcentral.db.json
 mesherrors.txt
-package-lock.json
 bob.json
 .greenlockrc
 
@@ -42,7 +41,6 @@ bob.json
 x64/
 x86/
 bld/
-[Bb]in/
 [Oo]bj/
 [Ll]og/
 
@@ -309,3 +307,7 @@ __pycache__/
 *.odx.cs
 *.xsd.cs
 .DS_Store
+
+# When running mkdocs locally as dev
+docs/__pycache__/
+docs/env/

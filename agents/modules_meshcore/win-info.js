@@ -18,28 +18,21 @@ var promise = require('promise');
 
 function qfe()
 {
-    var child = require('child_process').execFile(process.env['windir'] + '\\System32\\wbem\\wmic.exe', ['wmic', 'qfe', 'list', 'full', '/FORMAT:CSV']);
-    child.stdout.str = ''; child.stdout.on('data', function (c) { this.str += c.toString(); });
-    child.stderr.str = ''; child.stderr.on('data', function (c) { this.str += c.toString(); });
-    child.waitExit();
-
-    var lines = child.stdout.str.trim().split('\r\n');
-    var keys = lines[0].split(',');
-    var i, key;
-    var tokens;
-    var result = [];
-
-    for (i = 1; i < lines.length; ++i)
-    {
-        var obj = {};
-        tokens = lines[i].split(',');
-        for (key = 0; key < keys.length; ++key)
-        {
-            if (tokens[key]) { obj[keys[key]] = tokens[key]; }
+    try {
+        var tokens = require('win-wmi').query('ROOT\\CIMV2', 'SELECT * FROM Win32_QuickFixEngineering');
+        if (tokens[0]){
+            for (var index = 0; index < tokens.length; index++) {
+                for (var key in tokens[index]) {
+                    if (key.startsWith('__')) delete tokens[index][key];
+                }
+            }
+            return (tokens);
+        } else {
+            return ([]);
         }
-        result.push(obj);
+    } catch (ex) {
+        return ([]);
     }
-    return (result);
 }
 function av()
 {
@@ -53,9 +46,23 @@ function av()
     child.stdin.write('[reflection.Assembly]::LoadWithPartialName("system.core")\r\n');
     child.stdin.write('Get-WmiObject -Namespace "root/SecurityCenter2" -Class AntiVirusProduct | ');
     child.stdin.write('ForEach-Object -Process { ');
+    child.stdin.write('$matches = [regex]::Matches($_.pathToSignedProductExe, "%(.*?)%"); ');
+    child.stdin.write('$modifiedPath = $_.pathToSignedProductExe; ');
+    child.stdin.write('foreach ($match in $matches) { ');
+    child.stdin.write('$modifiedPath = $modifiedPath -replace [regex]::Escape($match.Value), [System.Environment]::GetEnvironmentVariable($match.Groups[1].Value, "Process") ');
+    child.stdin.write('} ');
+    child.stdin.write('$flag = $true; ');
+    child.stdin.write('if ($modifiedPath -ne "windowsdefender://"){ ');
+    child.stdin.write('if (-not (Test-Path -Path $modifiedPath -PathType Leaf)) { ');
+    child.stdin.write('$flag = $false; ');
+    child.stdin.write('} ');
+    child.stdin.write('} ');
+    child.stdin.write('if ($flag -eq $true) { ')
     child.stdin.write('$Bytes = [System.Text.Encoding]::UTF8.GetBytes($_.displayName); ');
     child.stdin.write('$EncodedText =[Convert]::ToBase64String($Bytes); ');
-    child.stdin.write('Write-Host ("{0},{1}" -f $_.productState,$EncodedText); }\r\n');
+    child.stdin.write('Write-Output ("{0},{1}" -f $_.productState,$EncodedText); ');
+    child.stdin.write('} ');
+    child.stdin.write('}\r\n ');
     child.stdin.write('exit\r\n');
     child.waitExit();
 
@@ -214,6 +221,14 @@ function installedApps()
         catch(e)\
         {\
         }\
+        try\
+        {\
+            val.installdate = reg.QueryKey(reg.HKEY.LocalMachine, 'SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\' + items.subkeys[key], 'InstallDate');\
+            if (val.installdate == '') { delete val.installdate; }\
+        }\
+        catch(e)\
+        {\
+        }\
         result.push(val);\
     }\
     console.log(JSON.stringify(result,'', 1));process.exit();";
@@ -225,12 +240,33 @@ function installedApps()
     return (ret);
 }
 
+function defender(){
+    var promise = require('promise');
+    var ret = new promise(function (a, r) { this._resolve = a; this._reject = r; });
+    ret.child = require('child_process').execFile(process.env['windir'] + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', ['powershell', '-noprofile', '-nologo', '-command', '-'], {});
+    ret.child.promise = ret;
+    ret.child.stdout.str = ''; ret.child.stdout.on('data', function (c) { this.str += c.toString(); });
+    ret.child.stderr.str = ''; ret.child.stderr.on('data', function (c) { this.str += c.toString(); });
+    ret.child.stdin.write('Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled,IsTamperProtected | ConvertTo-JSON\r\n');
+    ret.child.stdin.write('exit\r\n');
+    ret.child.on('exit', function (c) { 
+        if (this.stdout.str == '') { this.promise._resolve({}); return; }
+        try {
+            var abc = JSON.parse(this.stdout.str.trim());
+            this.promise._resolve({ RealTimeProtection: abc.RealTimeProtectionEnabled, TamperProtected: abc.IsTamperProtected });
+        } catch (ex) { 
+            this.promise._resolve({}); return;
+        }
+    });
+    return (ret);
+}
+
 if (process.platform == 'win32')
 {
-    module.exports = { qfe: qfe, av: av, defrag: defrag, pendingReboot: pendingReboot, installedApps: installedApps };
+    module.exports = { qfe: qfe, av: av, defrag: defrag, pendingReboot: pendingReboot, installedApps: installedApps, defender: defender };
 }
 else
 {
     var not_supported = function () { throw (process.platform + ' not supported'); };
-    module.exports = { qfe: not_supported, av: not_supported, defrag: not_supported, pendingReboot: not_supported, installedApps: not_supported };
+    module.exports = { qfe: not_supported, av: not_supported, defrag: not_supported, pendingReboot: not_supported, installedApps: not_supported, defender: not_supported };
 }

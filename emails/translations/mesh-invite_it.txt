@@ -26,6 +26,12 @@ Per Linux, taglia e incolla quanto segue in un terminale per installare l'agente
 ~wget -q "[[[SERVERURL]]]/meshagents?script=1" --no-check-certificate -O ./meshinstall.sh && chmod 755 ./meshinstall.sh && sudo ./meshinstall.sh [[[SERVERURL]]] '[[[MESHIDHEX]]]'
 ~
 ~</area-linux>
+~<area-assistant>
+Per MeshCentral Assistant su Windows, accedere al seguente collegamento per completare il processo:
+~
+~[[[SERVERURL]]]/meshagents?id=10006&meshid=[[[MESHIDHEX]]]&tag=mailto:[[[EMAIL]]]
+~
+~</area-assistant>
 ~<area-link>
 Per installare il software, vai a [[[SERVERURL]]][[[LINKURL]]][[[URLARGS2]]] e segui le istruzioni. 
 ~</area-link>
